@@ -64,6 +64,10 @@ class ModelParams(ParamGroup):
         self.multi_view_max_angle = 30
         self.multi_view_min_dis = 0.01
         self.multi_view_max_dis = 1.5
+        self.normal_prior_dir = "normals"
+        self.normal_prior_format = "png"
+        self.normal_prior_convention = "stablennormal"
+        self.normal_prior_flip_x = False
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args):
@@ -113,6 +117,8 @@ class OptimizationParams(ParamGroup):
 
         self.lambda_multi_view_geo = 0.02
         self.lambda_multi_view_ncc = 0.6
+        self.lambda_normal_prior = 0.0
+        self.normal_prior_from_iter = 7000
         self.multi_view_patch_size = 3
         self.multi_view_pixel_noise_th = 1.0
         self.use_geo_occ_aware = True

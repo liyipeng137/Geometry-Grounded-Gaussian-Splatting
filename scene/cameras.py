@@ -20,6 +20,7 @@ from utils.graphics_utils import getProjectionMatrix, getWorld2View2
 class Camera(nn.Module):
     def __init__(self, colmap_id, R, T, FoVx, FoVy, image, gt_alpha_mask,
                  image_name, uid,
+                 normal_prior=None,
                  trans=np.array([0.0, 0.0, 0.0]), scale=1.0, data_device = "cuda",
                  ):
         super(Camera, self).__init__()
@@ -55,6 +56,15 @@ class Camera(nn.Module):
             self.gt_mask = gt_alpha_mask.to(self.data_device)
         else:
             self.gt_mask = None
+
+        if normal_prior is not None:
+            self.normal_prior = normal_prior.to(self.data_device)
+            normal_norm = torch.norm(self.normal_prior, dim=0, keepdim=True)
+            self.normal_prior_mask = (normal_norm > 0.9) & (normal_norm < 1.1)
+            self.normal_prior = self.normal_prior / torch.clamp(normal_norm, min=1e-6)
+        else:
+            self.normal_prior = None
+            self.normal_prior_mask = None
 
         self.zfar = 100.0
         self.znear = 0.01

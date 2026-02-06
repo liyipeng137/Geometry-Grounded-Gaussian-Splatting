@@ -19,6 +19,7 @@ from typing import Any, Sequence, TypedDict, Union
 import cv2
 import numpy as np
 import torch
+import torch.nn.functional as F
 from tqdm import tqdm
 
 try:
@@ -82,6 +83,7 @@ def training(
     viewpoint_stack = None
     ema_loss_for_log = 0.0
     ema_normal_loss_for_log = 0.0
+    ema_normal_prior_loss_for_log = 0.0
     ema_ncc_loss_for_log = 0.0
     os.makedirs(os.path.join(dataset.model_path, "debug"), exist_ok=True)
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
@@ -165,6 +167,23 @@ def training(
             depth_normal = None
             depth_normal_loss = torch.tensor([0], dtype=torch.float32, device="cuda")
 
+        if (
+            iteration >= opt.normal_prior_from_iter
+            and opt.lambda_normal_prior > 0
+            and viewpoint_cam.normal_prior is not None
+        ):
+            rendered_normal_prior = render_pkg["normal"]
+            prior_normal = viewpoint_cam.normal_prior
+            prior_mask = viewpoint_cam.normal_prior_mask.squeeze(0)
+            if prior_mask.any().item():
+                prior_cos = F.cosine_similarity(rendered_normal_prior, prior_normal, dim=0)
+                normal_prior_error = 1.0 - torch.abs(prior_cos)
+                normal_prior_loss = normal_prior_error[prior_mask].mean()
+            else:
+                normal_prior_loss = torch.tensor([0], dtype=torch.float32, device="cuda")
+        else:
+            normal_prior_loss = torch.tensor([0], dtype=torch.float32, device="cuda")
+
         # patch match loss
         if reg_kick_on and (opt.lambda_multi_view_ncc > 0 or opt.lambda_multi_view_geo):
             nearest_cam = None if len(viewpoint_cam.nearest_id) == 0 else scene.getTrainCameras()[sample(viewpoint_cam.nearest_id, 1)[0]]
@@ -175,7 +194,13 @@ def training(
 
         rgb_loss = (1.0 - opt.lambda_dssim) * Ll1_render + opt.lambda_dssim * (1.0 - ssim(rendered_image.unsqueeze(0), gt_image.unsqueeze(0)))
 
-        loss = rgb_loss + opt.lambda_depth_normal * depth_normal_loss + opt.lambda_multi_view_ncc * ncc_loss + opt.lambda_multi_view_geo * geo_loss
+        loss = (
+            rgb_loss
+            + opt.lambda_depth_normal * depth_normal_loss
+            + opt.lambda_normal_prior * normal_prior_loss
+            + opt.lambda_multi_view_ncc * ncc_loss
+            + opt.lambda_multi_view_geo * geo_loss
+        )
         loss.backward()
 
         iter_end.record()
@@ -184,6 +209,7 @@ def training(
             # Progress bar
             ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
             ema_normal_loss_for_log = 0.4 * depth_normal_loss.item() + 0.6 * ema_normal_loss_for_log
+            ema_normal_prior_loss_for_log = 0.4 * normal_prior_loss.item() + 0.6 * ema_normal_prior_loss_for_log
             ema_ncc_loss_for_log = 0.4 * ncc_loss.item() + 0.6 * ema_ncc_loss_for_log
 
             if iteration % 10 == 0:
@@ -191,6 +217,7 @@ def training(
                     {
                         "Loss": f"{ema_loss_for_log:.{4}f}",
                         "loss_normal": f"{ema_normal_loss_for_log:.{4}f}",
+                        "loss_normal_prior": f"{ema_normal_prior_loss_for_log:.{4}f}",
                         "loss_ncc": f"{ema_ncc_loss_for_log:.{4}f}",
                     }
                 )
@@ -205,6 +232,7 @@ def training(
                 Ll1_render,
                 loss,
                 depth_normal_loss,
+                normal_prior_loss,
                 ncc_loss,
                 l1_loss,
                 iter_start.elapsed_time(iter_end),
@@ -286,6 +314,7 @@ def training_report(
     Ll1,
     loss,
     normal_loss,
+    normal_prior_loss,
     ncc_loss,
     l1_loss,
     elapsed,
@@ -297,6 +326,7 @@ def training_report(
     if tb_writer:
         tb_writer.add_scalar("train_loss_patches/l1_loss", Ll1.item(), iteration)
         tb_writer.add_scalar("train_loss_patches/normal_loss", normal_loss.item(), iteration)
+        tb_writer.add_scalar("train_loss_patches/normal_prior_loss", normal_prior_loss.item(), iteration)
         tb_writer.add_scalar("train_loss_patches/ncc_loss", ncc_loss.item(), iteration)
         tb_writer.add_scalar("train_loss_patches/total_loss", loss.item(), iteration)
         tb_writer.add_scalar("iter_time", elapsed, iteration)

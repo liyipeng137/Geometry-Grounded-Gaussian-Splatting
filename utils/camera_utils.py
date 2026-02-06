@@ -9,6 +9,10 @@
 # For inquiries contact  george.drettakis@inria.fr
 #
 
+import os
+
+from PIL import Image
+
 from scene.cameras import Camera
 import numpy as np
 from utils.general_utils import PILtoTorch
@@ -16,6 +20,31 @@ from utils.graphics_utils import fov2focal
 import torch
 
 WARNED = False
+
+
+def _load_normal_prior(args, cam_info, resolution):
+    normal_prior_dir = args.normal_prior_dir.strip()
+    if normal_prior_dir:
+        if os.path.isabs(normal_prior_dir):
+            normal_root = normal_prior_dir
+        else:
+            normal_root = os.path.join(args.source_path, normal_prior_dir)
+    else:
+        normal_root = os.path.join(os.path.dirname(os.path.dirname(cam_info.image_path)), "normals")
+
+    normal_format = args.normal_prior_format.lower().lstrip(".")
+    normal_path = os.path.join(normal_root, f"{cam_info.image_name}.{normal_format}")
+    if not os.path.exists(normal_path):
+        return None
+
+    normal_img = Image.open(normal_path)
+    resized_normal = PILtoTorch(normal_img, resolution)[:3]
+    normal_prior = resized_normal * 2.0 - 1.0
+
+    # default is stable normal
+    normal_prior = -normal_prior
+
+    return normal_prior
 
 def loadCam(args, id, cam_info, resolution_scale):
     orig_w, orig_h = cam_info.image.size
@@ -48,10 +77,13 @@ def loadCam(args, id, cam_info, resolution_scale):
         loaded_mask = None
         gt_image = resized_image_rgb
 
+    normal_prior = _load_normal_prior(args, cam_info, resolution)
+
     return Camera(colmap_id=cam_info.uid, R=cam_info.R, T=cam_info.T, 
                   FoVx=cam_info.FovX, FoVy=cam_info.FovY, 
                   image=gt_image, gt_alpha_mask=loaded_mask,
-                  image_name=cam_info.image_name, uid=id, data_device=args.data_device)
+                  image_name=cam_info.image_name, uid=id,
+                  normal_prior=normal_prior, data_device=args.data_device)
 
 def cameraList_from_camInfos(cam_infos, resolution_scale, args):
     camera_list = []
