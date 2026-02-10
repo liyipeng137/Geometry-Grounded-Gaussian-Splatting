@@ -117,7 +117,7 @@ class OptimizationParams(ParamGroup):
 
         self.lambda_multi_view_geo = 0.02
         self.lambda_multi_view_ncc = 0.6
-        self.lambda_normal_prior = 0.0
+        self.lambda_normal_prior = 0.1
         self.normal_prior_from_iter = 7000
         self.multi_view_patch_size = 3
         self.multi_view_pixel_noise_th = 1.0

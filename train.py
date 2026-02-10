@@ -138,13 +138,18 @@ def training(
             pipe.debug = True
 
         reg_kick_on = iteration >= opt.regularization_from_iter
+        normal_prior_kick_on = (
+            iteration >= opt.normal_prior_from_iter
+            and opt.lambda_normal_prior > 0
+            and viewpoint_cam.normal_prior is not None
+        )
         render_pkg = render(
             viewpoint_cam,
             gaussians,
             pipe,
             background,
             kernel_size,
-            require_depth=reg_kick_on,
+            require_depth=reg_kick_on or normal_prior_kick_on,
         )
         rendered_image: torch.Tensor
         rendered_image, viewspace_point_tensor, visibility_filter, radii = (
@@ -156,28 +161,39 @@ def training(
         gt_image = viewpoint_cam.original_image.cuda()
 
         Ll1_render = L1_loss_appearance(rendered_image, gt_image, gaussians, viewpoint_cam.uid)
-        # normal consistency
-        if reg_kick_on and opt.lambda_depth_normal > 0:
+        # normal consistency / depth-derived normal
+        if reg_kick_on or normal_prior_kick_on:
             depth_map: torch.Tensor = render_pkg["median_depth"]
             rendered_normal: torch.Tensor = render_pkg["normal"]
             depth_normal, valid_points = depth_to_normal(viewpoint_cam, depth_map)
-            normal_error_map = 1 - torch.linalg.vecdot(rendered_normal, depth_normal, dim=0)
-            depth_normal_loss = torch.where(valid_points.squeeze(), normal_error_map, torch.zeros_like(normal_error_map)).mean()
+            if reg_kick_on and opt.lambda_depth_normal > 0:
+                normal_error_map = 1 - torch.linalg.vecdot(rendered_normal, depth_normal, dim=0)
+                depth_normal_loss = torch.where(valid_points.squeeze(), normal_error_map, torch.zeros_like(normal_error_map)).mean()
+            else:
+                depth_normal_loss = torch.tensor([0], dtype=torch.float32, device="cuda")
         else:
             depth_normal = None
+            valid_points = None
             depth_normal_loss = torch.tensor([0], dtype=torch.float32, device="cuda")
 
-        if (
-            iteration >= opt.normal_prior_from_iter
-            and opt.lambda_normal_prior > 0
-            and viewpoint_cam.normal_prior is not None
-        ):
+        if normal_prior_kick_on:
             rendered_normal_prior = render_pkg["normal"]
             prior_normal = viewpoint_cam.normal_prior
             prior_mask = viewpoint_cam.normal_prior_mask.squeeze(0)
+            if valid_points is not None:
+                prior_mask = prior_mask & valid_points.squeeze()
+
             if prior_mask.any().item():
                 prior_cos = F.cosine_similarity(rendered_normal_prior, prior_normal, dim=0)
-                normal_prior_error = 1.0 - torch.abs(prior_cos)
+                prior_error_render = 1.0 - torch.abs(prior_cos)
+
+                if depth_normal is not None:
+                    prior_cos_depth = F.cosine_similarity(depth_normal, prior_normal, dim=0)
+                    prior_error_depth = 1.0 - torch.abs(prior_cos_depth)
+                else:
+                    prior_error_depth = torch.zeros_like(prior_error_render)
+
+                normal_prior_error = prior_error_render + prior_error_depth
                 normal_prior_loss = normal_prior_error[prior_mask].mean()
             else:
                 normal_prior_loss = torch.tensor([0], dtype=torch.float32, device="cuda")
