@@ -30,7 +30,7 @@ from utils.general_utils import (
     strip_symmetric,
 )
 from utils.graphics_utils import BasicPointCloud
-from utils.sh_utils import RGB2SH
+from utils.sh_utils import C0, RGB2SH
 from utils.system_utils import mkdir_p
 
 
@@ -489,6 +489,59 @@ class GaussianModel:
         elements = np.empty(xyz.shape[0], dtype=dtype_full)
         attributes = np.concatenate((xyz, normals, f_dc, f_rest, opacities, scale, rotation, sg_axis, sg_sharpness, sg_color, filter_3D), axis=1)
         elements[:] = list(map(tuple, attributes))
+        el = PlyElement.describe(elements, "vertex")
+        PlyData([el]).write(path)
+
+    def save_3dgsviewer_ply(self, path):
+        """
+        Export a viewer-compatible 3DGS PLY.
+        This bakes:
+        1) the GGGS 3D filter into scale/opacity parameters
+        2) a global PGSR appearance correction using robust (median) a,b over all training cameras.
+        """
+        mkdir_p(os.path.dirname(path))
+
+        xyz = self._xyz.detach().cpu().numpy()
+        normals = np.zeros_like(xyz)
+
+        # Bake filter_3D into raw scale/opacity parameters expected by vanilla 3DGS viewers.
+        scales_baked = self.get_scaling_with_3D_filter
+        opacities_baked = self.get_opacity_with_3D_filter
+        scales_param = torch.log(torch.clamp_min(scales_baked, 1e-12))
+        opacities_param = inverse_sigmoid(opacities_baked.clamp(1e-6, 1.0 - 1e-6))
+
+        # Start from SH coefficients and bake global PGSR appearance if available.
+        features_dc = self._features_dc.detach().clone()
+        features_rest = self._features_rest.detach().clone()
+        if self.app_model == self.App_model.PGSR and self._appearance_embeddings is not None and self._appearance_embeddings.numel() > 0:
+            appearance = self._appearance_embeddings.detach()
+            a = torch.median(appearance[:, 0])
+            b = torch.median(appearance[:, 1])
+            scale_rgb = torch.exp(a)
+            # The shader adds +0.5 after SH evaluation. Convert affine RGB into SH-space:
+            # I' = scale_rgb * I + b = scale_rgb * (SH + 0.5) + b = SH' + 0.5
+            dc_offset = (0.5 * scale_rgb + b - 0.5) / C0
+            features_dc = features_dc * scale_rgb + dc_offset
+            features_rest = features_rest * scale_rgb
+
+        f_dc = features_dc.transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
+        f_rest = features_rest.transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
+        opacities = opacities_param.detach().cpu().numpy()
+        scale = scales_param.detach().cpu().numpy()
+        rotation = self._rotation.detach().cpu().numpy()
+
+        # Standard 3DGS attribute layout (without SG/filter_3D extras).
+        attrs = ["x", "y", "z", "nx", "ny", "nz"]
+        attrs.extend([f"f_dc_{i}" for i in range(f_dc.shape[1])])
+        attrs.extend([f"f_rest_{i}" for i in range(f_rest.shape[1])])
+        attrs.append("opacity")
+        attrs.extend([f"scale_{i}" for i in range(scale.shape[1])])
+        attrs.extend([f"rot_{i}" for i in range(rotation.shape[1])])
+        dtype_full = [(attribute, "f4") for attribute in attrs]
+
+        elements = np.empty(xyz.shape[0], dtype=dtype_full)
+        packed = np.concatenate((xyz, normals, f_dc, f_rest, opacities, scale, rotation), axis=1)
+        elements[:] = list(map(tuple, packed))
         el = PlyElement.describe(elements, "vertex")
         PlyData([el]).write(path)
 

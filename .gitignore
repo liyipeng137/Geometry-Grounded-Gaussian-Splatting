@@ -32,3 +32,5 @@ cmake.check_cache
 blender_scripts/
 .clangd
 twodgs/
+threedgs/
+.describe/
