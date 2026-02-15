@@ -801,6 +801,15 @@ class GaussianModel:
         selected_pts_mask = torch.logical_or(selected_pts_mask, selected_pts_mask_abs)
 
         stds = self.get_scaling[selected_pts_mask].repeat(N, 1)
+        invalid_stds = (~torch.isfinite(stds)) | (stds <= 0)
+        if invalid_stds.any():
+            invalid_count = int(invalid_stds.sum().item())
+            total_count = int(stds.numel())
+            print(
+                f"[Warn][densify_and_split] Invalid stds: {invalid_count}/{total_count}. "
+                "Applying nan/inf clamp for stability."
+            )
+            stds = torch.nan_to_num(stds, nan=1e-6, posinf=1.0, neginf=1e-6).clamp(min=1e-6, max=1.0)
         means = torch.zeros((stds.size(0), 3), device="cuda")
         samples = torch.normal(mean=means, std=stds)
         rots = build_rotation(self._rotation[selected_pts_mask]).repeat(N, 1, 1)
@@ -828,6 +837,15 @@ class GaussianModel:
         new_xyz = self._xyz[selected_pts_mask]
         # sample a new gaussian instead of fixing position
         stds = self.get_scaling[selected_pts_mask]
+        invalid_stds = (~torch.isfinite(stds)) | (stds <= 0)
+        if invalid_stds.any():
+            invalid_count = int(invalid_stds.sum().item())
+            total_count = int(stds.numel())
+            print(
+                f"[Warn][densify_and_clone] Invalid stds: {invalid_count}/{total_count}. "
+                "Applying nan/inf clamp for stability."
+            )
+            stds = torch.nan_to_num(stds, nan=1e-6, posinf=1.0, neginf=1e-6).clamp(min=1e-6, max=1.0)
         means = torch.zeros((stds.size(0), 3), device="cuda")
         samples = torch.normal(mean=means, std=stds)
         rots = build_rotation(self._rotation[selected_pts_mask])

@@ -46,6 +46,25 @@ def _load_normal_prior(args, cam_info, resolution):
 
     return normal_prior
 
+
+# def _load_delight_image(args, cam_info, resolution):
+#     delight_dir = args.delight_dir.strip()
+#     if not delight_dir:
+#         return None
+
+#     if os.path.isabs(delight_dir):
+#         delight_root = delight_dir
+#     else:
+#         delight_root = os.path.join(args.source_path, delight_dir)
+
+#     delight_format = args.delight_format.lower().lstrip(".")
+#     delight_path = os.path.join(delight_root, f"{cam_info.image_name}.{delight_format}")
+#     if not os.path.exists(delight_path):
+#         return None
+#     print(f"Loading delight image from {delight_path}")
+#     delight_img = Image.open(delight_path)
+#     return PILtoTorch(delight_img, resolution)[:3]
+
 def loadCam(args, id, cam_info, resolution_scale):
     orig_w, orig_h = cam_info.image.size
 

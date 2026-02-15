@@ -39,6 +39,26 @@ from utils.image_utils import psnr
 from utils.loss_utils import L1_loss_appearance, PatchMatch, l1_loss, ssim
 
 
+# def normal_gradient_loss(rend_normal: torch.Tensor, gt_normal: torch.Tensor, valid_mask: torch.Tensor | None = None) -> torch.Tensor:
+#     sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], device=rend_normal.device, dtype=torch.float32).view(1, 1, 3, 3) / 4.0
+#     sobel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], device=rend_normal.device, dtype=torch.float32).view(1, 1, 3, 3) / 4.0
+
+#     rend_normal = rend_normal.unsqueeze(0)
+#     gt_normal = gt_normal.unsqueeze(0)
+#     rend_grad_x = F.conv2d(rend_normal, sobel_x.repeat(3, 1, 1, 1), padding=1, groups=3)
+#     rend_grad_y = F.conv2d(rend_normal, sobel_y.repeat(3, 1, 1, 1), padding=1, groups=3)
+#     gt_grad_x = F.conv2d(gt_normal, sobel_x.repeat(3, 1, 1, 1), padding=1, groups=3)
+#     gt_grad_y = F.conv2d(gt_normal, sobel_y.repeat(3, 1, 1, 1), padding=1, groups=3)
+
+#     if valid_mask is None:
+#         return F.mse_loss(rend_grad_x, gt_grad_x) + F.mse_loss(rend_grad_y, gt_grad_y)
+
+#     mask = valid_mask.float().unsqueeze(0).unsqueeze(0)
+#     loss_x = ((rend_grad_x - gt_grad_x).pow(2) * mask).sum() / (mask.sum() * 3.0 + 1e-6)
+#     loss_y = ((rend_grad_y - gt_grad_y).pow(2) * mask).sum() / (mask.sum() * 3.0 + 1e-6)
+#     return loss_x + loss_y
+
+
 def training(
     dataset,
     opt,
@@ -79,6 +99,17 @@ def training(
             debug=True,
             model_path=dataset.model_path,
         )
+
+    if os.path.isabs(dataset.normal_prior_dir):
+        normal_root = dataset.normal_prior_dir
+    else:
+        normal_root = os.path.join(dataset.source_path, dataset.normal_prior_dir)
+    has_normal_dir = os.path.isdir(normal_root)
+    has_loaded_normal_prior = any(cam.normal_prior is not None for cam in scene.getTrainCameras())
+    reflective_case = has_normal_dir
+    if reflective_case and not has_loaded_normal_prior:
+        print("[Pipeline][Warn] normals directory exists but no valid normal priors were loaded.")
+    print(f"[Pipeline] reflective_case={reflective_case} (normal_dir={normal_root}, loaded_priors={has_loaded_normal_prior})")
 
     viewpoint_stack = None
     ema_loss_for_log = 0.0
@@ -137,10 +168,28 @@ def training(
         if (iteration - 1) == debug_from:
             pipe.debug = True
 
+        
+        if reflective_case:
+            lambda_multi_view_ncc_cur = 0.1
+            if iteration > 15000:
+                lambda_multi_view_ncc_cur = 0.0
+            if iteration <= 3000:
+                lambda_normal_prior_cur = 0.0
+            elif iteration <= 7000:
+                lambda_normal_prior_cur = 0.15 * (iteration - 3000) / 4000.0
+            elif iteration <= 15000:
+                lambda_normal_prior_cur = 0.15 + 0.1 * (iteration - 7000) / 8000.0
+            else:
+                lambda_normal_prior_cur = 0.25
+        else:
+            lambda_multi_view_ncc_cur = 0.6
+            lambda_normal_prior_cur = 0.0
+
         reg_kick_on = iteration >= opt.regularization_from_iter
         normal_prior_kick_on = (
-            iteration >= opt.normal_prior_from_iter
-            and opt.lambda_normal_prior > 0
+            reflective_case
+            and
+            lambda_normal_prior_cur > 0
             and viewpoint_cam.normal_prior is not None
         )
         render_pkg = render(
@@ -177,18 +226,20 @@ def training(
             depth_normal_loss = torch.tensor([0], dtype=torch.float32, device="cuda")
 
         if normal_prior_kick_on:
+            rend_alpha = render_pkg["mask"]
             rendered_normal_prior = render_pkg["normal"]
             prior_normal = viewpoint_cam.normal_prior
+            prior_normal_eff = prior_normal * rend_alpha.detach()
             prior_mask = viewpoint_cam.normal_prior_mask.squeeze(0)
             if valid_points is not None:
                 prior_mask = prior_mask & valid_points.squeeze()
 
             if prior_mask.any().item():
-                prior_cos = F.cosine_similarity(rendered_normal_prior, prior_normal, dim=0)
+                prior_cos = F.cosine_similarity(rendered_normal_prior, prior_normal_eff, dim=0)
                 prior_error_render = 1.0 - torch.abs(prior_cos)
 
                 if depth_normal is not None:
-                    prior_cos_depth = F.cosine_similarity(depth_normal, prior_normal, dim=0)
+                    prior_cos_depth = F.cosine_similarity(depth_normal, prior_normal_eff, dim=0)
                     prior_error_depth = 1.0 - torch.abs(prior_cos_depth)
                 else:
                     prior_error_depth = torch.zeros_like(prior_error_render)
@@ -200,8 +251,22 @@ def training(
         else:
             normal_prior_loss = torch.tensor([0], dtype=torch.float32, device="cuda")
 
+        # if (
+        #     lambda_normal_gradient_cur > 0
+        #     and depth_normal is not None
+        #     and viewpoint_cam.normal_prior is not None
+        # ):
+        #     rend_alpha = render_pkg["mask"]
+        #     prior_normal_eff = prior_normal * (rend_alpha).detach()
+        #     grad_mask = viewpoint_cam.normal_prior_mask.squeeze(0)
+        #     if valid_points is not None:
+        #         grad_mask = grad_mask & valid_points.squeeze()
+        #     normal_grad_loss = normal_gradient_loss(depth_normal, prior_normal_eff, grad_mask)
+        # else:
+        #     normal_grad_loss = torch.tensor([0], dtype=torch.float32, device="cuda")
+
         # patch match loss
-        if reg_kick_on and (opt.lambda_multi_view_ncc > 0 or opt.lambda_multi_view_geo):
+        if reg_kick_on and (lambda_multi_view_ncc_cur > 0 or opt.lambda_multi_view_geo):
             nearest_cam = None if len(viewpoint_cam.nearest_id) == 0 else scene.getTrainCameras()[sample(viewpoint_cam.nearest_id, 1)[0]]
             ncc_loss, geo_loss = patchmatch(gaussians, render_pkg, viewpoint_cam, nearest_cam, iteration, depth_normal)
         else:
@@ -213,8 +278,8 @@ def training(
         loss = (
             rgb_loss
             + opt.lambda_depth_normal * depth_normal_loss
-            + opt.lambda_normal_prior * normal_prior_loss
-            + opt.lambda_multi_view_ncc * ncc_loss
+            + lambda_normal_prior_cur * normal_prior_loss
+            + lambda_multi_view_ncc_cur * ncc_loss
             + opt.lambda_multi_view_geo * geo_loss
         )
         loss.backward()
@@ -268,6 +333,11 @@ def training(
                 gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
 
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
+                    scaling_finite = torch.isfinite(gaussians.get_scaling)
+                    if not scaling_finite.all():
+                        invalid_count = int((~scaling_finite).sum().item())
+                        total_count = int(scaling_finite.numel())
+                        print(f"[Warn][iter {iteration}] Non-finite scaling detected before densify: {invalid_count}/{total_count}")
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
                     gaussians.densify_and_prune(
                         opt.densify_grad_threshold,
@@ -422,10 +492,10 @@ if __name__ == "__main__":
     parser.add_argument("--port", type=int, default=6009)
     parser.add_argument("--debug_from", type=int, default=-1)
     parser.add_argument("--detect_anomaly", action="store_true", default=False)
-    parser.add_argument("--test_iterations", nargs="+", type=int, default=[7000, 30000])
-    parser.add_argument("--save_iterations", nargs="+", type=int, default=[7000, 30000])
+    parser.add_argument("--test_iterations", nargs="+", type=int, default=[7000, 20000])
+    parser.add_argument("--save_iterations", nargs="+", type=int, default=[7000, 20000])
     parser.add_argument("--quiet", action="store_true")
-    parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[15000])
+    parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[30000])
     parser.add_argument("--start_checkpoint", type=str, default=None)
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
