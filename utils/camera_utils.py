@@ -22,6 +22,28 @@ import torch
 WARNED = False
 
 
+def _load_gt_mask(args, cam_info, resolution):
+    mask_dir = args.mask_dir.strip()
+    if not mask_dir:
+        return None
+
+    if os.path.isabs(mask_dir):
+        mask_root = mask_dir
+    else:
+        mask_root = os.path.join(args.source_path, mask_dir)
+
+    mask_format = args.mask_format.lower().lstrip(".")
+    mask_path = os.path.join(mask_root, f"{cam_info.image_name}.{mask_format}")
+    if not os.path.exists(mask_path):
+        return None
+
+    mask_img = Image.open(mask_path)
+    loaded_mask = PILtoTorch(mask_img, resolution)[:1]
+    # Keep a binary supervision target for alpha loss.
+    loaded_mask = (loaded_mask > 0.5).float()
+    return loaded_mask
+
+
 def _load_normal_prior(args, cam_info, resolution):
     normal_prior_dir = args.normal_prior_dir.strip()
     if normal_prior_dir:
@@ -93,7 +115,7 @@ def loadCam(args, id, cam_info, resolution_scale):
         gt_image = resized_image_rgb
     else:
         resized_image_rgb = PILtoTorch(cam_info.image, resolution)
-        loaded_mask = None
+        loaded_mask = _load_gt_mask(args, cam_info, resolution)
         gt_image = resized_image_rgb
 
     normal_prior = _load_normal_prior(args, cam_info, resolution)

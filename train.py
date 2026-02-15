@@ -116,6 +116,7 @@ def training(
     ema_normal_loss_for_log = 0.0
     ema_normal_prior_loss_for_log = 0.0
     ema_ncc_loss_for_log = 0.0
+    ema_mask_loss_for_log = 0.0
     os.makedirs(os.path.join(dataset.model_path, "debug"), exist_ok=True)
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
@@ -274,9 +275,16 @@ def training(
             geo_loss = torch.tensor([0], dtype=torch.float32, device="cuda")
 
         rgb_loss = (1.0 - opt.lambda_dssim) * Ll1_render + opt.lambda_dssim * (1.0 - ssim(rendered_image.unsqueeze(0), gt_image.unsqueeze(0)))
+        if opt.lambda_mask > 0 and viewpoint_cam.gt_mask is not None:
+            opacity = 1.0 - render_pkg["mask"].clamp(1e-6, 1.0 - 1e-6)
+            bg = 1.0 - viewpoint_cam.gt_mask
+            mask_loss = (-bg * torch.log(opacity)).mean()
+        else:
+            mask_loss = torch.tensor([0], dtype=torch.float32, device="cuda")
 
         loss = (
             rgb_loss
+            + opt.lambda_mask * mask_loss
             + opt.lambda_depth_normal * depth_normal_loss
             + lambda_normal_prior_cur * normal_prior_loss
             + lambda_multi_view_ncc_cur * ncc_loss
@@ -292,11 +300,13 @@ def training(
             ema_normal_loss_for_log = 0.4 * depth_normal_loss.item() + 0.6 * ema_normal_loss_for_log
             ema_normal_prior_loss_for_log = 0.4 * normal_prior_loss.item() + 0.6 * ema_normal_prior_loss_for_log
             ema_ncc_loss_for_log = 0.4 * ncc_loss.item() + 0.6 * ema_ncc_loss_for_log
+            ema_mask_loss_for_log = 0.4 * mask_loss.item() + 0.6 * ema_mask_loss_for_log
 
             if iteration % 10 == 0:
                 progress_bar.set_postfix(
                     {
                         "Loss": f"{ema_loss_for_log:.{4}f}",
+                        "loss_mask": f"{ema_mask_loss_for_log:.{4}f}",
                         "loss_normal": f"{ema_normal_loss_for_log:.{4}f}",
                         "loss_normal_prior": f"{ema_normal_prior_loss_for_log:.{4}f}",
                         "loss_ncc": f"{ema_ncc_loss_for_log:.{4}f}",
@@ -315,6 +325,7 @@ def training(
                 depth_normal_loss,
                 normal_prior_loss,
                 ncc_loss,
+                mask_loss,
                 l1_loss,
                 iter_start.elapsed_time(iter_end),
                 testing_iterations,
@@ -402,6 +413,7 @@ def training_report(
     normal_loss,
     normal_prior_loss,
     ncc_loss,
+    mask_loss,
     l1_loss,
     elapsed,
     testing_iterations,
@@ -414,6 +426,7 @@ def training_report(
         tb_writer.add_scalar("train_loss_patches/normal_loss", normal_loss.item(), iteration)
         tb_writer.add_scalar("train_loss_patches/normal_prior_loss", normal_prior_loss.item(), iteration)
         tb_writer.add_scalar("train_loss_patches/ncc_loss", ncc_loss.item(), iteration)
+        tb_writer.add_scalar("train_loss_patches/mask_loss", mask_loss.item(), iteration)
         tb_writer.add_scalar("train_loss_patches/total_loss", loss.item(), iteration)
         tb_writer.add_scalar("iter_time", elapsed, iteration)
 

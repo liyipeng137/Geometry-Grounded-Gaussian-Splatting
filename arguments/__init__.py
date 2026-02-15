@@ -64,6 +64,8 @@ class ModelParams(ParamGroup):
         self.multi_view_max_angle = 30
         self.multi_view_min_dis = 0.01
         self.multi_view_max_dis = 1.5
+        self.mask_dir = ""
+        self.mask_format = "png"
         self.normal_prior_dir = "normals"
         self.normal_prior_format = "png"
         super().__init__(parser, "Loading Parameters", sentinel)
@@ -106,6 +108,7 @@ class OptimizationParams(ParamGroup):
         self.percent_dense = 0.01
         self.lambda_dssim = 0.2
         self.lambda_depth_normal = 0.05
+        self.lambda_mask = 0.0
         self.densification_interval = 100
         self.opacity_reset_interval = 3000
         self.densify_from_iter = 500

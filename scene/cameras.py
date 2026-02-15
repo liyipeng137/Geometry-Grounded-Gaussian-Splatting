@@ -54,6 +54,8 @@ class Camera(nn.Module):
 
         if gt_alpha_mask is not None:
             self.gt_mask = gt_alpha_mask.to(self.data_device)
+            self.original_image *= self.gt_mask
+            self.gray_image *= self.gt_mask
         else:
             self.gt_mask = None
 
