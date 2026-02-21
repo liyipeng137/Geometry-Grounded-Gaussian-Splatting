@@ -33,5 +33,6 @@ blender_scripts/
 .clangd
 twodgs/
 threedgs/
-.describe/
+.paper/
 twodgs_split/
+fastgs/
