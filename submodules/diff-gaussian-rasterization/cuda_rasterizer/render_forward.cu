@@ -403,6 +403,9 @@ __global__ void __launch_bounds__(BLOCK_X* BLOCK_Y)
         const float focal_y,
         uint32_t* __restrict__ n_contrib,
         uint32_t* __restrict__ max_contributors,
+        const int* __restrict__ metric_map,
+        bool get_flag,
+        int* __restrict__ metricCount,
         const float* __restrict__ bg_color,
         float* __restrict__ out_color,
         float* __restrict__ out_alpha,
@@ -432,6 +435,7 @@ __global__ void __launch_bounds__(BLOCK_X* BLOCK_Y)
     int toDo         = range.y - range.x;
 
     // Allocate storage for batches of collectively fetched data.
+    __shared__ int collected_id[BLOCK_SIZE];
     __shared__ float2 collected_xy[BLOCK_SIZE];
     __shared__ float collected_feature[BLOCK_SIZE * CHANNELS];
     __shared__ float4 collected_conic_opacity[BLOCK_SIZE];
@@ -462,6 +466,7 @@ __global__ void __launch_bounds__(BLOCK_X* BLOCK_Y)
         int progress = i * BLOCK_SIZE + block.thread_rank();
         if (range.x + progress < range.y) {
             int coll_id                                  = point_list[range.x + progress];
+            collected_id[block.thread_rank()]            = coll_id;
             collected_xy[block.thread_rank()]            = points_xy_image[coll_id];
             collected_conic_opacity[block.thread_rank()] = conic_opacity[coll_id];
             for (int ch = 0; ch < CHANNELS; ch++)
@@ -505,6 +510,11 @@ __global__ void __launch_bounds__(BLOCK_X* BLOCK_Y)
             // Eq. (3) from 3D Gaussian splatting paper.
             for (int ch = 0; ch < CHANNELS; ch++)
                 C[ch] += collected_feature[j + BLOCK_SIZE * ch] * aT;
+            if (get_flag && metric_map != nullptr && metricCount != nullptr) {
+                if (metric_map[pix_id] == 1) {
+                    atomicAdd(&(metricCount[collected_id[j]]), 1);
+                }
+            }
 
             if constexpr (GEOMETRY) {
                 float4 ray_plane = collected_ray_planes[j];
@@ -685,6 +695,9 @@ void FORWARD::render(
     const float focal_y,
     uint32_t* n_contrib,
     uint32_t* max_contributor,
+    const int* metric_map,
+    bool get_flag,
+    int* metricCount,
     const float* bg_color,
     float* out_color,
     float* out_alpha,
@@ -696,7 +709,8 @@ void FORWARD::render(
     renderCUDA<NUM_CHANNELS, template_depth, SPLIT, SPLIT_ITERATIONS><<<grid, block>>>( \
         ranges, point_list, W, H, means2D, conic_opacity, colors,                       \
         ray_planes, normals, focal_x, focal_y,                                          \
-        n_contrib, max_contributor, bg_color, out_color, out_alpha,                     \
+        n_contrib, max_contributor, metric_map, get_flag, metricCount,                  \
+        bg_color, out_color, out_alpha,                                                 \
         out_normal, out_mdepth, normal_length)
 
     if (require_depth)

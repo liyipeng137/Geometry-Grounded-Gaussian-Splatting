@@ -15,7 +15,7 @@
 #include <torch/extension.h>
 #include <tuple>
 
-std::tuple<int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+std::tuple<int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 RasterizeGaussiansCUDA(
     const torch::Tensor& background,
     const torch::Tensor& means3D,
@@ -36,11 +36,13 @@ RasterizeGaussiansCUDA(
     const float tan_fovx,
     const float tan_fovy,
     const float kernel_size,
+    const torch::Tensor& metric_map,
     const int image_height,
     const int image_width,
     const torch::Tensor& campos,
     const bool prefiltered,
     const bool require_depth,
+    const bool get_flag,
     const bool debug);
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>

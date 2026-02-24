@@ -37,6 +37,7 @@ from utils.general_utils import safe_state
 from utils.graphics_utils import depth_to_normal
 from utils.image_utils import psnr
 from utils.loss_utils import L1_loss_appearance, PatchMatch, l1_loss, ssim
+from utils.vcd_utils import compute_vcd_importance_score, sample_vcd_cameras
 
 
 # def normal_gradient_loss(rend_normal: torch.Tensor, gt_normal: torch.Tensor, valid_mask: torch.Tensor | None = None) -> torch.Tensor:
@@ -350,11 +351,24 @@ def training(
                         total_count = int(scaling_finite.numel())
                         print(f"[Warn][iter {iteration}] Non-finite scaling detected before densify: {invalid_count}/{total_count}")
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
+                    importance_score = None
+                    if opt.vcd_enable and iteration >= opt.vcd_from_iter:
+                        camlist = sample_vcd_cameras(scene.getTrainCameras().copy(), opt.vcd_num_cams)
+                        importance_score = compute_vcd_importance_score(
+                            camlist=camlist,
+                            gaussians=gaussians,
+                            pipe=pipe,
+                            background=background,
+                            kernel_size=kernel_size,
+                            loss_thresh=opt.vcd_loss_thresh,
+                        )
                     gaussians.densify_and_prune(
                         opt.densify_grad_threshold,
                         0.05,
                         scene.cameras_extent,
                         size_threshold,
+                        importance_score=importance_score,
+                        importance_threshold=opt.vcd_importance_thresh,
                     )
                     if dataset.disable_filter3D:
                         gaussians.reset_3D_filter()

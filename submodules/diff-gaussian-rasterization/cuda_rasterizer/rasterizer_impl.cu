@@ -307,6 +307,7 @@ int CudaRasterizer::Rasterizer::forward(
     const float tan_fovx,
     const float tan_fovy,
     const float kernel_size,
+    const int* metric_map,
     const bool prefiltered,
     float* out_color,
     float* out_mdepth,
@@ -314,6 +315,8 @@ int CudaRasterizer::Rasterizer::forward(
     float* out_normal,
     int* radii,
     bool require_depth,
+    bool get_flag,
+    int* metricCount,
     bool debug) {
     const float focal_y = height / (2.0f * tan_fovy);
     const float focal_x = width / (2.0f * tan_fovx);
@@ -436,6 +439,9 @@ int CudaRasterizer::Rasterizer::forward(
                    focal_x, focal_y,
                    imgState.n_contrib,
                    tileState.max_contributor,
+                   metric_map,
+                   get_flag,
+                   metricCount,
                    background,
                    out_color,
                    out_alpha,

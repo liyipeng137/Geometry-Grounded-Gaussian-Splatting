@@ -121,6 +121,11 @@ class OptimizationParams(ParamGroup):
 
         self.lambda_normal_prior = 0.1
         self.normal_prior_from_iter = 7000
+        self.vcd_enable = False
+        self.vcd_from_iter = 500
+        self.vcd_num_cams = 10
+        self.vcd_loss_thresh = 0.1
+        self.vcd_importance_thresh = 5
         self.multi_view_patch_size = 3
         self.multi_view_pixel_noise_th = 1.0
         self.use_geo_occ_aware = True

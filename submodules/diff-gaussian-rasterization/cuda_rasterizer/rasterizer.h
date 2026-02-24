@@ -51,6 +51,7 @@ public:
         const float tan_fovx,
         const float tan_fovy,
         const float kernel_size,
+        const int* metric_map,
         const bool prefiltered,
         float* out_color,
         float* out_mdepth,
@@ -58,6 +59,8 @@ public:
         float* out_normal,
         int* radii         = nullptr,
         bool require_depth = true,
+        bool get_flag      = false,
+        int* metricCount   = nullptr,
         bool debug         = false);
 
     static void backward(
