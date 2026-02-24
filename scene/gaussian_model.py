@@ -997,6 +997,14 @@ class GaussianModel:
         prune = self._xyz.shape[0]
         return clone - before, split - clone, split - prune
 
+    def final_prune_fastgs(self, min_opacity, pruning_score=None, score_threshold=0.9):
+        """Final-stage pruning used in FastGS: opacity OR high pruning_score."""
+        prune_mask = (self.get_opacity < min_opacity).squeeze()
+        if pruning_score is not None:
+            score_mask = pruning_score > score_threshold
+            prune_mask = torch.logical_or(prune_mask, score_mask)
+        self.prune_points(prune_mask)
+
     def add_densification_stats(self, viewspace_point_tensor, update_filter):
         self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter, :2], dim=-1, keepdim=True)
         self.xyz_gradient_accum_abs[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter, 2:], dim=-1, keepdim=True)

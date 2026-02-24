@@ -385,6 +385,29 @@ def training(
                 if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
                     gaussians.reset_opacity()
 
+            # FastGS-style final-stage pruning: every 3k iterations after 15k.
+            if opt.vcp_enable and iteration % 3000 == 0 and iteration > 15_000 and iteration < 30_000:
+                camlist = sample_vcd_cameras(scene.getTrainCameras().copy(), opt.vcd_num_cams)
+                _, final_pruning_score = compute_vcd_vcp_scores(
+                    camlist=camlist,
+                    gaussians=gaussians,
+                    pipe=pipe,
+                    background=background,
+                    kernel_size=kernel_size,
+                    loss_thresh=opt.vcd_loss_thresh,
+                    need_vcd=False,
+                    need_vcp=True,
+                )
+                gaussians.final_prune_fastgs(
+                    min_opacity=0.1,
+                    pruning_score=final_pruning_score,
+                    score_threshold=0.9,
+                )
+                if dataset.disable_filter3D:
+                    gaussians.reset_3D_filter()
+                else:
+                    gaussians.compute_3D_filter(cameras=trainCameras)
+
             if iteration % 100 == 0 and iteration > opt.densify_until_iter and not dataset.disable_filter3D:
                 if iteration < opt.iterations - 100:
                     # don't update in the end of training
