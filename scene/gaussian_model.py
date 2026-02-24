@@ -947,7 +947,17 @@ class GaussianModel:
         )
 
     # use the same densification strategy as GOF https://github.com/autonomousvision/gaussian-opacity-fields
-    def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, importance_score=None, importance_threshold=5):
+    def densify_and_prune(
+        self,
+        max_grad,
+        min_opacity,
+        extent,
+        max_screen_size,
+        importance_score=None,
+        importance_threshold=5,
+        pruning_score=None,
+        vcp_remove_ratio=0.5,
+    ):
         grads = self.xyz_gradient_accum / self.denom
         grads[grads.isnan()] = 0.0
 
@@ -967,6 +977,22 @@ class GaussianModel:
         split = self._xyz.shape[0]
 
         prune_mask = (self.get_opacity < min_opacity).squeeze()
+        if pruning_score is not None:
+            scores = 1.0 - pruning_score
+            to_remove = torch.sum(prune_mask).item()
+            remove_budget = int(vcp_remove_ratio * to_remove)
+            if remove_budget > 0:
+                n_points = self.get_xyz.shape[0]
+                padded_importance = torch.zeros((n_points), dtype=torch.float32, device="cuda")
+                safe_scores = torch.clamp(scores.squeeze(), min=1e-6)
+                padded_importance[: safe_scores.shape[0]] = 1.0 / safe_scores
+                available = int((padded_importance > 0).sum().item())
+                sample_count = min(remove_budget, available)
+                if sample_count > 0:
+                    selected_pts_mask = torch.zeros((n_points), dtype=torch.bool, device="cuda")
+                    sampled_indices = torch.multinomial(padded_importance, sample_count, replacement=False)
+                    selected_pts_mask[sampled_indices] = True
+                    prune_mask = torch.logical_and(prune_mask, selected_pts_mask)
         self.prune_points(prune_mask)
         prune = self._xyz.shape[0]
         return clone - before, split - clone, split - prune

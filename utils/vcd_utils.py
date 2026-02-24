@@ -65,11 +65,52 @@ def build_metric_map(corrected_image, gt_image, gt_mask, loss_thresh):
     return metric_map.reshape(-1).to(torch.int32)
 
 
-def compute_vcd_importance_score(camlist, gaussians, pipe, background, kernel_size, loss_thresh):
-    if len(camlist) == 0:
+def _compute_masked_photometric_loss(corrected_image, gt_image, gt_mask):
+    per_pixel_l1 = torch.mean(torch.abs(corrected_image - gt_image), dim=0)
+    if gt_mask is not None:
+        valid_mask = gt_mask.to(device=per_pixel_l1.device).squeeze(0) > 0.5
+    else:
+        valid_mask = torch.ones_like(per_pixel_l1, dtype=torch.bool)
+    if not valid_mask.any():
+        return torch.tensor(0.0, device=per_pixel_l1.device)
+    return per_pixel_l1[valid_mask].mean()
+
+
+def _normalize_tensor(values):
+    if values is None:
         return None
+    if values.numel() == 0:
+        return values
+    valid = torch.isfinite(values)
+    if not valid.any():
+        return torch.zeros_like(values)
+    finite_vals = values[valid]
+    vmin = finite_vals.min()
+    vmax = finite_vals.max()
+    if torch.abs(vmax - vmin) < 1e-8:
+        out = torch.zeros_like(values)
+        out[valid] = 0.0
+        return out
+    out = torch.zeros_like(values)
+    out[valid] = (values[valid] - vmin) / (vmax - vmin)
+    return out
+
+
+def compute_vcd_vcp_scores(
+    camlist,
+    gaussians,
+    pipe,
+    background,
+    kernel_size,
+    loss_thresh,
+    need_vcd=True,
+    need_vcp=True,
+):
+    if len(camlist) == 0 or (not need_vcd and not need_vcp):
+        return None, None
 
     full_metric_counts = None
+    full_metric_score = None
     with torch.no_grad():
         for cam in camlist:
             render_pkg = render(
@@ -82,6 +123,7 @@ def compute_vcd_importance_score(camlist, gaussians, pipe, background, kernel_si
             )
             corrected_image = apply_appearance_correction(render_pkg["render"], gaussians, cam.uid)
             gt_image = cam.original_image.cuda()
+            photometric_loss = _compute_masked_photometric_loss(corrected_image, gt_image, cam.gt_mask)
             metric_map = build_metric_map(corrected_image, gt_image, cam.gt_mask, loss_thresh)
 
             metric_pkg = render(
@@ -94,10 +136,23 @@ def compute_vcd_importance_score(camlist, gaussians, pipe, background, kernel_si
                 get_flag=True,
                 metric_map=metric_map,
             )
-            counts = metric_pkg["accum_metric_counts"]
-            if full_metric_counts is None:
-                full_metric_counts = counts.clone()
-            else:
-                full_metric_counts += counts
+            counts = metric_pkg["accum_metric_counts"].to(torch.float32)
+            if need_vcd:
+                if full_metric_counts is None:
+                    full_metric_counts = counts.clone()
+                else:
+                    full_metric_counts += counts
+            if need_vcp:
+                weighted = photometric_loss * counts
+                if full_metric_score is None:
+                    full_metric_score = weighted
+                else:
+                    full_metric_score += weighted
 
-    return torch.div(full_metric_counts, len(camlist), rounding_mode="floor")
+    importance_score = None
+    pruning_score = None
+    if need_vcd and full_metric_counts is not None:
+        importance_score = torch.div(full_metric_counts, len(camlist), rounding_mode="floor")
+    if need_vcp and full_metric_score is not None:
+        pruning_score = _normalize_tensor(full_metric_score)
+    return importance_score, pruning_score

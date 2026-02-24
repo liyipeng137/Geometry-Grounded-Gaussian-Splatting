@@ -37,7 +37,7 @@ from utils.general_utils import safe_state
 from utils.graphics_utils import depth_to_normal
 from utils.image_utils import psnr
 from utils.loss_utils import L1_loss_appearance, PatchMatch, l1_loss, ssim
-from utils.vcd_utils import compute_vcd_importance_score, sample_vcd_cameras
+from utils.vcd_utils import compute_vcd_vcp_scores, sample_vcd_cameras
 
 
 # def normal_gradient_loss(rend_normal: torch.Tensor, gt_normal: torch.Tensor, valid_mask: torch.Tensor | None = None) -> torch.Tensor:
@@ -352,15 +352,20 @@ def training(
                         print(f"[Warn][iter {iteration}] Non-finite scaling detected before densify: {invalid_count}/{total_count}")
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
                     importance_score = None
-                    if opt.vcd_enable and iteration >= opt.vcd_from_iter:
+                    pruning_score = None
+                    need_vcd = opt.vcd_enable and iteration >= opt.vcd_from_iter
+                    need_vcp = opt.vcp_enable and iteration >= opt.vcp_from_iter
+                    if need_vcd or need_vcp:
                         camlist = sample_vcd_cameras(scene.getTrainCameras().copy(), opt.vcd_num_cams)
-                        importance_score = compute_vcd_importance_score(
+                        importance_score, pruning_score = compute_vcd_vcp_scores(
                             camlist=camlist,
                             gaussians=gaussians,
                             pipe=pipe,
                             background=background,
                             kernel_size=kernel_size,
                             loss_thresh=opt.vcd_loss_thresh,
+                            need_vcd=need_vcd,
+                            need_vcp=need_vcp,
                         )
                     gaussians.densify_and_prune(
                         opt.densify_grad_threshold,
@@ -369,6 +374,8 @@ def training(
                         size_threshold,
                         importance_score=importance_score,
                         importance_threshold=opt.vcd_importance_thresh,
+                        pruning_score=pruning_score,
+                        vcp_remove_ratio=opt.vcp_remove_ratio,
                     )
                     if dataset.disable_filter3D:
                         gaussians.reset_3D_filter()
