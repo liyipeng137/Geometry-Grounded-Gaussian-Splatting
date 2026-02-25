@@ -152,6 +152,164 @@ __forceinline__ __device__ bool in_frustum(const float3 p_orig,
     return true;
 }
 
+// This is built upon Speedy-Splat -- many thanks for their excellent work.
+__device__ inline float2 computeEllipseIntersection(
+    const float4 con_o, const float disc, const float t, const float2 p,
+    const bool isY, const float coord) {
+    float p_u   = isY ? p.y : p.x;
+    float p_v   = isY ? p.x : p.y;
+    float coeff = isY ? con_o.x : con_o.z;
+
+    float h         = coord - p_u;
+    float sqrt_term = sqrt(disc * h * h + t * coeff);
+
+    return {
+        (-con_o.y * h - sqrt_term) / coeff + p_v,
+        (-con_o.y * h + sqrt_term) / coeff + p_v};
+}
+
+// This is built upon Speedy-Splat -- many thanks for their excellent work.
+__device__ inline uint32_t processTiles(
+    const float4 con_o, const float disc, const float t, const float2 p,
+    float2 bbox_min, float2 bbox_max,
+    float2 bbox_argmin, float2 bbox_argmax,
+    int2 rect_min, int2 rect_max,
+    const dim3 grid, const bool isY,
+    uint32_t idx, uint32_t off, float depth,
+    uint64_t* gaussian_keys_unsorted,
+    uint32_t* gaussian_values_unsorted) {
+    // AccuTile-style sweeping over the shorter axis of the rectangle.
+    float block_u = isY ? BLOCK_Y : BLOCK_X;
+    float block_v = isY ? BLOCK_X : BLOCK_Y;
+
+    if (isY) {
+        rect_min    = {rect_min.y, rect_min.x};
+        rect_max    = {rect_max.y, rect_max.x};
+        bbox_min    = {bbox_min.y, bbox_min.x};
+        bbox_max    = {bbox_max.y, bbox_max.x};
+        bbox_argmin = {bbox_argmin.y, bbox_argmin.x};
+        bbox_argmax = {bbox_argmax.y, bbox_argmax.x};
+    }
+
+    uint32_t tiles_count = 0;
+    float2 intersect_min_line, intersect_max_line;
+    float ellipse_min, ellipse_max;
+    float min_line, max_line;
+
+    intersect_max_line = {bbox_max.y, bbox_min.y};
+    min_line           = rect_min.x * block_u;
+    if (bbox_min.x <= min_line) {
+        intersect_min_line = computeEllipseIntersection(con_o, disc, t, p, isY, rect_min.x * block_u);
+    } else {
+        intersect_min_line = intersect_max_line;
+    }
+
+    for (int u = rect_min.x; u < rect_max.x; ++u) {
+        max_line = min_line + block_u;
+        if (max_line <= bbox_max.x) {
+            intersect_max_line = computeEllipseIntersection(con_o, disc, t, p, isY, max_line);
+        }
+
+        if (min_line <= bbox_argmin.y && bbox_argmin.y < max_line) {
+            ellipse_min = bbox_min.y;
+        } else {
+            ellipse_min = min(intersect_min_line.x, intersect_max_line.x);
+        }
+
+        if (min_line <= bbox_argmax.y && bbox_argmax.y < max_line) {
+            ellipse_max = bbox_max.y;
+        } else {
+            ellipse_max = max(intersect_min_line.y, intersect_max_line.y);
+        }
+
+        int min_tile_v = max(rect_min.y, min(rect_max.y, (int)(ellipse_min / block_v)));
+        int max_tile_v = min(rect_max.y, max(rect_min.y, (int)(ellipse_max / block_v + 1)));
+
+        tiles_count += max_tile_v - min_tile_v;
+        if (gaussian_keys_unsorted != nullptr) {
+            for (int v = min_tile_v; v < max_tile_v; v++) {
+                uint64_t key = isY ? (u * grid.x + v) : (v * grid.x + u);
+                key <<= 32;
+                key |= *((uint32_t*)&depth);
+                gaussian_keys_unsorted[off]   = key;
+                gaussian_values_unsorted[off] = idx;
+                off++;
+            }
+        }
+        intersect_min_line = intersect_max_line;
+        min_line           = max_line;
+    }
+    return tiles_count;
+}
+
+// This is built upon Speedy-Splat -- many thanks for their excellent work.
+__device__ inline uint32_t duplicateToTilesTouched(
+    const float2 p, const float4 con_o, const dim3 grid, const float mult,
+    uint32_t idx, uint32_t off, float depth,
+    uint64_t* gaussian_keys_unsorted,
+    uint32_t* gaussian_values_unsorted) {
+    float disc = con_o.y * con_o.y - con_o.x * con_o.z;
+    if (con_o.x <= 0 || con_o.z <= 0 || disc >= 0) {
+        return 0;
+    }
+
+    const float effective_opacity_255 = con_o.w * 255.0f;
+    // Match the rasterization visibility cutoff and avoid invalid log/sqrt inputs.
+    if (!(effective_opacity_255 > 1.0f) || !isfinite(effective_opacity_255)) {
+        return 0;
+    }
+
+    float t = 2.0f * log(effective_opacity_255);
+    t       = mult * t;
+    if (!(t > 0.0f) || !isfinite(t)) {
+        return 0;
+    }
+
+    const float x_arg = -(con_o.y * con_o.y * t) / (disc * con_o.x);
+    const float y_arg = -(con_o.y * con_o.y * t) / (disc * con_o.z);
+    if (!(x_arg > 0.0f) || !(y_arg > 0.0f) || !isfinite(x_arg) || !isfinite(y_arg)) {
+        return 0;
+    }
+
+    float x_term = sqrt(x_arg);
+    x_term       = (con_o.y < 0) ? x_term : -x_term;
+    float y_term = sqrt(y_arg);
+    y_term       = (con_o.y < 0) ? y_term : -y_term;
+
+    float2 bbox_argmin = {p.y - y_term, p.x - x_term};
+    float2 bbox_argmax = {p.y + y_term, p.x + x_term};
+
+    float2 bbox_min = {
+        computeEllipseIntersection(con_o, disc, t, p, true, bbox_argmin.x).x,
+        computeEllipseIntersection(con_o, disc, t, p, false, bbox_argmin.y).x};
+    float2 bbox_max = {
+        computeEllipseIntersection(con_o, disc, t, p, true, bbox_argmax.x).y,
+        computeEllipseIntersection(con_o, disc, t, p, false, bbox_argmax.y).y};
+
+    int2 rect_min = {
+        max(0, min((int)grid.x, (int)(bbox_min.x / BLOCK_X))),
+        max(0, min((int)grid.y, (int)(bbox_min.y / BLOCK_Y)))};
+    int2 rect_max = {
+        max(0, min((int)grid.x, (int)(bbox_max.x / BLOCK_X + 1))),
+        max(0, min((int)grid.y, (int)(bbox_max.y / BLOCK_Y + 1)))};
+
+    int y_span = rect_max.y - rect_min.y;
+    int x_span = rect_max.x - rect_min.x;
+    if (y_span * x_span == 0) {
+        return 0;
+    }
+
+    bool isY = y_span < x_span;
+    return processTiles(
+        con_o, disc, t, p,
+        bbox_min, bbox_max, bbox_argmin, bbox_argmax,
+        rect_min, rect_max,
+        grid, isY,
+        idx, off, depth,
+        gaussian_keys_unsorted,
+        gaussian_values_unsorted);
+}
+
 namespace glm_modification {
 // Incorporate the transferSign, pythag, equal, and findEigenvaluesSymReal functions from the glm library,
 // with small modifications on findEgienvaluesSymReal to ensure numerical stability for big Gaussian kernels.

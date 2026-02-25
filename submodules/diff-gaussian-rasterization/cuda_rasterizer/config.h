@@ -30,6 +30,7 @@ constexpr float FAR_PLANE         = 100.f;
 constexpr float NORMALIZE_EPS     = 1.0E-12F;
 constexpr float MIN_TRANSMITTANCE = 0.45f;
 constexpr int SPLIT               = 8;
+constexpr float COMPACT_BOX_BETA  = 0.5f;
 #if TRAINING
 constexpr float SAMPLE_RANGE   = 0.4f;
 constexpr int SPLIT_ITERATIONS = 5;

@@ -362,9 +362,11 @@ __global__ void preprocessCUDA(
     float lambda2      = mid - sqrtf(fmaxf(0.1f, mid * mid - det));
     float my_radius    = ceilf(3.f * sqrtf(fmaxf(lambda1, lambda2)));
     float2 point_image = {ndc2Pix(p_proj.x, W), ndc2Pix(p_proj.y, H)};
-    uint2 rect_min, rect_max;
-    getRect(point_image, my_radius, rect_min, rect_max, grid);
-    if ((rect_max.x - rect_min.x) * (rect_max.y - rect_min.y) == 0)
+    float4 con_o       = {conic.x, conic.y, conic.z, opacities[idx] * ceof};
+    // Compact Box: estimate touched tiles using ellipse-aware bounds (beta fixed in config).
+    uint32_t tiles_count = duplicateToTilesTouched(
+        point_image, con_o, grid, COMPACT_BOX_BETA, 0, 0, 0.0f, nullptr, nullptr);
+    if (tiles_count == 0)
         return;
 
     // If colors have been precomputed, use them, otherwise convert
@@ -381,8 +383,8 @@ __global__ void preprocessCUDA(
     radii[idx]           = my_radius;
     points_xy_image[idx] = point_image;
     // Inverse 2D covariance and opacity neatly pack into one float4
-    conic_opacity[idx] = {conic.x, conic.y, conic.z, opacities[idx] * ceof};
-    tiles_touched[idx] = (rect_max.y - rect_min.y) * (rect_max.x - rect_min.x);
+    conic_opacity[idx] = con_o;
+    tiles_touched[idx] = tiles_count;
 }
 
 // Main rasterization method. Collaboratively works on one tile per
