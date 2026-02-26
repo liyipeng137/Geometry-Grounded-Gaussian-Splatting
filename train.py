@@ -60,6 +60,111 @@ from utils.vcd_utils import compute_vcd_vcp_scores, sample_vcd_cameras
 #     return loss_x + loss_y
 
 
+def masked_l1_depth_loss(pred_depth: torch.Tensor, gt_depth: torch.Tensor, valid_mask: torch.Tensor) -> torch.Tensor:
+    valid_mask = valid_mask.bool()
+    if not valid_mask.any():
+        return pred_depth.new_tensor(0.0)
+    return torch.abs(pred_depth[valid_mask] - gt_depth[valid_mask]).mean()
+
+
+def weighted_charbonnier_depth_loss(
+    pred_depth: torch.Tensor,
+    gt_depth: torch.Tensor,
+    valid_mask: torch.Tensor,
+    weight_map: torch.Tensor | None = None,
+    eps: float = 1e-3,
+) -> torch.Tensor:
+    valid_mask = valid_mask.bool()
+    if not valid_mask.any():
+        return pred_depth.new_tensor(0.0)
+
+    depth_err = pred_depth - gt_depth
+    depth_charb = torch.sqrt(depth_err * depth_err + eps * eps)
+    if weight_map is None:
+        return depth_charb[valid_mask].mean()
+
+    weights = weight_map[valid_mask]
+    if weights.numel() == 0:
+        return pred_depth.new_tensor(0.0)
+    return (depth_charb[valid_mask] * weights).sum() / (weights.sum() + 1e-6)
+
+
+def masked_pearson_depth_loss(pred_depth: torch.Tensor, gt_depth: torch.Tensor, valid_mask: torch.Tensor) -> torch.Tensor:
+    valid_mask = valid_mask.bool()
+    if valid_mask.sum().item() < 2:
+        return pred_depth.new_tensor(0.0)
+
+    src = pred_depth[valid_mask]
+    tgt = gt_depth[valid_mask]
+    src = src - src.mean()
+    tgt = tgt - tgt.mean()
+
+    src_std = src.std(unbiased=False)
+    tgt_std = tgt.std(unbiased=False)
+    if src_std.item() < 1e-6 or tgt_std.item() < 1e-6:
+        return pred_depth.new_tensor(0.0)
+
+    src = src / (src_std + 1e-6)
+    tgt = tgt / (tgt_std + 1e-6)
+    corr = (src * tgt).mean()
+    return 1.0 - corr
+
+
+def masked_local_pearson_loss(
+    pred_depth: torch.Tensor,
+    gt_depth: torch.Tensor,
+    valid_mask: torch.Tensor,
+    confidence_map: torch.Tensor | None = None,
+    box_p: int = 128,
+    p_corr: float = 0.5,
+    min_valid_ratio: float = 0.1,
+) -> torch.Tensor:
+    _, h, w = pred_depth.shape
+    if h < box_p or w < box_p:
+        return masked_pearson_depth_loss(pred_depth, gt_depth, valid_mask)
+
+    num_box_h = max(h // box_p, 1)
+    num_box_w = max(w // box_p, 1)
+    n_corr = max(int(p_corr * num_box_h * num_box_w), 1)
+    max_h = h - box_p + 1
+    max_w = w - box_p + 1
+    if confidence_map is not None:
+        conf2d = confidence_map.squeeze(0).clamp(0.0, 1.0)
+        valid2d = valid_mask.squeeze(0).float()
+        conf_patch = F.avg_pool2d(conf2d[None, None], kernel_size=box_p, stride=1)[0, 0]
+        valid_ratio_patch = F.avg_pool2d(valid2d[None, None], kernel_size=box_p, stride=1)[0, 0]
+        sample_scores = conf_patch * (valid_ratio_patch >= min_valid_ratio).float()
+        flat_scores = sample_scores.reshape(-1)
+        if flat_scores.sum().item() > 0:
+            sampled = torch.multinomial(flat_scores, n_corr, replacement=True)
+            x_0 = torch.div(sampled, max_w, rounding_mode="floor")
+            y_0 = sampled % max_w
+        else:
+            x_0 = torch.randint(0, max_h, size=(n_corr,), device=pred_depth.device)
+            y_0 = torch.randint(0, max_w, size=(n_corr,), device=pred_depth.device)
+    else:
+        x_0 = torch.randint(0, max_h, size=(n_corr,), device=pred_depth.device)
+        y_0 = torch.randint(0, max_w, size=(n_corr,), device=pred_depth.device)
+    min_valid_pixels = max(int(box_p * box_p * min_valid_ratio), 1)
+
+    loss_sum = pred_depth.new_tensor(0.0)
+    valid_patch_count = 0
+    for i in range(n_corr):
+        x_start, y_start = int(x_0[i].item()), int(y_0[i].item())
+        x_end, y_end = x_start + box_p, y_start + box_p
+        patch_mask = valid_mask[:, x_start:x_end, y_start:y_end]
+        if patch_mask.sum().item() < min_valid_pixels:
+            continue
+        patch_pred = pred_depth[:, x_start:x_end, y_start:y_end]
+        patch_gt = gt_depth[:, x_start:x_end, y_start:y_end]
+        loss_sum = loss_sum + masked_pearson_depth_loss(patch_pred, patch_gt, patch_mask)
+        valid_patch_count += 1
+
+    if valid_patch_count == 0:
+        return masked_pearson_depth_loss(pred_depth, gt_depth, valid_mask)
+    return loss_sum / valid_patch_count
+
+
 def training(
     dataset,
     opt,
@@ -107,15 +212,32 @@ def training(
         normal_root = os.path.join(dataset.source_path, dataset.normal_prior_dir)
     has_normal_dir = os.path.isdir(normal_root)
     has_loaded_normal_prior = any(cam.normal_prior is not None for cam in scene.getTrainCameras())
-    reflective_case = has_normal_dir
-    if reflective_case and not has_loaded_normal_prior:
+    if has_normal_dir and not has_loaded_normal_prior:
         print("[Pipeline][Warn] normals directory exists but no valid normal priors were loaded.")
-    print(f"[Pipeline] reflective_case={reflective_case} (normal_dir={normal_root}, loaded_priors={has_loaded_normal_prior})")
+    print(f"[Pipeline] has_normal_dir={has_normal_dir} (normal_dir={normal_root}, loaded_priors={has_loaded_normal_prior})")
+
+    if dataset.depth_prior_dir.strip():
+        if os.path.isabs(dataset.depth_prior_dir):
+            depth_root = dataset.depth_prior_dir
+        else:
+            depth_root = os.path.join(dataset.source_path, dataset.depth_prior_dir)
+    else:
+        depth_root = None
+    has_depth_dir = depth_root is not None and os.path.isdir(depth_root)
+    has_loaded_depth_prior = any(cam.depth_prior is not None for cam in scene.getTrainCameras())
+    if has_depth_dir and not has_loaded_depth_prior:
+        print("[Pipeline][Warn] depth directory exists but no valid depth priors were loaded.")
+    print(f"[Pipeline] depth_prior_ready={has_loaded_depth_prior} (depth_dir={depth_root})")
+
+    scene_case = has_normal_dir and has_loaded_depth_prior
+    reflective_case = has_normal_dir and not has_loaded_depth_prior
+    print(f"[Pipeline] scene_case={scene_case}, reflective_case={reflective_case}")
 
     viewpoint_stack = None
     ema_loss_for_log = 0.0
     ema_normal_loss_for_log = 0.0
     ema_normal_prior_loss_for_log = 0.0
+    ema_depth_prior_loss_for_log = 0.0
     ema_ncc_loss_for_log = 0.0
     ema_mask_loss_for_log = 0.0
     os.makedirs(os.path.join(dataset.model_path, "debug"), exist_ok=True)
@@ -183,16 +305,31 @@ def training(
                 lambda_normal_prior_cur = 0.15 + 0.1 * (iteration - 7000) / 8000.0
             else:
                 lambda_normal_prior_cur = 0.25
+        elif scene_case:
+            if iteration <= 3000:
+                lambda_normal_prior_cur = 0.0
+            elif iteration <= 7000:
+                lambda_normal_prior_cur = 0.1 * (iteration - 3000) / 4000.0
+            elif iteration <= 15000:
+                lambda_normal_prior_cur = 0.1 + 0.1 * (iteration - 7000) / 8000.0
+            else:
+                lambda_normal_prior_cur = 0.2
+            lambda_multi_view_ncc_cur = 0.0
         else:
             lambda_multi_view_ncc_cur = 0.6
             lambda_normal_prior_cur = 0.0
 
         reg_kick_on = iteration >= opt.regularization_from_iter
         normal_prior_kick_on = (
-            reflective_case
+            (reflective_case or scene_case)
             and
             lambda_normal_prior_cur > 0
             and viewpoint_cam.normal_prior is not None
+        )
+        depth_prior_kick_on = (
+            opt.lambda_depth_prior > 0
+            and iteration >= opt.depth_prior_from_iter
+            and viewpoint_cam.depth_prior is not None
         )
         render_pkg = render(
             viewpoint_cam,
@@ -200,7 +337,7 @@ def training(
             pipe,
             background,
             kernel_size,
-            require_depth=reg_kick_on or normal_prior_kick_on,
+            require_depth=reg_kick_on or normal_prior_kick_on or depth_prior_kick_on,
         )
         rendered_image: torch.Tensor
         rendered_image, viewspace_point_tensor, visibility_filter, radii = (
@@ -213,8 +350,12 @@ def training(
 
         Ll1_render = L1_loss_appearance(rendered_image, gt_image, gaussians, viewpoint_cam.uid)
         # normal consistency / depth-derived normal
-        if reg_kick_on or normal_prior_kick_on:
+        if reg_kick_on or normal_prior_kick_on or depth_prior_kick_on:
             depth_map: torch.Tensor = render_pkg["median_depth"]
+        else:
+            depth_map = None
+
+        if reg_kick_on or normal_prior_kick_on:
             rendered_normal: torch.Tensor = render_pkg["normal"]
             depth_normal, valid_points = depth_to_normal(viewpoint_cam, depth_map)
             if reg_kick_on and opt.lambda_depth_normal > 0:
@@ -253,6 +394,39 @@ def training(
         else:
             normal_prior_loss = torch.tensor([0], dtype=torch.float32, device="cuda")
 
+        if depth_prior_kick_on and depth_map is not None:
+            gt_depth_prior = viewpoint_cam.depth_prior
+            valid_depth_mask = gt_depth_prior > 0
+            confidence_map = None
+            if viewpoint_cam.depth_confidence is not None:
+                confidence_map = viewpoint_cam.depth_confidence.clamp(0.0, 1.0)
+                # keep conf>0 as validity gate, and use confidence as soft weights.
+                valid_depth_mask = valid_depth_mask & (confidence_map > 0)
+
+            if valid_depth_mask.any().item():
+                if iteration <= 7000:
+                    conf_weights = None
+                    if confidence_map is not None:
+                        conf_weights = confidence_map.pow(2)
+                    depth_prior_loss = weighted_charbonnier_depth_loss(
+                        depth_map, gt_depth_prior, valid_depth_mask, weight_map=conf_weights, eps=1e-3
+                    )
+                else:
+                    pearson_loss = masked_pearson_depth_loss(depth_map, gt_depth_prior, valid_depth_mask)
+                    lp_loss = masked_local_pearson_loss(
+                        depth_map,
+                        gt_depth_prior,
+                        valid_depth_mask,
+                        confidence_map=confidence_map,
+                        box_p=128,
+                        p_corr=0.5,
+                    )
+                    depth_prior_loss = (pearson_loss + lp_loss) * 0.1
+            else:
+                depth_prior_loss = torch.tensor([0], dtype=torch.float32, device="cuda")
+        else:
+            depth_prior_loss = torch.tensor([0], dtype=torch.float32, device="cuda")
+
         # if (
         #     lambda_normal_gradient_cur > 0
         #     and depth_normal is not None
@@ -288,6 +462,7 @@ def training(
             + opt.lambda_mask * mask_loss
             + opt.lambda_depth_normal * depth_normal_loss
             + lambda_normal_prior_cur * normal_prior_loss
+            + opt.lambda_depth_prior * depth_prior_loss
             + lambda_multi_view_ncc_cur * ncc_loss
             + opt.lambda_multi_view_geo * geo_loss
         )
@@ -300,6 +475,7 @@ def training(
             ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
             ema_normal_loss_for_log = 0.4 * depth_normal_loss.item() + 0.6 * ema_normal_loss_for_log
             ema_normal_prior_loss_for_log = 0.4 * normal_prior_loss.item() + 0.6 * ema_normal_prior_loss_for_log
+            ema_depth_prior_loss_for_log = 0.4 * depth_prior_loss.item() + 0.6 * ema_depth_prior_loss_for_log
             ema_ncc_loss_for_log = 0.4 * ncc_loss.item() + 0.6 * ema_ncc_loss_for_log
             ema_mask_loss_for_log = 0.4 * mask_loss.item() + 0.6 * ema_mask_loss_for_log
 
@@ -310,6 +486,7 @@ def training(
                         "loss_mask": f"{ema_mask_loss_for_log:.{4}f}",
                         "loss_normal": f"{ema_normal_loss_for_log:.{4}f}",
                         "loss_normal_prior": f"{ema_normal_prior_loss_for_log:.{4}f}",
+                        "loss_depth_prior": f"{ema_depth_prior_loss_for_log:.{4}f}",
                         "loss_ncc": f"{ema_ncc_loss_for_log:.{4}f}",
                     }
                 )
@@ -325,6 +502,7 @@ def training(
                 loss,
                 depth_normal_loss,
                 normal_prior_loss,
+                depth_prior_loss,
                 ncc_loss,
                 mask_loss,
                 l1_loss,
@@ -455,6 +633,7 @@ def training_report(
     loss,
     normal_loss,
     normal_prior_loss,
+    depth_prior_loss,
     ncc_loss,
     mask_loss,
     l1_loss,
@@ -468,6 +647,7 @@ def training_report(
         tb_writer.add_scalar("train_loss_patches/l1_loss", Ll1.item(), iteration)
         tb_writer.add_scalar("train_loss_patches/normal_loss", normal_loss.item(), iteration)
         tb_writer.add_scalar("train_loss_patches/normal_prior_loss", normal_prior_loss.item(), iteration)
+        tb_writer.add_scalar("train_loss_patches/depth_prior_loss", depth_prior_loss.item(), iteration)
         tb_writer.add_scalar("train_loss_patches/ncc_loss", ncc_loss.item(), iteration)
         tb_writer.add_scalar("train_loss_patches/mask_loss", mask_loss.item(), iteration)
         tb_writer.add_scalar("train_loss_patches/total_loss", loss.item(), iteration)

@@ -64,10 +64,16 @@ class ModelParams(ParamGroup):
         self.multi_view_max_angle = 30
         self.multi_view_min_dis = 0.01
         self.multi_view_max_dis = 1.5
-        self.mask_dir = ""
+        self.mask_dir = "masks"
         self.mask_format = "png"
         self.normal_prior_dir = "normals"
         self.normal_prior_format = "png"
+        self.depth_prior_dir = "depths"
+        self.depth_prior_format = "png"
+        self.depth_prior_scale = 1000.0
+        self.depth_confidence_dir = "confidence"
+        self.depth_confidence_format = "png"
+        self.disable_rgbd_init_ply = False
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args):
@@ -84,7 +90,7 @@ class PipelineParams(ParamGroup):
 
 class OptimizationParams(ParamGroup):
     def __init__(self, parser):
-        self.iterations = 30_000
+        self.iterations = 20_000
         self.position_lr_init = 0.00016
         self.position_lr_final = 0.0000016
         self.position_lr_delay_mult = 0.01
@@ -113,7 +119,9 @@ class OptimizationParams(ParamGroup):
         self.opacity_reset_interval = 3000
         self.densify_from_iter = 500
         self.densify_until_iter = 15_000
-        self.regularization_from_iter = 7000
+
+
+        self.regularization_from_iter = 7000 # if scene case change to 3000
         self.densify_grad_threshold = 0.0002
 
         self.lambda_multi_view_geo = 0.02
@@ -121,12 +129,14 @@ class OptimizationParams(ParamGroup):
 
         self.lambda_normal_prior = 0.1
         self.normal_prior_from_iter = 7000
-        self.vcd_enable = False
+        self.lambda_depth_prior = 0.3
+        self.depth_prior_from_iter = 3000
+        self.vcd_enable = True
         self.vcd_from_iter = 500
-        self.vcd_num_cams = 10
+        self.vcd_num_cams = 10 # if scene case change to 15
         self.vcd_loss_thresh = 0.1
         self.vcd_importance_thresh = 5
-        self.vcp_enable = False
+        self.vcp_enable = True
         self.vcp_from_iter = 500
         self.vcp_remove_ratio = 0.5
         self.multi_view_patch_size = 3
