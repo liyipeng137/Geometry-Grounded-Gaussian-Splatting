@@ -31,7 +31,7 @@ except ImportError:
 
 from arguments import ModelParams, OptimizationParams, PipelineParams
 from gaussian_renderer import network_gui, render
-from scene import GaussianModel, Scene
+from scene import GaussianBackgroundModel, GaussianModel, Scene
 from scene.cameras import Camera
 from utils.general_utils import safe_state
 from utils.graphics_utils import depth_to_normal
@@ -60,6 +60,59 @@ from utils.vcd_utils import compute_vcd_vcp_scores, sample_vcd_cameras
 #     return loss_x + loss_y
 
 
+def should_use_background_rgb(dataset, scene: Scene, reflective_case: bool, iteration: int) -> bool:
+    if not dataset.train_with_background_rgb or not scene.should_train_with_bg:
+        return False
+    cutoff = 3000 if reflective_case else 7000
+    return iteration < cutoff
+
+
+def training_bg(dataset, opt, pipe, scene: Scene, background: torch.Tensor, kernel_size: float) -> None:
+    gaussians = scene.bg_gaussians
+    if gaussians is None or not scene.should_train_with_bg or opt.bg_iterations <= 0:
+        return
+
+    gaussians.training_setup(opt)
+    progress_bar = tqdm(range(0, opt.bg_iterations), desc="Background training")
+    viewpoint_stack = None
+    ema_loss_for_log = 0.0
+
+    for iteration in range(1, opt.bg_iterations + 1):
+        gaussians.update_learning_rate(iteration)
+        if not viewpoint_stack:
+            viewpoint_stack = scene.getTrainCameras().copy()
+        viewpoint_cam: Camera = viewpoint_stack.pop(randint(0, len(viewpoint_stack) - 1))
+
+        render_pkg = render(
+            viewpoint_cam,
+            gaussians,
+            pipe,
+            background,
+            kernel_size,
+            require_depth=False,
+        )
+        image = render_pkg["render"]
+        gt_image = viewpoint_cam.original_image.cuda()
+        rgb_loss = (1.0 - opt.lambda_dssim) * l1_loss(image, gt_image) + opt.lambda_dssim * (
+            1.0 - ssim(image.unsqueeze(0), gt_image.unsqueeze(0))
+        )
+        rgb_loss.backward()
+
+        with torch.no_grad():
+            ema_loss_for_log = 0.4 * rgb_loss.item() + 0.6 * ema_loss_for_log
+            if iteration % 10 == 0:
+                progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.4f}"})
+                progress_bar.update(10)
+            if iteration == opt.bg_iterations:
+                progress_bar.close()
+                print(f"\n[BG ITER {iteration}] Saving background Gaussians")
+                scene.save_bg(iteration)
+
+            if gaussians.optimizer is not None:
+                gaussians.optimizer.step()
+                gaussians.optimizer.zero_grad(set_to_none=True)
+
+
 def training(
     dataset,
     opt,
@@ -73,7 +126,8 @@ def training(
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
     gaussians = GaussianModel(dataset.sh_degree, dataset.sg_degree)
-    scene = Scene(dataset, gaussians)
+    bg_gaussians = GaussianBackgroundModel(dataset.sh_degree) if dataset.enable_background_sphere else None
+    scene = Scene(dataset, gaussians, bg_gaussians)
     gaussians.training_setup(opt)
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
@@ -81,6 +135,9 @@ def training(
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
     kernel_size = dataset.kernel_size
+
+    if scene.should_train_with_bg:
+        training_bg(dataset, opt, pipe, scene, background, kernel_size)
 
     iter_start = torch.cuda.Event(enable_timing=True)
     iter_end = torch.cuda.Event(enable_timing=True)
@@ -202,9 +259,21 @@ def training(
             kernel_size,
             require_depth=reg_kick_on or normal_prior_kick_on,
         )
+        bg_model = scene.bg_gaussians if should_use_background_rgb(dataset, scene, reflective_case, iteration) else None
+        rgb_render_pkg = render_pkg
+        if bg_model is not None:
+            rgb_render_pkg = render(
+                viewpoint_cam,
+                gaussians,
+                pipe,
+                background,
+                kernel_size,
+                require_depth=False,
+                bg_splats=bg_model,
+            )
         rendered_image: torch.Tensor
         rendered_image, viewspace_point_tensor, visibility_filter, radii = (
-            render_pkg["render"],
+            rgb_render_pkg["render"],
             render_pkg["viewspace_points"],
             render_pkg["visibility_filter"],
             render_pkg["radii"],

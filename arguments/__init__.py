@@ -68,6 +68,8 @@ class ModelParams(ParamGroup):
         self.mask_format = "png"
         self.normal_prior_dir = "normals"
         self.normal_prior_format = "png"
+        self.enable_background_sphere = False
+        self.train_with_background_rgb = False
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args):
@@ -84,7 +86,8 @@ class PipelineParams(ParamGroup):
 
 class OptimizationParams(ParamGroup):
     def __init__(self, parser):
-        self.iterations = 30_000
+        self.iterations = 20_000
+        self.bg_iterations = 4_000
         self.position_lr_init = 0.00016
         self.position_lr_final = 0.0000016
         self.position_lr_delay_mult = 0.01
@@ -121,12 +124,12 @@ class OptimizationParams(ParamGroup):
 
         self.lambda_normal_prior = 0.1
         self.normal_prior_from_iter = 7000
-        self.vcd_enable = False
+        self.vcd_enable = True
         self.vcd_from_iter = 500
         self.vcd_num_cams = 10
         self.vcd_loss_thresh = 0.1
         self.vcd_importance_thresh = 5
-        self.vcp_enable = False
+        self.vcp_enable = True
         self.vcp_from_iter = 500
         self.vcp_remove_ratio = 0.5
         self.multi_view_patch_size = 3

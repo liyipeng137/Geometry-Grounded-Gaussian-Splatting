@@ -13,12 +13,13 @@ import math
 from typing import Optional
 import torch
 from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
+from scene.gaussian_bg_model import GaussianBackgroundModel
 from scene.gaussian_model import GaussianModel
 
 
 def render(
     viewpoint_camera,
-    pc: GaussianModel,
+    pc: GaussianModel | GaussianBackgroundModel,
     pipe,
     bg_color: torch.Tensor,
     kernel_size,
@@ -26,6 +27,7 @@ def render(
     require_depth: bool = True,
     get_flag: bool = False,
     metric_map: Optional[torch.Tensor] = None,
+    bg_splats: Optional[GaussianBackgroundModel] = None,
 ):
     """
     Render the scene. 
@@ -36,7 +38,11 @@ def render(
     # Set up rasterization configuration
     tanfovx = math.tan(viewpoint_camera.FoVx * 0.5)
     tanfovy = math.tan(viewpoint_camera.FoVy * 0.5)
-    screenspace_points = torch.zeros_like(pc.get_xyz, dtype=pc.get_xyz.dtype, requires_grad=True, device="cuda") + 0
+    means3D = pc.get_xyz
+    if bg_splats is not None:
+        means3D = torch.cat([means3D, bg_splats.get_xyz], dim=0)
+
+    screenspace_points = torch.zeros_like(means3D, dtype=means3D.dtype, requires_grad=True, device="cuda") + 0
     try:
         screenspace_points.retain_grad()
     except:
@@ -46,6 +52,8 @@ def render(
         metric_map = torch.empty(0, dtype=torch.int32, device="cuda")
     else:
         metric_map = metric_map.reshape(-1).to(device="cuda", dtype=torch.int32).contiguous()
+
+    sg_degree = getattr(pc, "active_sg_degree", 0)
 
     raster_settings = GaussianRasterizationSettings(
         image_height=int(viewpoint_camera.image_height),
@@ -58,7 +66,7 @@ def render(
         viewmatrix=viewpoint_camera.world_view_transform,
         projmatrix=viewpoint_camera.full_proj_transform,
         sh_degree=pc.active_sh_degree,
-        sg_degree=pc.active_sg_degree,
+        sg_degree=sg_degree,
         campos=viewpoint_camera.camera_center,
         prefiltered=False,
         require_depth = require_depth,
@@ -69,7 +77,6 @@ def render(
 
     rasterizer = GaussianRasterizer(raster_settings=raster_settings)
 
-    means3D = pc.get_xyz
     means2D = screenspace_points
 
     # If precomputed 3d covariance is provided, use it. If not, then it will be computed from
@@ -77,17 +84,38 @@ def render(
     scales = None
     rotations = None
     cov3D_precomp = None
-    scales, opacity = pc.get_scaling_n_opacity_with_3D_filter
-    rotations = pc.get_rotation
+    if isinstance(pc, GaussianBackgroundModel):
+        scales = pc.get_scaling
+        opacity = pc.get_opacity
+        rotations = pc.get_rotation
+        shs = pc.get_features
+        sg_axis = torch.zeros((pc.get_xyz.shape[0], 0, 3), dtype=means3D.dtype, device=means3D.device)
+        sg_sharpness = torch.zeros((pc.get_xyz.shape[0], 0), dtype=means3D.dtype, device=means3D.device)
+        sg_color = torch.zeros((pc.get_xyz.shape[0], 0, 3), dtype=means3D.dtype, device=means3D.device)
+    else:
+        scales, opacity = pc.get_scaling_n_opacity_with_3D_filter
+        rotations = pc.get_rotation
+        shs = pc.get_features
+        sg_axis = pc.get_sg_axis
+        sg_sharpness = pc.get_sg_sharpness
+        sg_color = pc.get_sg_color
+
+    if bg_splats is not None:
+        bg_count = bg_splats.get_xyz.shape[0]
+        scales = torch.cat([scales, bg_splats.get_scaling], dim=0)
+        opacity = torch.cat([opacity, bg_splats.get_opacity], dim=0)
+        rotations = torch.cat([rotations, bg_splats.get_rotation], dim=0)
+        shs = torch.cat([shs, bg_splats.get_features], dim=0)
+        zero_axis = torch.zeros((bg_count, pc.max_sg_degree, 3), dtype=sg_axis.dtype, device=sg_axis.device)
+        zero_sharpness = torch.zeros((bg_count, pc.max_sg_degree), dtype=sg_sharpness.dtype, device=sg_sharpness.device)
+        zero_color = torch.zeros((bg_count, pc.max_sg_degree, 3), dtype=sg_color.dtype, device=sg_color.device)
+        sg_axis = torch.cat([sg_axis, zero_axis], dim=0)
+        sg_sharpness = torch.cat([sg_sharpness, zero_sharpness], dim=0)
+        sg_color = torch.cat([sg_color, zero_color], dim=0)
 
     # If precomputed colors are provided, use them. Otherwise, if it is desired to precompute colors
     # from SHs in Python, do it. If not, then SH -> RGB conversion will be done by rasterizer.
-    shs = pc.get_features
     colors_precomp = None
-    
-    sg_axis = pc.get_sg_axis
-    sg_sharpness = pc.get_sg_sharpness
-    sg_color = pc.get_sg_color
 
     rendered_image, radii, rendered_median_depth, rendered_alpha, rendered_normal, accum_metric_counts = rasterizer(
         means3D = means3D,
