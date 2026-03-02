@@ -106,16 +106,17 @@ class _RasterizeGaussians(torch.autograd.Function):
         if raster_settings.debug:
             cpu_args = cpu_deep_copy_tuple(args)  # Copy them before they can be corrupted
             try:
-                num_rendered, color, alpha, normal, mdepth, radii, geomBuffer, binningBuffer, imgBuffer, tileBuffer, accum_metric_counts = _C.rasterize_gaussians(*args)
+                num_rendered, num_buckets, color, alpha, normal, mdepth, radii, geomBuffer, binningBuffer, imgBuffer, tileBuffer, sampleBuffer, accum_metric_counts = _C.rasterize_gaussians(*args)
             except Exception as ex:
                 torch.save(cpu_args, "snapshot_fw.dump")
                 print("\nAn error occured in forward. Please forward snapshot_fw.dump for debugging.")
                 raise ex
         else:
-            num_rendered, color, alpha, normal, mdepth, radii, geomBuffer, binningBuffer, imgBuffer, tileBuffer, accum_metric_counts = _C.rasterize_gaussians(*args)
+            num_rendered, num_buckets, color, alpha, normal, mdepth, radii, geomBuffer, binningBuffer, imgBuffer, tileBuffer, sampleBuffer, accum_metric_counts = _C.rasterize_gaussians(*args)
         # Keep relevant tensors for backward
         ctx.raster_settings = raster_settings
         ctx.num_rendered = num_rendered
+        ctx.num_buckets = num_buckets
         ctx.save_for_backward(
             means3D,
             colors_precomp,
@@ -135,6 +136,7 @@ class _RasterizeGaussians(torch.autograd.Function):
             binningBuffer,
             imgBuffer,
             tileBuffer,
+            sampleBuffer,
         )
         return color, radii, mdepth, alpha, normal, accum_metric_counts
 
@@ -142,6 +144,7 @@ class _RasterizeGaussians(torch.autograd.Function):
     def backward(ctx, grad_color, grad_radii, grad_mdepth, grad_alpha, grad_normal, grad_metric):
         # Restore necessary values from context
         num_rendered = ctx.num_rendered
+        num_buckets = ctx.num_buckets
         raster_settings = ctx.raster_settings
         (
             means3D,
@@ -162,6 +165,7 @@ class _RasterizeGaussians(torch.autograd.Function):
             binningBuffer,
             imgBuffer,
             tileBuffer,
+            sampleBuffer,
         ) = ctx.saved_tensors
 
         # Restructure args as C++ method expects them
@@ -196,9 +200,11 @@ class _RasterizeGaussians(torch.autograd.Function):
             radii,
             geomBuffer,
             num_rendered,
+            num_buckets,
             binningBuffer,
             imgBuffer,
             tileBuffer,
+            sampleBuffer,
             raster_settings.require_depth,
             raster_settings.debug,
         )

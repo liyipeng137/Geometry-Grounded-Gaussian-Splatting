@@ -15,7 +15,7 @@
 #include <torch/extension.h>
 #include <tuple>
 
-std::tuple<int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+std::tuple<int, int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 RasterizeGaussiansCUDA(
     const torch::Tensor& background,
     const torch::Tensor& means3D,
@@ -77,9 +77,11 @@ RasterizeGaussiansBackwardCUDA(
     const torch::Tensor& radii,
     const torch::Tensor& geomBuffer,
     const int R,
+    const int B,
     const torch::Tensor& binningBuffer,
     const torch::Tensor& imageBuffer,
     const torch::Tensor& tileBuffer,
+    const torch::Tensor& sampleBuffer,
     const bool require_depth,
     const bool debug);
 

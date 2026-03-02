@@ -158,6 +158,15 @@ __global__ void countPointBatches(int B, const uint2* ranges, uint32_t* tile_rou
     tile_rounds[idx] = rounds;
 }
 
+__global__ void countRenderBuckets(int T, const uint2* ranges, uint32_t* bucket_count) {
+    auto idx = cg::this_grid().thread_rank();
+    if (idx >= T)
+        return;
+    const uint2 range = ranges[idx];
+    const int num_splats = range.y - range.x;
+    bucket_count[idx] = static_cast<uint32_t>((num_splats + 31) / 32);
+}
+
 __global__ void setBlockId(int B, const uint32_t* tile_offsets, const uint32_t* tile_rounds, uint32_t* tile_ids) {
     auto idx = cg::this_grid().thread_rank();
     if (idx >= B)
@@ -234,8 +243,12 @@ CudaRasterizer::TileState<true> CudaRasterizer::TileState<true>::fromChunk(char*
 
 CudaRasterizer::TileState<false> CudaRasterizer::TileState<false>::fromChunk(char*& chunk, size_t N) {
     TileState<false> tiles;
+    cub::DeviceScan::InclusiveSum(nullptr, tiles.scan_size, tiles.bucket_count, tiles.bucket_count, N);
     obtain(chunk, tiles.gaussian_ranges, N, 128);
     obtain(chunk, tiles.max_contributor, N, 128);
+    obtain(chunk, tiles.bucket_count, N, 128);
+    obtain(chunk, tiles.bucket_offsets, N, 128);
+    obtain(chunk, tiles.scanning_space, tiles.scan_size, 128);
     return tiles;
 }
 
@@ -250,7 +263,16 @@ CudaRasterizer::ImageState CudaRasterizer::ImageState::fromChunk(char*& chunk, s
     ImageState img;
     obtain(chunk, img.n_contrib, N, 128);
     obtain(chunk, img.normal_length, N, 128);
+    obtain(chunk, img.pixel_colors, N * NUM_CHANNELS, 128);
     return img;
+}
+
+CudaRasterizer::SampleState CudaRasterizer::SampleState::fromChunk(char*& chunk, size_t B) {
+    SampleState sample;
+    obtain(chunk, sample.bucket_to_tile, B, 128);
+    obtain(chunk, sample.T, B * BLOCK_SIZE, 128);
+    obtain(chunk, sample.ar, B * BLOCK_SIZE * NUM_CHANNELS, 128);
+    return sample;
 }
 
 CudaRasterizer::BinningState CudaRasterizer::BinningState::fromChunk(char*& chunk, size_t P) {
@@ -269,11 +291,12 @@ CudaRasterizer::BinningState CudaRasterizer::BinningState::fromChunk(char*& chun
 
 // Forward rendering procedure for differentiable rasterization
 // of Gaussians.
-int CudaRasterizer::Rasterizer::forward(
+int2 CudaRasterizer::Rasterizer::forward(
     std::function<char*(size_t)> geometryBuffer,
     std::function<char*(size_t)> binningBuffer,
     std::function<char*(size_t)> imageBuffer,
     std::function<char*(size_t)> tileBuffer,
+    std::function<char*(size_t)> sampleBuffer,
     const int P, int SHD, int SHM, int SGD, int SGM,
     const float* background,
     const int width, int height,
@@ -311,6 +334,7 @@ int CudaRasterizer::Rasterizer::forward(
     dim3 tile_grid((width + BLOCK_X - 1) / BLOCK_X, (height + BLOCK_Y - 1) / BLOCK_Y, 1);
     dim3 block(BLOCK_X, BLOCK_Y, 1);
     const int tiles = tile_grid.x * tile_grid.y;
+    int bucket_sum = 0;
 
     size_t chunk_size       = required<GeometryState>(P);
     char* chunkptr          = geometryBuffer(chunk_size);
@@ -319,11 +343,6 @@ int CudaRasterizer::Rasterizer::forward(
     size_t tile_chunk_size     = required<TileState<false>>(tiles);
     char* tile_chunkptr        = tileBuffer(tile_chunk_size);
     TileState<false> tileState = TileState<false>::fromChunk(tile_chunkptr, tiles);
-
-    // Dynamically resize image-based auxiliary buffers during training
-    size_t img_chunk_size = required<ImageState>(width * height);
-    char* img_chunkptr    = imageBuffer(img_chunk_size);
-    ImageState imgState   = ImageState::fromChunk(img_chunkptr, width * height);
 
     if (radii == nullptr) {
         radii = geomState.internal_radii;
@@ -412,12 +431,39 @@ int CudaRasterizer::Rasterizer::forward(
             tileState.gaussian_ranges);
     CHECK_CUDA(, debug);
 
+    if (!require_depth) {
+        countRenderBuckets<<<(tiles + 255) / 256, 256>>>(tiles, tileState.gaussian_ranges, tileState.bucket_count);
+        CHECK_CUDA(cub::DeviceScan::InclusiveSum(
+                       tileState.scanning_space,
+                       tileState.scan_size,
+                       tileState.bucket_count,
+                       tileState.bucket_offsets,
+                       tiles),
+                   debug)
+        CHECK_CUDA(cudaMemcpy(&bucket_sum, tileState.bucket_offsets + tiles - 1, sizeof(int), cudaMemcpyDeviceToHost), debug);
+    }
+
+    size_t img_chunk_size = required<ImageState>(width * height);
+    char* img_chunkptr    = imageBuffer(img_chunk_size);
+    ImageState imgState   = ImageState::fromChunk(img_chunkptr, width * height);
+
+    SampleState sampleState = {};
+    if (!require_depth && bucket_sum > 0) {
+        size_t sample_chunk_size = required<SampleState>(bucket_sum);
+        char* sample_chunkptr    = sampleBuffer(sample_chunk_size);
+        sampleState              = SampleState::fromChunk(sample_chunkptr, bucket_sum);
+    }
+
     // Let each tile blend its range of Gaussians independently in parallel
     const float* feature_ptr = colors_precomp != nullptr ? colors_precomp : geomState.rgb;
     CHECK_CUDA(FORWARD::render(
                    tile_grid, block,
                    tileState.gaussian_ranges,
                    binningState.point_list,
+                   tileState.bucket_offsets,
+                   sampleState.bucket_to_tile,
+                   sampleState.T,
+                   sampleState.ar,
                    width, height,
                    geomState.means2D,
                    geomState.conic_opacity,
@@ -433,19 +479,20 @@ int CudaRasterizer::Rasterizer::forward(
                    background,
                    out_color,
                    out_alpha,
+                   imgState.pixel_colors,
                    out_normal,
                    out_mdepth,
                    imgState.normal_length,
                    require_depth),
                debug);
-    return num_rendered;
+    return {num_rendered, bucket_sum};
 }
 
 // Produce necessary gradients for optimization, corresponding
 // to forward render pass
 void CudaRasterizer::Rasterizer::backward(
     std::function<char*(size_t)> geometryBuffer,
-    const int P, int SHD, int SHM, int SGD, int SGM, int R,
+    const int P, int SHD, int SHM, int SGD, int SGM, int R, int B,
     const float* background,
     const int width, int height,
     const float* means3D,
@@ -473,6 +520,7 @@ void CudaRasterizer::Rasterizer::backward(
     char* binning_buffer,
     char* img_buffer,
     char* tile_buffer,
+    char* sample_buffer,
     const float* dL_dpix,
     const float* dL_dpix_mdepth,
     const float* dL_dalphas,
@@ -508,6 +556,7 @@ void CudaRasterizer::Rasterizer::backward(
     const dim3 tile_grid((width + BLOCK_X - 1) / BLOCK_X, (height + BLOCK_Y - 1) / BLOCK_Y, 1);
     const dim3 block(BLOCK_X, BLOCK_Y, 1);
     TileState<false> tileState = TileState<false>::fromChunk(tile_buffer, tile_grid.x * tile_grid.y);
+    SampleState sampleState    = SampleState::fromChunk(sample_buffer, B);
 
     // Compute loss gradients w.r.t. 2D mean position, conic matrix,
     // opacity and RGB of Gaussians from per-pixel loss gradients.
@@ -518,6 +567,11 @@ void CudaRasterizer::Rasterizer::backward(
                    block,
                    tileState.gaussian_ranges,
                    binningState.point_list,
+                   B,
+                   tileState.bucket_offsets,
+                   sampleState.bucket_to_tile,
+                   sampleState.T,
+                   sampleState.ar,
                    width, height,
                    background,
                    geomState.means2D,
@@ -532,6 +586,7 @@ void CudaRasterizer::Rasterizer::backward(
                    imgState.normal_length,
                    imgState.n_contrib,
                    tileState.max_contributor,
+                   imgState.pixel_colors,
                    dL_dpix,
                    dL_dpix_mdepth,
                    dL_dalphas,

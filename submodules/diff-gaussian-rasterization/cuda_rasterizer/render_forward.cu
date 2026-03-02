@@ -682,11 +682,152 @@ __global__ void __launch_bounds__(BLOCK_X* BLOCK_Y)
         max_contributors[block_id] = block_max;
 }
 
+template <uint32_t CHANNELS>
+__global__ void __launch_bounds__(BLOCK_X* BLOCK_Y)
+    renderBucketCUDA(
+        const uint2* __restrict__ ranges,
+        const uint32_t* __restrict__ point_list,
+        const uint32_t* __restrict__ bucket_offsets,
+        uint32_t* __restrict__ bucket_to_tile,
+        float* __restrict__ sampled_T,
+        float* __restrict__ sampled_ar,
+        int W, int H,
+        const float2* __restrict__ points_xy_image,
+        const float4* __restrict__ conic_opacity,
+        const float* __restrict__ features,
+        uint32_t* __restrict__ n_contrib,
+        uint32_t* __restrict__ max_contributors,
+        const int* __restrict__ metric_map,
+        bool get_flag,
+        int* __restrict__ metricCount,
+        const float* __restrict__ bg_color,
+        float* __restrict__ out_color,
+        float* __restrict__ out_alpha,
+        float* __restrict__ pixel_colors) {
+    auto block                 = cg::this_thread_block();
+    const uint32_t horizontal_blocks = (W + BLOCK_X - 1) / BLOCK_X;
+    const uint32_t tile_id     = block.group_index().y * horizontal_blocks + block.group_index().x;
+    const uint2 pix            = {block.group_index().x * BLOCK_X + block.thread_index().x,
+                                  block.group_index().y * BLOCK_Y + block.thread_index().y};
+    const uint32_t pix_id      = W * pix.y + pix.x;
+    const float2 pixf          = {static_cast<float>(pix.x), static_cast<float>(pix.y)};
+
+    const bool inside = pix.x < W && pix.y < H;
+    bool done         = !inside;
+
+    const uint2 range  = ranges[tile_id];
+    const int rounds   = (range.y - range.x + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    int toDo           = range.y - range.x;
+    const uint32_t bbm = tile_id == 0 ? 0 : bucket_offsets[tile_id - 1];
+    const int num_buckets = (toDo + 31) / 32;
+
+    for (int i = 0; i < (num_buckets + BLOCK_SIZE - 1) / BLOCK_SIZE; ++i) {
+        const int bucket_idx = i * BLOCK_SIZE + block.thread_rank();
+        if (bucket_idx < num_buckets) {
+            bucket_to_tile[bbm + bucket_idx] = tile_id;
+        }
+    }
+
+    __shared__ int collected_id[BLOCK_SIZE];
+    __shared__ float2 collected_xy[BLOCK_SIZE];
+    __shared__ float4 collected_conic_opacity[BLOCK_SIZE];
+
+    float T                   = 1.0f;
+    uint32_t contributor      = 0;
+    uint32_t last_contributor = 0;
+    float C[CHANNELS]         = {0};
+    uint32_t bucket_base      = bbm;
+
+    for (int i = 0; i < rounds; i++, toDo -= BLOCK_SIZE) {
+        int block_done = __syncthreads_and(done);
+        if (block_done)
+            break;
+
+        int progress = i * BLOCK_SIZE + block.thread_rank();
+        if (range.x + progress < range.y) {
+            const int coll_id                          = point_list[range.x + progress];
+            collected_id[block.thread_rank()]          = coll_id;
+            collected_xy[block.thread_rank()]          = points_xy_image[coll_id];
+            collected_conic_opacity[block.thread_rank()] = conic_opacity[coll_id];
+        }
+        block.sync();
+
+        for (int j = 0; !done && j < min(BLOCK_SIZE, toDo); j++) {
+            if ((j & 31) == 0) {
+                sampled_T[bucket_base * BLOCK_SIZE + block.thread_rank()] = T;
+                for (int ch = 0; ch < CHANNELS; ch++) {
+                    sampled_ar[(bucket_base * CHANNELS + ch) * BLOCK_SIZE + block.thread_rank()] = C[ch];
+                }
+                ++bucket_base;
+            }
+
+            contributor++;
+
+            const float2 xy    = collected_xy[j];
+            const float2 d     = {xy.x - pixf.x, xy.y - pixf.y};
+            const float4 con_o = collected_conic_opacity[j];
+            const float power  = -0.5f * (con_o.x * d.x * d.x + con_o.z * d.y * d.y) - con_o.y * d.x * d.y;
+            if (power > 0.0f)
+                continue;
+
+            const float alpha = fminf(0.99f, con_o.w * expf(power));
+            if (alpha < 1.0f / 255.0f)
+                continue;
+
+            const float test_T = T * (1.f - alpha);
+            if (test_T < 0.0001f) {
+                done = true;
+                continue;
+            }
+
+            const float aT = alpha * T;
+            for (int ch = 0; ch < CHANNELS; ch++) {
+                C[ch] += features[collected_id[j] * CHANNELS + ch] * aT;
+            }
+            if (get_flag && metric_map != nullptr && metricCount != nullptr && metric_map[pix_id] == 1) {
+                atomicAdd(&(metricCount[collected_id[j]]), 1);
+            }
+
+            T = test_T;
+            last_contributor = contributor;
+        }
+    }
+
+    using BlockReduce = cub::BlockReduce<uint32_t,
+                                         BLOCK_X,
+                                         cub::BLOCK_REDUCE_WARP_REDUCTIONS,
+                                         BLOCK_Y, 1>;
+    __shared__ typename BlockReduce::TempStorage temp_storage;
+#if CUDA_VERSION_AT_LEAST_12_9
+    const uint32_t block_max =
+        BlockReduce(temp_storage).Reduce(last_contributor, cuda::maximum<uint32_t>{});
+#else
+    auto op = [] __device__(uint32_t a, uint32_t b) { return max(a, b); };
+    const uint32_t block_max =
+        BlockReduce(temp_storage).Reduce(last_contributor, op);
+#endif
+
+    if (inside) {
+        n_contrib[pix_id] = last_contributor;
+        for (int ch = 0; ch < CHANNELS; ch++) {
+            pixel_colors[ch * H * W + pix_id] = C[ch];
+            out_color[ch * H * W + pix_id]    = C[ch] + T * bg_color[ch];
+        }
+        out_alpha[pix_id] = 1.f - T;
+    }
+    if (block.thread_rank() == 0)
+        max_contributors[tile_id] = block_max;
+}
+
 // the Bool inputs can be replaced by an enumeration variable for different functions.
 void FORWARD::render(
     const dim3 grid, dim3 block,
     const uint2* ranges,
     const uint32_t* point_list,
+    const uint32_t* bucket_offsets,
+    uint32_t* bucket_to_tile,
+    float* sampled_T,
+    float* sampled_ar,
     int W, int H,
     const float2* means2D,
     const float4* conic_opacity,
@@ -703,6 +844,7 @@ void FORWARD::render(
     const float* bg_color,
     float* out_color,
     float* out_alpha,
+    float* pixel_colors,
     float* out_normal,
     float* out_mdepth,
     float* normal_length,
@@ -718,7 +860,26 @@ void FORWARD::render(
     if (require_depth)
         RENDER_CUDA_CALL(true);
     else
-        RENDER_CUDA_CALL(false);
+        renderBucketCUDA<NUM_CHANNELS><<<grid, block>>>(
+            ranges,
+            point_list,
+            bucket_offsets,
+            bucket_to_tile,
+            sampled_T,
+            sampled_ar,
+            W, H,
+            means2D,
+            conic_opacity,
+            colors,
+            n_contrib,
+            max_contributor,
+            metric_map,
+            get_flag,
+            metricCount,
+            bg_color,
+            out_color,
+            out_alpha,
+            pixel_colors);
 
 #undef RENDER_CUDA_CALL
 }

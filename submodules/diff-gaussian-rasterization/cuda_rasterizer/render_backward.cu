@@ -712,6 +712,196 @@ __global__ void preprocessCUDA(
                              (glm::vec3*)dL_dmeans, (glm::vec3*)dL_dsh, (glm::vec3*)dL_dsg_axis, dL_dsg_sharpness, (glm::vec3*)dL_dsg_color);
 }
 
+template <uint32_t C>
+__global__ void renderBucketCUDA(
+    const uint2* __restrict__ ranges,
+    const uint32_t* __restrict__ point_list,
+    int B,
+    const uint32_t* __restrict__ bucket_offsets,
+    const uint32_t* __restrict__ bucket_to_tile,
+    const float* __restrict__ sampled_T,
+    const float* __restrict__ sampled_ar,
+    int W, int H,
+    const float* __restrict__ bg_color,
+    const float2* __restrict__ points_xy_image,
+    const float4* __restrict__ conic_opacity,
+    const float* __restrict__ colors,
+    const float* __restrict__ alphas,
+    const uint32_t* __restrict__ n_contrib,
+    const uint32_t* __restrict__ max_contributors,
+    const float* __restrict__ pixel_colors,
+    const float* __restrict__ dL_dpixels,
+    const float* __restrict__ dL_dalphas,
+    float3* __restrict__ dL_dmean2D,
+    float4* __restrict__ dL_dconic2D,
+    float* __restrict__ dL_dcolors) {
+    const uint32_t global_bucket_idx = blockIdx.x;
+    if (global_bucket_idx >= static_cast<uint32_t>(B))
+        return;
+
+    cg::thread_block block         = cg::this_thread_block();
+    cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
+
+    const uint32_t tile_id         = bucket_to_tile[global_bucket_idx];
+    const uint2 range              = ranges[tile_id];
+    const int num_splats_in_tile   = range.y - range.x;
+    const uint32_t bucket_base     = tile_id == 0 ? 0 : bucket_offsets[tile_id - 1];
+    const int bucket_idx_in_tile   = global_bucket_idx - bucket_base;
+    const int splat_idx_in_tile    = bucket_idx_in_tile * 32 + warp.thread_rank();
+    const int splat_idx_global     = range.x + splat_idx_in_tile;
+    if (bucket_idx_in_tile * 32 >= max_contributors[tile_id])
+        return;
+
+    const bool valid_splat = splat_idx_in_tile < num_splats_in_tile;
+
+    int gaussian_idx = 0;
+    float2 xy        = {0.0f, 0.0f};
+    float4 con_o     = {0.0f, 0.0f, 0.0f, 0.0f};
+    float c[C]       = {0.0f};
+    if (valid_splat) {
+        gaussian_idx = point_list[splat_idx_global];
+        xy           = points_xy_image[gaussian_idx];
+        con_o        = conic_opacity[gaussian_idx];
+        for (int ch = 0; ch < C; ch++) {
+            c[ch] = colors[gaussian_idx * C + ch];
+        }
+    }
+
+    float reg_dL_dmean_x     = 0.0f;
+    float reg_dL_dmean_y     = 0.0f;
+    float reg_dL_dmean_abs   = 0.0f;
+    float reg_dL_dconic_x    = 0.0f;
+    float reg_dL_dconic_y    = 0.0f;
+    float reg_dL_dconic_z    = 0.0f;
+    float reg_dL_dopacity    = 0.0f;
+    float reg_dL_dcolors[C]  = {0.0f};
+
+    const uint32_t horizontal_blocks = (W + BLOCK_X - 1) / BLOCK_X;
+    const uint2 tile                 = {tile_id % horizontal_blocks, tile_id / horizontal_blocks};
+    const uint2 pix_min              = {tile.x * BLOCK_X, tile.y * BLOCK_Y};
+
+    float T                = 0.0f;
+    float T_final          = 0.0f;
+    float dL_dfinalT       = 0.0f;
+    float last_contributor = 0.0f;
+    float ar[C]            = {0.0f};
+    float dL_dpixel[C]     = {0.0f};
+    const float ddelx_dx   = 0.5f * W;
+    const float ddely_dy   = 0.5f * H;
+
+    __shared__ float shared_sampled_ar[32 * C];
+    __shared__ float shared_pixels[32 * C];
+
+    const float* bucket_sampled_ar = sampled_ar + global_bucket_idx * BLOCK_SIZE * C;
+
+#pragma unroll
+    for (int i = 0; i < BLOCK_SIZE + 31; ++i) {
+        if ((i & 31) == 0 && i < BLOCK_SIZE) {
+            for (int ch = 0; ch < C; ch++) {
+                const int shift = BLOCK_SIZE * ch + i + block.thread_rank();
+                shared_sampled_ar[ch * 32 + block.thread_rank()] = bucket_sampled_ar[shift];
+            }
+            const uint32_t local_id = i + block.thread_rank();
+            const uint2 shared_pix  = {pix_min.x + local_id % BLOCK_X, pix_min.y + local_id / BLOCK_X};
+            const bool shared_inside = shared_pix.x < W && shared_pix.y < H;
+            const uint32_t shared_pix_id = W * shared_pix.y + shared_pix.x;
+            for (int ch = 0; ch < C; ch++) {
+                shared_pixels[ch * 32 + block.thread_rank()] =
+                    shared_inside ? pixel_colors[ch * H * W + shared_pix_id] : 0.0f;
+            }
+            block.sync();
+        }
+
+        T                = warp.shfl_up(T, 1);
+        T_final          = warp.shfl_up(T_final, 1);
+        dL_dfinalT       = warp.shfl_up(dL_dfinalT, 1);
+        last_contributor = warp.shfl_up(last_contributor, 1);
+        for (int ch = 0; ch < C; ch++) {
+            ar[ch]        = warp.shfl_up(ar[ch], 1);
+            dL_dpixel[ch] = warp.shfl_up(dL_dpixel[ch], 1);
+        }
+
+        const int idx = i - warp.thread_rank();
+        const bool in_tile = 0 <= idx && idx < BLOCK_SIZE;
+        const uint2 pix = {
+            pix_min.x + static_cast<uint32_t>(in_tile ? (idx % BLOCK_X) : 0),
+            pix_min.y + static_cast<uint32_t>(in_tile ? (idx / BLOCK_X) : 0)};
+        const bool valid_pixel = in_tile && pix.x < W && pix.y < H;
+        const uint32_t pix_id  = W * pix.y + pix.x;
+        const float2 pixf      = {static_cast<float>(pix.x), static_cast<float>(pix.y)};
+
+        if (valid_splat && valid_pixel && warp.thread_rank() == 0) {
+            T          = sampled_T[global_bucket_idx * BLOCK_SIZE + idx];
+            const int ii = i & 31;
+            for (int ch = 0; ch < C; ch++) {
+                ar[ch] = -shared_pixels[ch * 32 + ii] + shared_sampled_ar[ch * 32 + ii];
+                dL_dpixel[ch] = dL_dpixels[ch * H * W + pix_id];
+            }
+            T_final          = 1.0f - alphas[pix_id];
+            last_contributor = n_contrib[pix_id];
+            dL_dfinalT       = -dL_dalphas[pix_id];
+            for (int ch = 0; ch < C; ch++) {
+                dL_dfinalT += bg_color[ch] * dL_dpixel[ch];
+            }
+        }
+
+        if (!(valid_splat && valid_pixel))
+            continue;
+        if (splat_idx_in_tile >= last_contributor)
+            continue;
+
+        const float2 d   = {xy.x - pixf.x, xy.y - pixf.y};
+        const float power = -0.5f * (con_o.x * d.x * d.x + con_o.z * d.y * d.y) - con_o.y * d.x * d.y;
+        if (power > 0.0f)
+            continue;
+
+        const float G     = expf(power);
+        const float alpha = fminf(0.99f, con_o.w * G);
+        if (alpha < 1.0f / 255.0f)
+            continue;
+
+        const float blending_weight      = alpha * T;
+        const float one_minus_alpha_reci = 1.0f / (1.0f - alpha);
+        float dL_dopa                    = 0.0f;
+        for (int ch = 0; ch < C; ch++) {
+            ar[ch] += blending_weight * c[ch];
+            reg_dL_dcolors[ch] += blending_weight * dL_dpixel[ch];
+            dL_dopa += (c[ch] * T + one_minus_alpha_reci * ar[ch]) * dL_dpixel[ch];
+        }
+        dL_dopa += (-T_final * one_minus_alpha_reci) * dL_dfinalT;
+        T *= (1.0f - alpha);
+
+        const float dL_dG    = con_o.w * dL_dopa;
+        const float gdx      = G * d.x;
+        const float gdy      = G * d.y;
+        const float dG_ddelx = -gdx * con_o.x - gdy * con_o.y;
+        const float dG_ddely = -gdy * con_o.z - gdx * con_o.y;
+
+        const float tmp_x = dL_dG * dG_ddelx * ddelx_dx;
+        const float tmp_y = dL_dG * dG_ddely * ddely_dy;
+        reg_dL_dmean_x += tmp_x;
+        reg_dL_dmean_y += tmp_y;
+        reg_dL_dmean_abs += fabsf(tmp_x) + fabsf(tmp_y);
+        reg_dL_dconic_x += -0.5f * gdx * d.x * dL_dG;
+        reg_dL_dconic_y += -0.5f * gdx * d.y * dL_dG;
+        reg_dL_dconic_z += -0.5f * gdy * d.y * dL_dG;
+        reg_dL_dopacity += G * dL_dopa;
+    }
+
+    if (valid_splat) {
+        atomicAdd(&dL_dmean2D[gaussian_idx].x, reg_dL_dmean_x);
+        atomicAdd(&dL_dmean2D[gaussian_idx].y, reg_dL_dmean_y);
+        atomicAdd(&dL_dmean2D[gaussian_idx].z, reg_dL_dmean_abs);
+        atomicAdd(&dL_dconic2D[gaussian_idx].x, reg_dL_dconic_x);
+        atomicAdd(&dL_dconic2D[gaussian_idx].y, reg_dL_dconic_y);
+        atomicAdd(&dL_dconic2D[gaussian_idx].z, reg_dL_dconic_z);
+        atomicAdd(&dL_dconic2D[gaussian_idx].w, reg_dL_dopacity);
+        for (int ch = 0; ch < C; ch++) {
+            atomicAdd(&dL_dcolors[gaussian_idx * C + ch], reg_dL_dcolors[ch]);
+        }
+    }
+}
+
 // Backward version of the rendering procedure.
 template <uint32_t C, bool GEOMETRY>
 __global__ void __launch_bounds__(BLOCK_X* BLOCK_Y)
@@ -1165,6 +1355,11 @@ void BACKWARD::render(
     const dim3 grid, const dim3 block,
     const uint2* ranges,
     const uint32_t* point_list,
+    int B,
+    const uint32_t* bucket_offsets,
+    const uint32_t* bucket_to_tile,
+    const float* sampled_T,
+    const float* sampled_ar,
     int W, int H,
     const float* bg_color,
     const float2* means2D,
@@ -1179,6 +1374,7 @@ void BACKWARD::render(
     const float* normal_length,
     const uint32_t* n_contrib,
     const uint32_t* max_contributors,
+    const float* pixel_colors,
     const float* dL_dpixels,
     const float* dL_dpixel_mdepth,
     const float* dL_dalphas,
@@ -1191,6 +1387,13 @@ void BACKWARD::render(
     float4* dL_dray_planes,
     float3* dL_dnormals,
     bool require_depth) {
+#define RENDER_BUCKET_CALL()                                                         \
+    renderBucketCUDA<NUM_CHANNELS><<<B, 32>>>(                                      \
+        ranges, point_list, B, bucket_offsets, bucket_to_tile, sampled_T, sampled_ar, \
+        W, H, bg_color, means2D, conic_opacity, colors, alphas, n_contrib,         \
+        max_contributors, pixel_colors, dL_dpixels, dL_dalphas, dL_dmean2D,        \
+        dL_dconic2D, dL_dcolors)
+
 #define RENDER_CUDA_CALL(template_depth)                                    \
     renderCUDA<NUM_CHANNELS, template_depth><<<grid, block>>>(              \
         ranges, point_list, W, H, bg_color, means2D, conic_opacity, colors, \
@@ -1202,8 +1405,9 @@ void BACKWARD::render(
 
     if (require_depth)
         RENDER_CUDA_CALL(true);
-    else
-        RENDER_CUDA_CALL(false);
+    else if (B > 0)
+        RENDER_BUCKET_CALL();
 
 #undef RENDER_CUDA_CALL
+#undef RENDER_BUCKET_CALL
 }

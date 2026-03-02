@@ -26,11 +26,12 @@ public:
         float* projmatrix,
         bool* present);
 
-    static int forward(
+    static int2 forward(
         std::function<char*(size_t)> geometryBuffer,
         std::function<char*(size_t)> binningBuffer,
         std::function<char*(size_t)> imageBuffer,
         std::function<char*(size_t)> tileBuffer,
+        std::function<char*(size_t)> sampleBuffer,
         const int P, int SHD, int SHM, int SGD, int SGM,
         const float* background,
         const int width, int height,
@@ -66,6 +67,7 @@ public:
     static void backward(
         std::function<char*(size_t)> geometryBuffer,
         const int P, int SHD, int SHM, int SGD, int SGM, int R,
+        const int B,
         const float* background,
         const int width, int height,
         const float* means3D,
@@ -93,6 +95,7 @@ public:
         char* binning_buffer,
         char* image_buffer,
         char* tile_buffer,
+        char* sample_buffer,
         const float* dL_dpix,
         const float* dL_dpix_mdepth,
         const float* dL_dalphas,

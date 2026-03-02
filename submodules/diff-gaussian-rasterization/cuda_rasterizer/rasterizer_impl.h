@@ -79,8 +79,12 @@ struct TileState<true> {
 
 template<>
 struct TileState<false> {
+    size_t scan_size;
     uint2* gaussian_ranges;
     uint32_t* max_contributor;
+    uint32_t* bucket_count;
+    uint32_t* bucket_offsets;
+    char* scanning_space;
 
     static TileState<false> fromChunk(char*& chunk, size_t N);
 };
@@ -94,8 +98,17 @@ struct DuplicatedTileState {
 struct ImageState {
     uint32_t* n_contrib;
     float* normal_length;
+    float* pixel_colors;
 
     static ImageState fromChunk(char*& chunk, size_t N);
+};
+
+struct SampleState {
+    uint32_t* bucket_to_tile;
+    float* T;
+    float* ar;
+
+    static SampleState fromChunk(char*& chunk, size_t B);
 };
 
 struct BinningState {

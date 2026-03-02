@@ -36,7 +36,7 @@ std::function<char*(size_t N)> resizeFunctional(torch::Tensor& t) {
     return lambda;
 }
 
-std::tuple<int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+std::tuple<int, int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 RasterizeGaussiansCUDA(
     const torch::Tensor& background,
     const torch::Tensor& means3D,
@@ -88,10 +88,12 @@ RasterizeGaussiansCUDA(
     torch::Tensor binningBuffer              = torch::empty({0}, options.device(device));
     torch::Tensor imgBuffer                  = torch::empty({0}, options.device(device));
     torch::Tensor tileBuffer                 = torch::empty({0}, options.device(device));
+    torch::Tensor sampleBuffer               = torch::empty({0}, options.device(device));
     std::function<char*(size_t)> geomFunc    = resizeFunctional(geomBuffer);
     std::function<char*(size_t)> binningFunc = resizeFunctional(binningBuffer);
     std::function<char*(size_t)> imgFunc     = resizeFunctional(imgBuffer);
     std::function<char*(size_t)> tileFunc    = resizeFunctional(tileBuffer);
+    std::function<char*(size_t)> sampleFunc  = resizeFunctional(sampleBuffer);
     int* accum_metric_counts_ptr             = nullptr;
     torch::Tensor metricCount                = torch::empty({0}, int_opts);
     if (get_flag) {
@@ -100,6 +102,7 @@ RasterizeGaussiansCUDA(
     }
 
     int rendered = 0;
+    int buckets  = 0;
     if (P != 0) {
         int SHM = 0, SGM = 0;
         if (sh.size(0) != 0) {
@@ -109,11 +112,12 @@ RasterizeGaussiansCUDA(
             SGM = sg_color.size(1);
         }
 
-        rendered = CudaRasterizer::Rasterizer::forward(
+        const int2 forward_result = CudaRasterizer::Rasterizer::forward(
             geomFunc,
             binningFunc,
             imgFunc,
             tileFunc,
+            sampleFunc,
             P, sh_degree, SHM, sg_degree, SGM,
             background.contiguous().data_ptr<float>(),
             W, H,
@@ -145,8 +149,10 @@ RasterizeGaussiansCUDA(
             get_flag,
             accum_metric_counts_ptr,
             debug);
+        rendered = forward_result.x;
+        buckets  = forward_result.y;
     }
-    return std::make_tuple(rendered, out_color, out_alpha, out_normal, out_mdepth, radii, geomBuffer, binningBuffer, imgBuffer, tileBuffer, metricCount);
+    return std::make_tuple(rendered, buckets, out_color, out_alpha, out_normal, out_mdepth, radii, geomBuffer, binningBuffer, imgBuffer, tileBuffer, sampleBuffer, metricCount);
 }
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
@@ -181,9 +187,11 @@ RasterizeGaussiansBackwardCUDA(
     const torch::Tensor& radii,
     const torch::Tensor& geomBuffer,
     const int R,
+    const int B,
     const torch::Tensor& binningBuffer,
     const torch::Tensor& imageBuffer,
     const torch::Tensor& tileBuffer,
+    const torch::Tensor& sampleBuffer,
     const bool require_depth,
     const bool debug) {
     const int P = means3D.size(0);
@@ -218,7 +226,7 @@ RasterizeGaussiansBackwardCUDA(
     if (P != 0) {
         CudaRasterizer::Rasterizer::backward(
             geomFunc,
-            P, sh_degree, SHM, sg_degree, SGM, R,
+            P, sh_degree, SHM, sg_degree, SGM, R, B,
             background.contiguous().data_ptr<float>(),
             W, H,
             means3D.contiguous().data_ptr<float>(),
@@ -246,6 +254,7 @@ RasterizeGaussiansBackwardCUDA(
             reinterpret_cast<char*>(binningBuffer.contiguous().data_ptr()),
             reinterpret_cast<char*>(imageBuffer.contiguous().data_ptr()),
             reinterpret_cast<char*>(tileBuffer.contiguous().data_ptr()),
+            reinterpret_cast<char*>(sampleBuffer.contiguous().data_ptr()),
             dL_dout_color.contiguous().data_ptr<float>(),
             dL_dout_mdepth.contiguous().data_ptr<float>(),
             dL_dout_alpha.contiguous().data_ptr<float>(),
