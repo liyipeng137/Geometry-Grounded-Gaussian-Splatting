@@ -229,21 +229,21 @@ def training(
         # Custom fine-tuning for reflective case
         if reflective_case:
             lambda_multi_view_ncc_cur = 0.1 if iteration < 15000 else 0.0
-            if iteration < 5000:
+            if iteration < 3000:
                 lambda_normal_prior_cur = 0.0
-            elif 5000 <= iteration < 7000:
-                lambda_normal_prior_cur = 0.15 * (iteration - 5000) / 2000.0
-            elif 7000 <= iteration < 15000:
+            elif iteration < 7000:
+                lambda_normal_prior_cur = 0.15 * (iteration - 3000) / 4000.0
+            elif iteration < 15000:
                 lambda_normal_prior_cur = 0.15 + 0.1 * (iteration - 7000) / 8000.0
             else:
-                lambda_normal_prior_cur = 0.0
+                lambda_normal_prior_cur = 0.25
+
         else:
             lambda_multi_view_ncc_cur = 0.6
             lambda_normal_prior_cur = 0.0
 
-        reg_kick_on = opt.regularization_until_iter > iteration >= opt.regularization_from_iter
-        # normal_prior_phase_on = reflective_case and lambda_normal_prior_cur > 0
-        normal_prior_kick_on = reflective_case and lambda_normal_prior_cur > 0
+        reg_kick_on = (iteration >= opt.regularization_from_iter)  # 7k~2w
+        normal_prior_kick_on = reflective_case and lambda_normal_prior_cur > 0  # 5k~2w if reflective case
         depth_render_on = reg_kick_on or normal_prior_kick_on
         active_scale = low_resolution if depth_render_on else 1.0
 
