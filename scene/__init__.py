@@ -48,6 +48,9 @@ class Scene:
         self.bg_gaussians = bg_gaussians
         self.should_train_with_bg = bg_gaussians is not None
         self.scene_scale = None
+        self.low_resolution = float(args.low_resolution)
+        if self.low_resolution < 1.0:
+            raise ValueError(f"low_resolution must be >= 1.0, got {self.low_resolution}")
 
         if load_iteration:
             if load_iteration == -1:
@@ -86,11 +89,24 @@ class Scene:
 
         camera_centers_list: list[torch.Tensor] = []
         for resolution_scale in resolution_scales:
-            self.train_cameras[resolution_scale] = cameraList_from_camInfos(scene_info.train_cameras, resolution_scale, args)
+            load_aux_data = len(resolution_scales) == 1 or np.isclose(resolution_scale, self.low_resolution)
+            self.train_cameras[resolution_scale] = cameraList_from_camInfos(
+                scene_info.train_cameras,
+                resolution_scale,
+                args,
+                load_mask=load_aux_data,
+                load_normal=load_aux_data,
+            )
             print(f"Loading Training Cameras: {len(self.train_cameras[resolution_scale])} .")
 
-            self.test_cameras[resolution_scale] = cameraList_from_camInfos(scene_info.test_cameras, resolution_scale, args)
-            print(f"Loading Test Cameras: {len(self.test_cameras[resolution_scale])} .")
+            # self.test_cameras[resolution_scale] = cameraList_from_camInfos(
+            #     scene_info.test_cameras,
+            #     resolution_scale,
+            #     args,
+            #     load_mask=load_aux_data,
+            #     load_normal=load_aux_data,
+            # )
+            # print(f"Loading Test Cameras: {len(self.test_cameras[resolution_scale])} .")
 
             print("computing nearest_id")
             current_centers: list[torch.Tensor] = []

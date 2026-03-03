@@ -40,26 +40,6 @@ from utils.loss_utils import L1_loss_appearance, PatchMatch, l1_loss, ssim
 from utils.vcd_utils import compute_vcd_vcp_scores, sample_vcd_cameras
 
 
-# def normal_gradient_loss(rend_normal: torch.Tensor, gt_normal: torch.Tensor, valid_mask: torch.Tensor | None = None) -> torch.Tensor:
-#     sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], device=rend_normal.device, dtype=torch.float32).view(1, 1, 3, 3) / 4.0
-#     sobel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], device=rend_normal.device, dtype=torch.float32).view(1, 1, 3, 3) / 4.0
-
-#     rend_normal = rend_normal.unsqueeze(0)
-#     gt_normal = gt_normal.unsqueeze(0)
-#     rend_grad_x = F.conv2d(rend_normal, sobel_x.repeat(3, 1, 1, 1), padding=1, groups=3)
-#     rend_grad_y = F.conv2d(rend_normal, sobel_y.repeat(3, 1, 1, 1), padding=1, groups=3)
-#     gt_grad_x = F.conv2d(gt_normal, sobel_x.repeat(3, 1, 1, 1), padding=1, groups=3)
-#     gt_grad_y = F.conv2d(gt_normal, sobel_y.repeat(3, 1, 1, 1), padding=1, groups=3)
-
-#     if valid_mask is None:
-#         return F.mse_loss(rend_grad_x, gt_grad_x) + F.mse_loss(rend_grad_y, gt_grad_y)
-
-#     mask = valid_mask.float().unsqueeze(0).unsqueeze(0)
-#     loss_x = ((rend_grad_x - gt_grad_x).pow(2) * mask).sum() / (mask.sum() * 3.0 + 1e-6)
-#     loss_y = ((rend_grad_y - gt_grad_y).pow(2) * mask).sum() / (mask.sum() * 3.0 + 1e-6)
-#     return loss_x + loss_y
-
-
 def should_use_background_rgb(dataset, scene: Scene, reflective_case: bool, iteration: int, has_train_mask: bool) -> bool:
     if not dataset.train_with_background_rgb or not scene.should_train_with_bg:
         return False
@@ -67,6 +47,20 @@ def should_use_background_rgb(dataset, scene: Scene, reflective_case: bool, iter
         return False
     cutoff = 3000 if reflective_case else 7000
     return iteration < cutoff
+
+
+def get_low_resolution(dataset) -> float:
+    low_resolution = float(dataset.low_resolution)
+    if low_resolution < 1.0:
+        raise ValueError(f"low_resolution must be >= 1.0, got {low_resolution}")
+    return low_resolution
+
+
+def get_training_resolution_scales(dataset) -> list[float]:
+    low_resolution = get_low_resolution(dataset)
+    if np.isclose(low_resolution, 1.0):
+        return [1.0]
+    return [1.0, low_resolution]
 
 
 def training_bg(dataset, opt, pipe, scene: Scene, background: torch.Tensor, kernel_size: float) -> None:
@@ -129,7 +123,7 @@ def training(
     tb_writer = prepare_output_and_logger(dataset)
     gaussians = GaussianModel(dataset.sh_degree, dataset.sg_degree)
     bg_gaussians = GaussianBackgroundModel(dataset.sh_degree) if dataset.enable_background_sphere else None
-    scene = Scene(dataset, gaussians, bg_gaussians)
+    scene = Scene(dataset, gaussians, bg_gaussians, resolution_scales=get_training_resolution_scales(dataset))
     gaussians.training_setup(opt)
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
@@ -144,7 +138,9 @@ def training(
     iter_start = torch.cuda.Event(enable_timing=True)
     iter_end = torch.cuda.Event(enable_timing=True)
 
-    trainCameras = scene.getTrainCameras().copy()
+    low_resolution = get_low_resolution(dataset)
+    low_res_train_cameras = scene.getTrainCameras(scale=low_resolution).copy()
+    trainCameras = scene.getTrainCameras(scale=1.0).copy()
     if dataset.disable_filter3D:
         gaussians.reset_3D_filter()
     else:
@@ -165,19 +161,19 @@ def training(
     else:
         normal_root = os.path.join(dataset.source_path, dataset.normal_prior_dir)
     has_normal_dir = os.path.isdir(normal_root)
-    has_loaded_normal_prior = any(cam.normal_prior is not None for cam in scene.getTrainCameras())
-    has_train_mask = any(cam.gt_mask is not None for cam in scene.getTrainCameras())
+    has_loaded_normal_prior = any(cam.normal_prior is not None for cam in low_res_train_cameras)
+    has_loaded_mask = any(cam.gt_mask is not None for cam in low_res_train_cameras)
     reflective_case = has_normal_dir
     if reflective_case and not has_loaded_normal_prior:
         print("[Pipeline][Warn] normals directory exists but no valid normal priors were loaded.")
     print(f"[Pipeline] reflective_case={reflective_case} (normal_dir={normal_root}, loaded_priors={has_loaded_normal_prior})")
     has_mask_dir = os.path.isdir(os.path.join(dataset.source_path, dataset.mask_dir))
-    if has_mask_dir and not has_train_mask:
+    if has_mask_dir and not has_loaded_mask:
         print("[Pipeline][Warn] masks directory exists but no valid mask priors were loaded.")
-    print(f"[Pipeline] has_mask_dir={has_mask_dir} (mask_dir={os.path.join(dataset.source_path, dataset.mask_dir)}, loaded_masks={has_train_mask}), lambda_mask={opt.lambda_mask}")
+    print(f"[Pipeline] has_mask_dir={has_mask_dir} (mask_dir={os.path.join(dataset.source_path, dataset.mask_dir)}, loaded_masks={has_loaded_mask}), lambda_mask={opt.lambda_mask}")
+    print(f"[Pipeline] low_resolution={low_resolution}")
 
-
-    viewpoint_stack = None
+    viewpoint_stacks: dict[float, list[Camera] | None] = {scale: None for scale in get_training_resolution_scales(dataset)}
     ema_loss_for_log = 0.0
     ema_normal_loss_for_log = 0.0
     ema_normal_prior_loss_for_log = 0.0
@@ -226,11 +222,6 @@ def training(
                 gaussians.unlockSGdegree(100)
             gaussians.oneupSHdegree()
 
-        # Pick a random Camera
-        if not viewpoint_stack:
-            viewpoint_stack = scene.getTrainCameras().copy()
-        viewpoint_cam: Camera = viewpoint_stack.pop(randint(0, len(viewpoint_stack) - 1))
-
         # Render
         if (iteration - 1) == debug_from:
             pipe.debug = True
@@ -253,20 +244,23 @@ def training(
             lambda_normal_prior_cur = 0.0
 
         reg_kick_on = iteration >= opt.regularization_from_iter
-        normal_prior_kick_on = (
-            reflective_case
-            and
-            lambda_normal_prior_cur > 0
-            and viewpoint_cam.normal_prior is not None
-        )
-        bg_model = scene.bg_gaussians if should_use_background_rgb(dataset, scene, reflective_case, iteration, has_train_mask) else None
+        normal_prior_phase_on = reflective_case and lambda_normal_prior_cur > 0
+        active_scale = low_resolution if reg_kick_on or normal_prior_phase_on else 1.0
+        viewpoint_stack = viewpoint_stacks[active_scale]
+        if not viewpoint_stack:
+            viewpoint_stack = scene.getTrainCameras(scale=active_scale).copy()
+            viewpoint_stacks[active_scale] = viewpoint_stack
+        viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack) - 1))
+        normal_prior_kick_on = normal_prior_phase_on and viewpoint_cam.normal_prior is not None
+        need_depth_branch = reg_kick_on or normal_prior_kick_on
+        bg_model = scene.bg_gaussians if should_use_background_rgb(dataset, scene, reflective_case, iteration, has_loaded_mask) else None
         render_pkg = render(
             viewpoint_cam,
             gaussians,
             pipe,
             background,
             kernel_size,
-            require_depth=reg_kick_on or normal_prior_kick_on,
+            require_depth=need_depth_branch,
             bg_splats=bg_model,
         )
         rendered_image: torch.Tensor
@@ -280,7 +274,7 @@ def training(
 
         Ll1_render = L1_loss_appearance(rendered_image, gt_image, gaussians, viewpoint_cam.uid)
         # normal consistency / depth-derived normal
-        if reg_kick_on or normal_prior_kick_on:
+        if need_depth_branch:
             depth_map: torch.Tensor = render_pkg["median_depth"]
             rendered_normal: torch.Tensor = render_pkg["normal"]
             depth_normal, valid_points = depth_to_normal(viewpoint_cam, depth_map)
@@ -320,30 +314,21 @@ def training(
         else:
             normal_prior_loss = torch.tensor([0], dtype=torch.float32, device="cuda")
 
-        # if (
-        #     lambda_normal_gradient_cur > 0
-        #     and depth_normal is not None
-        #     and viewpoint_cam.normal_prior is not None
-        # ):
-        #     rend_alpha = render_pkg["mask"]
-        #     prior_normal_eff = prior_normal * (rend_alpha).detach()
-        #     grad_mask = viewpoint_cam.normal_prior_mask.squeeze(0)
-        #     if valid_points is not None:
-        #         grad_mask = grad_mask & valid_points.squeeze()
-        #     normal_grad_loss = normal_gradient_loss(depth_normal, prior_normal_eff, grad_mask)
-        # else:
-        #     normal_grad_loss = torch.tensor([0], dtype=torch.float32, device="cuda")
 
         # patch match loss
         if reg_kick_on and (lambda_multi_view_ncc_cur > 0 or opt.lambda_multi_view_geo):
-            nearest_cam = None if len(viewpoint_cam.nearest_id) == 0 else scene.getTrainCameras()[sample(viewpoint_cam.nearest_id, 1)[0]]
+            nearest_cam = (
+                None
+                if len(viewpoint_cam.nearest_id) == 0
+                else scene.getTrainCameras(scale=active_scale)[sample(viewpoint_cam.nearest_id, 1)[0]]
+            )
             ncc_loss, geo_loss = patchmatch(gaussians, render_pkg, viewpoint_cam, nearest_cam, iteration, depth_normal)
         else:
             ncc_loss = torch.tensor([0], dtype=torch.float32, device="cuda")
             geo_loss = torch.tensor([0], dtype=torch.float32, device="cuda")
 
         rgb_loss = (1.0 - opt.lambda_dssim) * Ll1_render + opt.lambda_dssim * (1.0 - ssim(rendered_image.unsqueeze(0), gt_image.unsqueeze(0)))
-        if opt.lambda_mask > 0 and viewpoint_cam.gt_mask is not None:
+        if opt.lambda_mask > 0 and viewpoint_cam.gt_mask is not None and need_depth_branch:
             opacity = 1.0 - render_pkg["mask"].clamp(1e-6, 1.0 - 1e-6)
             bg = 1.0 - viewpoint_cam.gt_mask
             mask_loss = (-bg * torch.log(opacity)).mean()

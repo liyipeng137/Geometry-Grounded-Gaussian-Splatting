@@ -68,6 +68,7 @@ class ModelParams(ParamGroup):
         self.mask_format = "png"
         self.normal_prior_dir = "normals"
         self.normal_prior_format = "png"
+        self.low_resolution = 2.0
         self.enable_background_sphere = True
         self.train_with_background_rgb = False
         super().__init__(parser, "Loading Parameters", sentinel)

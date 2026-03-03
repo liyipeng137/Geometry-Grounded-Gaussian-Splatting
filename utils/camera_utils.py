@@ -87,7 +87,7 @@ def _load_normal_prior(args, cam_info, resolution):
 #     delight_img = Image.open(delight_path)
 #     return PILtoTorch(delight_img, resolution)[:3]
 
-def loadCam(args, id, cam_info, resolution_scale):
+def loadCam(args, id, cam_info, resolution_scale, load_mask=True, load_normal=True):
     orig_w, orig_h = cam_info.image.size
 
     if args.resolution in [1, 2, 4, 8]:
@@ -115,10 +115,10 @@ def loadCam(args, id, cam_info, resolution_scale):
         gt_image = resized_image_rgb
     else:
         resized_image_rgb = PILtoTorch(cam_info.image, resolution)
-        loaded_mask = _load_gt_mask(args, cam_info, resolution)
+        loaded_mask = _load_gt_mask(args, cam_info, resolution) if load_mask else None
         gt_image = resized_image_rgb
 
-    normal_prior = _load_normal_prior(args, cam_info, resolution)
+    normal_prior = _load_normal_prior(args, cam_info, resolution) if load_normal else None
 
     return Camera(colmap_id=cam_info.uid, R=cam_info.R, T=cam_info.T, 
                   FoVx=cam_info.FovX, FoVy=cam_info.FovY, 
@@ -126,11 +126,11 @@ def loadCam(args, id, cam_info, resolution_scale):
                   image_name=cam_info.image_name, uid=id,
                   normal_prior=normal_prior, data_device=args.data_device)
 
-def cameraList_from_camInfos(cam_infos, resolution_scale, args):
+def cameraList_from_camInfos(cam_infos, resolution_scale, args, load_mask=True, load_normal=True):
     camera_list = []
 
     for id, c in enumerate(cam_infos):
-        camera_list.append(loadCam(args, id, c, resolution_scale))
+        camera_list.append(loadCam(args, id, c, resolution_scale, load_mask=load_mask, load_normal=load_normal))
 
     return camera_list
 
