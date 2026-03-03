@@ -171,8 +171,11 @@ def training(
     if reflective_case and not has_loaded_normal_prior:
         print("[Pipeline][Warn] normals directory exists but no valid normal priors were loaded.")
     print(f"[Pipeline] reflective_case={reflective_case} (normal_dir={normal_root}, loaded_priors={has_loaded_normal_prior})")
-    if has_train_mask and dataset.train_with_background_rgb:
-        print("[Pipeline] masks detected; disabling background composition during main training.")
+    has_mask_dir = os.path.isdir(os.path.join(dataset.source_path, dataset.mask_dir))
+    if has_mask_dir and not has_train_mask:
+        print("[Pipeline][Warn] masks directory exists but no valid mask priors were loaded.")
+    print(f"[Pipeline] has_mask_dir={has_mask_dir} (mask_dir={os.path.join(dataset.source_path, dataset.mask_dir)}, loaded_masks={has_train_mask}), lambda_mask={opt.lambda_mask}")
+
 
     viewpoint_stack = None
     ema_loss_for_log = 0.0
@@ -451,7 +454,7 @@ def training(
                     gaussians.reset_opacity()
 
             # FastGS-style final-stage pruning: every 3k iterations after 15k.
-            if opt.vcp_enable and iteration % 3000 == 0 and iteration >= 15_000 and iteration < 30_000:
+            if opt.vcp_enable and iteration % 3000 == 0 and iteration > 15_000 and iteration < 30_000:
                 camlist = sample_vcd_cameras(scene.getTrainCameras().copy(), opt.vcd_num_cams)
                 _, final_pruning_score = compute_vcd_vcp_scores(
                     camlist=camlist,
@@ -467,7 +470,7 @@ def training(
                     min_opacity=0.1,
                     pruning_score=final_pruning_score,
                     score_threshold=0.9,
-                    outside_prune_radius=(scene.scene_scale * 1.1) if scene.scene_scale is not None else None,
+                    outside_prune_radius=(scene.scene_scale * 1.5) if scene.scene_scale is not None else None,
                 )
                 if dataset.disable_filter3D:
                     gaussians.reset_3D_filter()
