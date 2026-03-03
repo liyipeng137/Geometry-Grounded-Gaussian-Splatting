@@ -156,21 +156,21 @@ def training(
             model_path=dataset.model_path,
         )
 
-    if os.path.isabs(dataset.normal_prior_dir):
-        normal_root = dataset.normal_prior_dir
-    else:
-        normal_root = os.path.join(dataset.source_path, dataset.normal_prior_dir)
-    has_normal_dir = os.path.isdir(normal_root)
+
+    has_normal_dir = os.path.exists(os.path.join(dataset.source_path, dataset.normal_prior_dir))
     has_loaded_normal_prior = any(cam.normal_prior is not None for cam in low_res_train_cameras)
-    has_loaded_mask = any(cam.gt_mask is not None for cam in low_res_train_cameras)
-    reflective_case = has_normal_dir
+    has_loaded_mask = any(cam.gt_mask is not None for cam in trainCameras)
+    has_mask_dir = os.path.exists(os.path.join(dataset.source_path, dataset.mask_dir))
+    reflective_case = has_loaded_normal_prior
+
+
     if reflective_case and not has_loaded_normal_prior:
         print("[Pipeline][Warn] normals directory exists but no valid normal priors were loaded.")
-    print(f"[Pipeline] reflective_case={reflective_case} (normal_dir={normal_root}, loaded_priors={has_loaded_normal_prior})")
-    has_mask_dir = os.path.isdir(os.path.join(dataset.source_path, dataset.mask_dir))
     if has_mask_dir and not has_loaded_mask:
         print("[Pipeline][Warn] masks directory exists but no valid mask priors were loaded.")
-    print(f"[Pipeline] has_mask_dir={has_mask_dir} (mask_dir={os.path.join(dataset.source_path, dataset.mask_dir)}, loaded_masks={has_loaded_mask}), lambda_mask={opt.lambda_mask}")
+
+    print(f"[Pipeline] has_normal_dir={has_normal_dir} (loaded_priors={has_loaded_normal_prior})")
+    print(f"[Pipeline] has_mask_dir={has_mask_dir} (loaded_masks={has_loaded_mask}), lambda_mask={opt.lambda_mask}")
     print(f"[Pipeline] low_resolution={low_resolution}")
 
     viewpoint_stacks: dict[float, list[Camera] | None] = {scale: None for scale in get_training_resolution_scales(dataset)}
@@ -226,33 +226,36 @@ def training(
         if (iteration - 1) == debug_from:
             pipe.debug = True
 
-        
+        # Custom fine-tuning for reflective case
         if reflective_case:
-            lambda_multi_view_ncc_cur = 0.1
-            if iteration > 15000:
-                lambda_multi_view_ncc_cur = 0.0
-            if iteration <= 3000:
+            lambda_multi_view_ncc_cur = 0.1 if iteration < 15000 else 0.0
+            if iteration < 5000:
                 lambda_normal_prior_cur = 0.0
-            elif iteration <= 7000:
-                lambda_normal_prior_cur = 0.15 * (iteration - 3000) / 4000.0
-            elif iteration <= 15000:
+            elif 5000 <= iteration < 7000:
+                lambda_normal_prior_cur = 0.15 * (iteration - 5000) / 2000.0
+            elif 7000 <= iteration < 15000:
                 lambda_normal_prior_cur = 0.15 + 0.1 * (iteration - 7000) / 8000.0
             else:
-                lambda_normal_prior_cur = 0.25
+                lambda_normal_prior_cur = 0.0
         else:
             lambda_multi_view_ncc_cur = 0.6
             lambda_normal_prior_cur = 0.0
 
-        reg_kick_on = iteration >= opt.regularization_from_iter
-        normal_prior_phase_on = reflective_case and lambda_normal_prior_cur > 0
-        active_scale = low_resolution if reg_kick_on or normal_prior_phase_on else 1.0
-        viewpoint_stack = viewpoint_stacks[active_scale]
-        if not viewpoint_stack:
-            viewpoint_stack = scene.getTrainCameras(scale=active_scale).copy()
-            viewpoint_stacks[active_scale] = viewpoint_stack
-        viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack) - 1))
-        normal_prior_kick_on = normal_prior_phase_on and viewpoint_cam.normal_prior is not None
-        need_depth_branch = reg_kick_on or normal_prior_kick_on
+        reg_kick_on = opt.regularization_until_iter > iteration >= opt.regularization_from_iter
+        # normal_prior_phase_on = reflective_case and lambda_normal_prior_cur > 0
+        normal_prior_kick_on = reflective_case and lambda_normal_prior_cur > 0
+        depth_render_on = reg_kick_on or normal_prior_kick_on
+        active_scale = low_resolution if depth_render_on else 1.0
+
+        if viewpoint_stacks[active_scale] is None or len(viewpoint_stacks[active_scale]) == 0:
+            viewpoint_stacks[active_scale] = scene.getTrainCameras(scale=active_scale).copy()
+
+        viewpoint_cam = viewpoint_stacks[active_scale].pop(
+            randint(0, len(viewpoint_stacks[active_scale]) - 1)
+        )
+        # normal_prior_kick_on = normal_prior_phase_on and viewpoint_cam.normal_prior is not None
+        mask_kick_on = opt.lambda_mask > 0 and iteration >= opt.mask_from_iter and viewpoint_cam.gt_mask is not None
+
         bg_model = scene.bg_gaussians if should_use_background_rgb(dataset, scene, reflective_case, iteration, has_loaded_mask) else None
         render_pkg = render(
             viewpoint_cam,
@@ -260,7 +263,7 @@ def training(
             pipe,
             background,
             kernel_size,
-            require_depth=need_depth_branch,
+            require_depth=depth_render_on,
             bg_splats=bg_model,
         )
         rendered_image: torch.Tensor
@@ -273,8 +276,9 @@ def training(
         gt_image = viewpoint_cam.original_image.cuda()
 
         Ll1_render = L1_loss_appearance(rendered_image, gt_image, gaussians, viewpoint_cam.uid)
+
         # normal consistency / depth-derived normal
-        if need_depth_branch:
+        if depth_render_on:
             depth_map: torch.Tensor = render_pkg["median_depth"]
             rendered_normal: torch.Tensor = render_pkg["normal"]
             depth_normal, valid_points = depth_to_normal(viewpoint_cam, depth_map)
@@ -288,6 +292,7 @@ def training(
             valid_points = None
             depth_normal_loss = torch.tensor([0], dtype=torch.float32, device="cuda")
 
+        # Normal prior loss
         if normal_prior_kick_on:
             rend_alpha = render_pkg["mask"]
             rendered_normal_prior = render_pkg["normal"]
@@ -328,7 +333,9 @@ def training(
             geo_loss = torch.tensor([0], dtype=torch.float32, device="cuda")
 
         rgb_loss = (1.0 - opt.lambda_dssim) * Ll1_render + opt.lambda_dssim * (1.0 - ssim(rendered_image.unsqueeze(0), gt_image.unsqueeze(0)))
-        if opt.lambda_mask > 0 and viewpoint_cam.gt_mask is not None and need_depth_branch:
+
+        # mask loss
+        if mask_kick_on:
             opacity = 1.0 - render_pkg["mask"].clamp(1e-6, 1.0 - 1e-6)
             bg = 1.0 - viewpoint_cam.gt_mask
             mask_loss = (-bg * torch.log(opacity)).mean()
@@ -392,6 +399,11 @@ def training(
 
             # Densification
             if iteration < opt.densify_until_iter:
+                # VCD/VCP
+                importance_score = None
+                pruning_score = None
+                need_vcd = opt.vcd_enable and iteration >= opt.vcd_from_iter
+                need_vcp = opt.vcp_enable and iteration >= opt.vcp_from_iter
                 # Keep track of max radii in image-space for pruning
                 gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
                 gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
@@ -403,10 +415,6 @@ def training(
                         total_count = int(scaling_finite.numel())
                         print(f"[Warn][iter {iteration}] Non-finite scaling detected before densify: {invalid_count}/{total_count}")
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
-                    importance_score = None
-                    pruning_score = None
-                    need_vcd = opt.vcd_enable and iteration >= opt.vcd_from_iter
-                    need_vcp = opt.vcp_enable and iteration >= opt.vcp_from_iter
                     if need_vcd or need_vcp:
                         camlist = sample_vcd_cameras(scene.getTrainCameras().copy(), opt.vcd_num_cams)
                         importance_score, pruning_score = compute_vcd_vcp_scores(
@@ -427,7 +435,7 @@ def training(
                         importance_score=importance_score,
                         importance_threshold=opt.vcd_importance_thresh,
                         pruning_score=pruning_score,
-                        vcp_remove_ratio=opt.vcp_remove_ratio,
+                        vcp_remove_ratio=opt.vcp_remove_ratio if active_scale == 1.0 else 0.65,
                         outside_prune_radius=None,
                     )
                     if dataset.disable_filter3D:
@@ -440,7 +448,7 @@ def training(
 
             # FastGS-style final-stage pruning: every 3k iterations after 15k.
             if opt.vcp_enable and iteration % 3000 == 0 and iteration > 15_000 and iteration < 30_000:
-                camlist = sample_vcd_cameras(scene.getTrainCameras().copy(), opt.vcd_num_cams)
+                camlist = sample_vcd_cameras(scene.getTrainCameras().copy(), 20)
                 _, final_pruning_score = compute_vcd_vcp_scores(
                     camlist=camlist,
                     gaussians=gaussians,
@@ -602,8 +610,8 @@ if __name__ == "__main__":
     parser.add_argument("--port", type=int, default=6009)
     parser.add_argument("--debug_from", type=int, default=-1)
     parser.add_argument("--detect_anomaly", action="store_true", default=False)
-    parser.add_argument("--test_iterations", nargs="+", type=int, default=[7000, 20000])
-    parser.add_argument("--save_iterations", nargs="+", type=int, default=[7000, 20000])
+    parser.add_argument("--test_iterations", nargs="+", type=int, default=[7000, 15000, 20000])
+    parser.add_argument("--save_iterations", nargs="+", type=int, default=[7000, 15000, 20000])
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[30000])
     parser.add_argument("--start_checkpoint", type=str, default=None)

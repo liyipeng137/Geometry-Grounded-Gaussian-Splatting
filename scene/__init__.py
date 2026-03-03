@@ -89,13 +89,14 @@ class Scene:
 
         camera_centers_list: list[torch.Tensor] = []
         for resolution_scale in resolution_scales:
-            load_aux_data = len(resolution_scales) == 1 or np.isclose(resolution_scale, self.low_resolution)
+            load_mask = True
+            load_normal = len(resolution_scales) == 1 or np.isclose(resolution_scale, self.low_resolution)
             self.train_cameras[resolution_scale] = cameraList_from_camInfos(
                 scene_info.train_cameras,
                 resolution_scale,
                 args,
-                load_mask=load_aux_data,
-                load_normal=load_aux_data,
+                load_mask=load_mask,
+                load_normal=load_normal,
             )
             print(f"Loading Training Cameras: {len(self.train_cameras[resolution_scale])} .")
 
@@ -103,8 +104,8 @@ class Scene:
                 scene_info.test_cameras,
                 resolution_scale,
                 args,
-                load_mask=load_aux_data,
-                load_normal=load_aux_data,
+                load_mask=load_mask,
+                load_normal=load_normal,
             )
             print(f"Loading Test Cameras: {len(self.test_cameras[resolution_scale])} .")
 
