@@ -99,14 +99,14 @@ class Scene:
             )
             print(f"Loading Training Cameras: {len(self.train_cameras[resolution_scale])} .")
 
-            # self.test_cameras[resolution_scale] = cameraList_from_camInfos(
-            #     scene_info.test_cameras,
-            #     resolution_scale,
-            #     args,
-            #     load_mask=load_aux_data,
-            #     load_normal=load_aux_data,
-            # )
-            # print(f"Loading Test Cameras: {len(self.test_cameras[resolution_scale])} .")
+            self.test_cameras[resolution_scale] = cameraList_from_camInfos(
+                scene_info.test_cameras,
+                resolution_scale,
+                args,
+                load_mask=load_aux_data,
+                load_normal=load_aux_data,
+            )
+            print(f"Loading Test Cameras: {len(self.test_cameras[resolution_scale])} .")
 
             print("computing nearest_id")
             current_centers: list[torch.Tensor] = []
