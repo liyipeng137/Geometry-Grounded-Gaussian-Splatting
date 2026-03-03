@@ -60,8 +60,10 @@ from utils.vcd_utils import compute_vcd_vcp_scores, sample_vcd_cameras
 #     return loss_x + loss_y
 
 
-def should_use_background_rgb(dataset, scene: Scene, reflective_case: bool, iteration: int) -> bool:
+def should_use_background_rgb(dataset, scene: Scene, reflective_case: bool, iteration: int, has_train_mask: bool) -> bool:
     if not dataset.train_with_background_rgb or not scene.should_train_with_bg:
+        return False
+    if has_train_mask:
         return False
     cutoff = 3000 if reflective_case else 7000
     return iteration < cutoff
@@ -164,10 +166,13 @@ def training(
         normal_root = os.path.join(dataset.source_path, dataset.normal_prior_dir)
     has_normal_dir = os.path.isdir(normal_root)
     has_loaded_normal_prior = any(cam.normal_prior is not None for cam in scene.getTrainCameras())
+    has_train_mask = any(cam.gt_mask is not None for cam in scene.getTrainCameras())
     reflective_case = has_normal_dir
     if reflective_case and not has_loaded_normal_prior:
         print("[Pipeline][Warn] normals directory exists but no valid normal priors were loaded.")
     print(f"[Pipeline] reflective_case={reflective_case} (normal_dir={normal_root}, loaded_priors={has_loaded_normal_prior})")
+    if has_train_mask and dataset.train_with_background_rgb:
+        print("[Pipeline] masks detected; disabling background composition during main training.")
 
     viewpoint_stack = None
     ema_loss_for_log = 0.0
@@ -251,6 +256,7 @@ def training(
             lambda_normal_prior_cur > 0
             and viewpoint_cam.normal_prior is not None
         )
+        bg_model = scene.bg_gaussians if should_use_background_rgb(dataset, scene, reflective_case, iteration, has_train_mask) else None
         render_pkg = render(
             viewpoint_cam,
             gaussians,
@@ -258,22 +264,11 @@ def training(
             background,
             kernel_size,
             require_depth=reg_kick_on or normal_prior_kick_on,
+            bg_splats=bg_model,
         )
-        bg_model = scene.bg_gaussians if should_use_background_rgb(dataset, scene, reflective_case, iteration) else None
-        rgb_render_pkg = render_pkg
-        if bg_model is not None:
-            rgb_render_pkg = render(
-                viewpoint_cam,
-                gaussians,
-                pipe,
-                background,
-                kernel_size,
-                require_depth=False,
-                bg_splats=bg_model,
-            )
         rendered_image: torch.Tensor
         rendered_image, viewspace_point_tensor, visibility_filter, radii = (
-            rgb_render_pkg["render"],
+            render_pkg["render"],
             render_pkg["viewspace_points"],
             render_pkg["visibility_filter"],
             render_pkg["radii"],
@@ -445,6 +440,7 @@ def training(
                         importance_threshold=opt.vcd_importance_thresh,
                         pruning_score=pruning_score,
                         vcp_remove_ratio=opt.vcp_remove_ratio,
+                        outside_prune_radius=None,
                     )
                     if dataset.disable_filter3D:
                         gaussians.reset_3D_filter()
@@ -455,7 +451,7 @@ def training(
                     gaussians.reset_opacity()
 
             # FastGS-style final-stage pruning: every 3k iterations after 15k.
-            if opt.vcp_enable and iteration % 3000 == 0 and iteration > 15_000 and iteration < 30_000:
+            if opt.vcp_enable and iteration % 3000 == 0 and iteration >= 15_000 and iteration < 30_000:
                 camlist = sample_vcd_cameras(scene.getTrainCameras().copy(), opt.vcd_num_cams)
                 _, final_pruning_score = compute_vcd_vcp_scores(
                     camlist=camlist,
@@ -471,6 +467,7 @@ def training(
                     min_opacity=0.1,
                     pruning_score=final_pruning_score,
                     score_threshold=0.9,
+                    outside_prune_radius=(scene.scene_scale * 1.1) if scene.scene_scale is not None else None,
                 )
                 if dataset.disable_filter3D:
                     gaussians.reset_3D_filter()

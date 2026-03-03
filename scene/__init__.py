@@ -11,7 +11,6 @@
 
 import json
 import os
-import shutil
 from typing import Sequence
 
 import numpy as np
@@ -156,10 +155,8 @@ class Scene:
         mkdir_p(point_cloud_path)
         raw_path = os.path.join(point_cloud_path, "point_cloud.ply")
         filled_path = os.path.join(point_cloud_path, "point_cloud.filled.ply")
-        viewer_path = os.path.join(point_cloud_path, "point_cloud_3dgsviewer.ply")
         self.bg_gaussians.save_ply(raw_path)
         self.fill_bg_empty(raw_path, filled_path)
-        shutil.copyfile(filled_path, viewer_path)
 
     def fill_bg_empty(self, input_ply, output_ply):
         with open(input_ply, "rb") as file:
@@ -203,6 +200,7 @@ class Scene:
         latest_bg = self._latest_bg_path()
         if latest_bg is not None:
             self.bg_gaussians.load_ply(latest_bg)
+            self._update_background_scale()
             return
 
         bg_path = os.path.join(self.model_path, "bg.ply")
@@ -219,6 +217,7 @@ class Scene:
             self.scene_scale = scene_scale
 
         self.bg_gaussians.load_ply(bg_path)
+        self._update_background_scale()
 
     def _latest_bg_path(self):
         bg_dir = os.path.join(self.model_path, "point_cloud_bg")
@@ -235,6 +234,12 @@ class Scene:
         if os.path.exists(raw):
             return raw
         return None
+
+    def _update_background_scale(self):
+        if self.bg_gaussians is None or self.bg_gaussians.get_xyz.numel() == 0:
+            return
+        with torch.no_grad():
+            self.scene_scale = float(torch.linalg.norm(self.bg_gaussians.get_xyz, dim=1).max().item())
 
     def getTrainCameras(self, scale=1.0) -> Sequence[Camera]:
         return self.train_cameras[scale]

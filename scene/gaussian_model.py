@@ -957,6 +957,7 @@ class GaussianModel:
         importance_threshold=5,
         pruning_score=None,
         vcp_remove_ratio=0.5,
+        outside_prune_radius=None,
     ):
         grads = self.xyz_gradient_accum / self.denom
         grads[grads.isnan()] = 0.0
@@ -993,16 +994,22 @@ class GaussianModel:
                     sampled_indices = torch.multinomial(padded_importance, sample_count, replacement=False)
                     selected_pts_mask[sampled_indices] = True
                     prune_mask = torch.logical_and(prune_mask, selected_pts_mask)
+        if outside_prune_radius is not None:
+            outside_mask = torch.linalg.norm(self.get_xyz, dim=1) > outside_prune_radius
+            prune_mask = torch.logical_or(prune_mask, outside_mask)
         self.prune_points(prune_mask)
         prune = self._xyz.shape[0]
         return clone - before, split - clone, split - prune
 
-    def final_prune_fastgs(self, min_opacity, pruning_score=None, score_threshold=0.9):
+    def final_prune_fastgs(self, min_opacity, pruning_score=None, score_threshold=0.9, outside_prune_radius=None):
         """Final-stage pruning used in FastGS: opacity OR high pruning_score."""
         prune_mask = (self.get_opacity < min_opacity).squeeze()
         if pruning_score is not None:
             score_mask = pruning_score > score_threshold
             prune_mask = torch.logical_or(prune_mask, score_mask)
+        if outside_prune_radius is not None:
+            outside_mask = torch.linalg.norm(self.get_xyz, dim=1) > outside_prune_radius
+            prune_mask = torch.logical_or(prune_mask, outside_mask)
         self.prune_points(prune_mask)
 
     def add_densification_stats(self, viewspace_point_tensor, update_filter):
