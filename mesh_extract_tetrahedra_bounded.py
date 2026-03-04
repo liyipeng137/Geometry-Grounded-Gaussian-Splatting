@@ -47,6 +47,26 @@ def post_process_mesh(mesh, cluster_to_keep=1, min_triangles=50):
     return mesh_0
 
 
+def smooth_mesh(mesh, iterations=0, lambda_filter=0.5, mu=-0.53):
+    if iterations <= 0:
+        return mesh
+
+    print(
+        "smoothing mesh with Taubin filter: "
+        f"iterations={iterations}, lambda={lambda_filter}, mu={mu}"
+    )
+    mesh_smooth = mesh.filter_smooth_taubin(
+        number_of_iterations=iterations,
+        lambda_filter=lambda_filter,
+        mu=mu,
+    )
+    mesh_smooth.remove_degenerate_triangles()
+    mesh_smooth.remove_duplicated_triangles()
+    mesh_smooth.remove_duplicated_vertices()
+    mesh_smooth.remove_unreferenced_vertices()
+    return mesh_smooth
+
+
 def estimate_bounding_sphere(cameras):
     """
     Estimate the bounding sphere given camera poses
@@ -124,7 +144,8 @@ def evaluage_alpha_cull(points, views, gaussians, pipeline, kernel_size):
 def marching_tetrahedra_with_binary_search_bounded(
     model_path, views, gaussians, pipeline, kernel_size, move_cpu, num_cluster,
     alpha_threshold=0.5, scale_factor=1.0, min_triangles=50,
-    center=None, radius=None, boundary_margin=1.2
+    center=None, radius=None, boundary_margin=1.2,
+    smooth_iterations=0, smooth_lambda=0.5, smooth_mu=-0.53,
 ):
     """
     Marching tetrahedra with boundary constraints
@@ -260,6 +281,15 @@ def marching_tetrahedra_with_binary_search_bounded(
     print("remove flyers")
     mesh_post = post_process_mesh(o3d_mesh, cluster_to_keep=1, min_triangles=min_triangles)
     o3d.io.write_triangle_mesh(os.path.join(model_path, "recon_bounded_post.ply"), mesh_post)
+
+    mesh_smooth = smooth_mesh(
+        mesh_post,
+        iterations=smooth_iterations,
+        lambda_filter=smooth_lambda,
+        mu=smooth_mu,
+    )
+    if smooth_iterations > 0:
+        o3d.io.write_triangle_mesh(os.path.join(model_path, "recon_bounded_post_smooth.ply"), mesh_smooth)
     print("done!")
 
 
@@ -267,7 +297,8 @@ def extract_mesh(
     dataset: ModelParams, iteration: int, pipeline: PipelineParams, 
     move_cpu: bool, num_cluster: int,
     alpha_threshold: float = 0.5, scale_factor: float = 1.0, min_triangles: int = 50,
-    use_boundary: bool = True, boundary_margin: float = 1.2
+    use_boundary: bool = True, boundary_margin: float = 1.2,
+    smooth_iterations: int = 0, smooth_lambda: float = 0.5, smooth_mu: float = -0.53,
 ):
     with torch.no_grad():
         gaussians = GaussianModel(dataset.sh_degree, dataset.sg_degree)
@@ -284,7 +315,8 @@ def extract_mesh(
         marching_tetrahedra_with_binary_search_bounded(
             dataset.model_path, cams, gaussians, pipeline, kernel_size, 
             move_cpu, num_cluster, alpha_threshold, scale_factor, min_triangles,
-            center, radius, boundary_margin
+            center, radius, boundary_margin,
+            smooth_iterations, smooth_lambda, smooth_mu,
         )
 
 
@@ -310,6 +342,12 @@ if __name__ == "__main__":
                        help="Disable boundary constraint (extract unbounded mesh)")
     parser.add_argument("--boundary_margin", default=1.2, type=float,
                        help="Boundary margin factor (1.0-2.0, larger = more margin)")
+    parser.add_argument("--smooth_iterations", default=10, type=int,
+                       help="Taubin smoothing iterations after mesh extraction (0 disables smoothing)")
+    parser.add_argument("--smooth_lambda", default=0.5, type=float,
+                       help="Taubin smoothing lambda parameter")
+    parser.add_argument("--smooth_mu", default=-0.53, type=float,
+                       help="Taubin smoothing mu parameter")
     
     args = get_combined_args(parser)
 
@@ -321,5 +359,8 @@ if __name__ == "__main__":
         model.extract(args), args.iteration, pipeline.extract(args), 
         args.move_cpu, args.num_cluster,
         args.alpha_threshold, args.scale_factor, args.min_triangles,
-        use_boundary=not args.no_boundary, boundary_margin=args.boundary_margin
+        use_boundary=not args.no_boundary, boundary_margin=args.boundary_margin,
+        smooth_iterations=args.smooth_iterations,
+        smooth_lambda=args.smooth_lambda,
+        smooth_mu=args.smooth_mu,
     )
