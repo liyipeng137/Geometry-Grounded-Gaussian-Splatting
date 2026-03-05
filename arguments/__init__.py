@@ -64,13 +64,13 @@ class ModelParams(ParamGroup):
         self.multi_view_max_angle = 30
         self.multi_view_min_dis = 0.01
         self.multi_view_max_dis = 1.5
-        self.mask_dir = ""
+        self.mask_dir = "masks"
         self.mask_format = "png"
         self.normal_prior_dir = "normals"
         self.normal_prior_format = "png"
         self.low_resolution = 2.0
         self.enable_background_sphere = True
-        self.train_with_background_rgb = False
+        self.train_with_background_rgb = True
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args):
