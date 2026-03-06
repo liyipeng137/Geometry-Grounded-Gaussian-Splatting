@@ -80,15 +80,20 @@ def read_next_bytes(fid, num_bytes, format_char_sequence, endian_character="<"):
     data = fid.read(num_bytes)
     return struct.unpack(endian_character + format_char_sequence, data)
 
-def read_points3D_text(path):
+
+
+def read_points3D_text(path, max_err=2, min_track_length=3):
     """
     see: src/base/reconstruction.cc
         void Reconstruction::ReadPoints3DText(const std::string& path)
         void Reconstruction::WritePoints3DText(const std::string& path)
+
+    Filters out points with err greater than max_err and track length less than min_track_length,
+    consistent with read_points3D_binary_new and COLMAP's visualization defaults.
     """
-    xyzs = None
-    rgbs = None
-    errors = None
+    xyzs = []
+    rgbs = []
+    errors = []
     with open(path, "r") as fid:
         while True:
             line = fid.readline()
@@ -97,26 +102,55 @@ def read_points3D_text(path):
             line = line.strip()
             if len(line) > 0 and line[0] != "#":
                 elems = line.split()
-                xyz = np.array(tuple(map(float, elems[1:4])))
-                rgb = np.array(tuple(map(int, elems[4:7])))
-                error = np.array(float(elems[7]))
-                if xyzs is None:
-                    xyzs = xyz[None, ...]
-                    rgbs = rgb[None, ...]
-                    errors = error[None, ...]
-                else:
-                    xyzs = np.append(xyzs, xyz[None, ...], axis=0)
-                    rgbs = np.append(rgbs, rgb[None, ...], axis=0)
-                    errors = np.append(errors, error[None, ...], axis=0)
-    return xyzs, rgbs, errors
+                error = float(elems[7])
+                track_length = (len(elems) - 8) // 2
+                if error > max_err or track_length < min_track_length:
+                    continue
+                xyzs.append(tuple(map(float, elems[1:4])))
+                rgbs.append(tuple(map(int, elems[4:7])))
+                errors.append(error)
+    return np.array(xyzs), np.array(rgbs), np.array(errors)[..., None]
 
-def read_points3D_binary(path_to_model_file):
+# def read_points3D_text(path):
+#     """
+#     see: src/base/reconstruction.cc
+#         void Reconstruction::ReadPoints3DText(const std::string& path)
+#         void Reconstruction::WritePoints3DText(const std::string& path)
+#     """
+#     xyzs = None
+#     rgbs = None
+#     errors = None
+#     with open(path, "r") as fid:
+#         while True:
+#             line = fid.readline()
+#             if not line:
+#                 break
+#             line = line.strip()
+#             if len(line) > 0 and line[0] != "#":
+#                 elems = line.split()
+#                 xyz = np.array(tuple(map(float, elems[1:4])))
+#                 rgb = np.array(tuple(map(int, elems[4:7])))
+#                 error = np.array(float(elems[7]))
+#                 if xyzs is None:
+#                     xyzs = xyz[None, ...]
+#                     rgbs = rgb[None, ...]
+#                     errors = error[None, ...]
+#                 else:
+#                     xyzs = np.append(xyzs, xyz[None, ...], axis=0)
+#                     rgbs = np.append(rgbs, rgb[None, ...], axis=0)
+#                     errors = np.append(errors, error[None, ...], axis=0)
+#     return xyzs, rgbs, errors
+
+def read_points3D_binary(path_to_model_file,max_err=2,min_track_length=3):
     """
     see: src/base/reconstruction.cc
         void Reconstruction::ReadPoints3DBinary(const std::string& path)
         void Reconstruction::WritePoints3DBinary(const std::string& path)
-    """
 
+    The colmap visualization filters out points with err greater than 2.0 and track length less than 3
+    see: src/ui/model_viewer_widget.cc
+        void ModelViewerWidget::UploadPointData(const bool selection_mode)
+    """
 
     with open(path_to_model_file, "rb") as fid:
         num_points = read_next_bytes(fid, 8, "Q")[0]
@@ -125,6 +159,7 @@ def read_points3D_binary(path_to_model_file):
         rgbs = np.empty((num_points, 3))
         errors = np.empty((num_points, 1))
 
+        count = 0
         for p_id in range(num_points):
             binary_point_line_properties = read_next_bytes(
                 fid, num_bytes=43, format_char_sequence="QdddBBBd")
@@ -136,10 +171,20 @@ def read_points3D_binary(path_to_model_file):
             track_elems = read_next_bytes(
                 fid, num_bytes=8*track_length,
                 format_char_sequence="ii"*track_length)
-            xyzs[p_id] = xyz
-            rgbs[p_id] = rgb
-            errors[p_id] = error
+            if error > max_err or track_length < min_track_length:
+                continue
+
+            xyzs[count] = xyz
+            rgbs[count] = rgb
+            errors[count] = error
+            count +=1
+    xyzs = np.delete(xyzs,np.arange(count,num_points),axis=0)
+    rgbs = np.delete(rgbs, np.arange(count, num_points), axis=0)
+    errors = np.delete(errors, np.arange(count, num_points), axis=0)
     return xyzs, rgbs, errors
+
+
+
 
 def read_intrinsics_text(path):
     """
