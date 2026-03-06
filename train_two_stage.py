@@ -495,7 +495,7 @@ def training(
                 and in_stage_b
                 and stage_b_final_prune_interval > 0
                 and iteration % stage_b_final_prune_interval == 0
-                and iteration > stage_b_final_prune_from_iter
+                and iteration >= stage_b_final_prune_from_iter
                 and iteration < opt.iterations
             ):
                 camlist = sample_vcd_cameras(scene.getTrainCameras().copy(), 20)
