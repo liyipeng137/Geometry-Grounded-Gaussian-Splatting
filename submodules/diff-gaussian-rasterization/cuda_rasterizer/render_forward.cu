@@ -408,6 +408,9 @@ __global__ void __launch_bounds__(BLOCK_X* BLOCK_Y)
         const int* __restrict__ metric_map,
         bool get_flag,
         int* __restrict__ metricCount,
+        bool record_transmittance,
+        float* __restrict__ transmittance_sum,
+        int* __restrict__ covered_count,
         const float* __restrict__ bg_color,
         float* __restrict__ out_color,
         float* __restrict__ out_alpha,
@@ -500,6 +503,10 @@ __global__ void __launch_bounds__(BLOCK_X* BLOCK_Y)
             // and its exponential falloff from mean.
             // Avoid numerical instabilities (see paper appendix).
             float alpha = fminf(0.99f, con_o.w * expf(power));
+            if (record_transmittance && transmittance_sum != nullptr && covered_count != nullptr) {
+                atomicAdd(&(transmittance_sum[collected_id[j]]), T * alpha);
+                atomicAdd(&(covered_count[collected_id[j]]), 1);
+            }
             if (alpha < 1.0f / 255.0f)
                 continue;
             float test_T = T * (1.f - alpha);
@@ -700,6 +707,9 @@ void FORWARD::render(
     const int* metric_map,
     bool get_flag,
     int* metricCount,
+    bool record_transmittance,
+    float* transmittance_sum,
+    int* covered_count,
     const float* bg_color,
     float* out_color,
     float* out_alpha,
@@ -712,6 +722,7 @@ void FORWARD::render(
         ranges, point_list, W, H, means2D, conic_opacity, colors,                       \
         ray_planes, normals, focal_x, focal_y,                                          \
         n_contrib, max_contributor, metric_map, get_flag, metricCount,                  \
+        record_transmittance, transmittance_sum, covered_count,                         \
         bg_color, out_color, out_alpha,                                                 \
         out_normal, out_mdepth, normal_length)
 

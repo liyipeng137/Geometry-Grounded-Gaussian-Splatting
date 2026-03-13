@@ -165,6 +165,50 @@ def masked_local_pearson_loss(
     return loss_sum / valid_patch_count
 
 
+@torch.no_grad()
+def prune_low_contribution_gaussians(
+    gaussians: GaussianModel,
+    cameras: Sequence[Camera],
+    pipe,
+    bg: torch.Tensor,
+    kernel_size: float,
+    K: int = 5,
+    prune_ratio: float = 0.1,
+) -> None:
+    if len(cameras) == 0 or K <= 0:
+        return
+
+    contributions = []
+    for cam in cameras:
+        transmittance_pkg = render(
+            cam,
+            gaussians,
+            pipe,
+            bg,
+            kernel_size,
+            require_depth=False,
+            record_transmittance=True,
+        )
+        trans = transmittance_pkg["transmittance_avg"]
+        if trans is not None:
+            contributions.append(trans.to(torch.float32))
+
+    if len(contributions) == 0:
+        return
+
+    k = min(K, len(contributions))
+    contribution_stack = torch.stack(contributions, dim=0)
+    contribution_topk = torch.topk(contribution_stack, k=k, dim=0, largest=True, sorted=False).values
+
+    prune_ratio = max(0.0, min(float(prune_ratio), 1.0))
+    contribution_score = contribution_topk.mean(dim=0)
+    threshold = torch.quantile(contribution_score, prune_ratio)
+    prune_mask = contribution_score < threshold
+    if prune_mask.any().item():
+        gaussians.prune_points(prune_mask)
+        torch.cuda.empty_cache()
+
+
 def training(
     dataset,
     opt,
@@ -293,31 +337,31 @@ def training(
             pipe.debug = True
 
         
-        if reflective_case:
-            lambda_multi_view_ncc_cur = 0.1
-            if iteration > 15000:
-                lambda_multi_view_ncc_cur = 0.0
-            if iteration <= 3000:
-                lambda_normal_prior_cur = 0.0
-            elif iteration <= 7000:
-                lambda_normal_prior_cur = 0.15 * (iteration - 3000) / 4000.0
-            elif iteration <= 15000:
-                lambda_normal_prior_cur = 0.15 + 0.1 * (iteration - 7000) / 8000.0
-            else:
-                lambda_normal_prior_cur = 0.25
-        elif scene_case:
-            if iteration <= 3000:
-                lambda_normal_prior_cur = 0.0
-            elif iteration <= 7000:
-                lambda_normal_prior_cur = 0.1 * (iteration - 3000) / 4000.0
-            elif iteration <= 15000:
-                lambda_normal_prior_cur = 0.1 + 0.1 * (iteration - 7000) / 8000.0
-            else:
-                lambda_normal_prior_cur = 0.2
-            lambda_multi_view_ncc_cur = 0.0
-        else:
-            lambda_multi_view_ncc_cur = 0.6
-            lambda_normal_prior_cur = 0.0
+        # if reflective_case:
+        #     lambda_multi_view_ncc_cur = 0.1
+        #     if iteration > 15000:
+        #         lambda_multi_view_ncc_cur = 0.0
+        #     if iteration <= 3000:
+        #         lambda_normal_prior_cur = 0.0
+        #     elif iteration <= 7000:
+        #         lambda_normal_prior_cur = 0.15 * (iteration - 3000) / 4000.0
+        #     elif iteration <= 15000:
+        #         lambda_normal_prior_cur = 0.15 + 0.1 * (iteration - 7000) / 8000.0
+        #     else:
+        #         lambda_normal_prior_cur = 0.25
+        # elif scene_case:
+        #     if iteration <= 3000:
+        #         lambda_normal_prior_cur = 0.0
+        #     elif iteration <= 7000:
+        #         lambda_normal_prior_cur = 0.1 * (iteration - 3000) / 4000.0
+        #     elif iteration <= 15000:
+        #         lambda_normal_prior_cur = 0.1 + 0.1 * (iteration - 7000) / 8000.0
+        #     else:
+        #         lambda_normal_prior_cur = 0.2
+        #     lambda_multi_view_ncc_cur = 0.0
+        # else:
+        lambda_multi_view_ncc_cur = 0.6
+        lambda_normal_prior_cur = 0.0
 
         reg_kick_on = iteration >= opt.regularization_from_iter
         normal_prior_kick_on = (
@@ -559,6 +603,24 @@ def training(
                         gaussians.reset_3D_filter()
                     else:
                         gaussians.compute_3D_filter(cameras=trainCameras)
+
+                if iteration > opt.contribution_prune_from_iter and iteration % opt.contribution_prune_interval == 0:
+                    if iteration % opt.opacity_reset_interval == opt.contribution_prune_interval:
+                        print(f"[Iter {iteration}] Skipped contribution pruning near opacity reset.")
+                    else:
+                        prune_low_contribution_gaussians(
+                            gaussians,
+                            trainCameras[::2],
+                            pipe,
+                            background,
+                            kernel_size,
+                            K=1,
+                            prune_ratio=opt.contribution_prune_ratio,
+                        )
+                        if dataset.disable_filter3D:
+                            gaussians.reset_3D_filter()
+                        else:
+                            gaussians.compute_3D_filter(cameras=trainCameras)
 
                 if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
                     gaussians.reset_opacity()

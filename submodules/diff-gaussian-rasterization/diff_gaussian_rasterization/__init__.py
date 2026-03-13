@@ -72,6 +72,9 @@ class _RasterizeGaussians(torch.autograd.Function):
         get_flag = raster_settings.get_flag
         if get_flag is None:
             get_flag = False
+        record_transmittance = raster_settings.record_transmittance
+        if record_transmittance is None:
+            record_transmittance = False
         args = (
             raster_settings.bg,
             means3D,
@@ -99,6 +102,7 @@ class _RasterizeGaussians(torch.autograd.Function):
             raster_settings.prefiltered,
             raster_settings.require_depth,
             get_flag,
+            record_transmittance,
             raster_settings.debug,
         )
 
@@ -106,13 +110,41 @@ class _RasterizeGaussians(torch.autograd.Function):
         if raster_settings.debug:
             cpu_args = cpu_deep_copy_tuple(args)  # Copy them before they can be corrupted
             try:
-                num_rendered, color, alpha, normal, mdepth, radii, geomBuffer, binningBuffer, imgBuffer, tileBuffer, accum_metric_counts = _C.rasterize_gaussians(*args)
+                (
+                    num_rendered,
+                    color,
+                    alpha,
+                    normal,
+                    mdepth,
+                    radii,
+                    geomBuffer,
+                    binningBuffer,
+                    imgBuffer,
+                    tileBuffer,
+                    accum_metric_counts,
+                    transmittance_sum,
+                    covered_count,
+                ) = _C.rasterize_gaussians(*args)
             except Exception as ex:
                 torch.save(cpu_args, "snapshot_fw.dump")
                 print("\nAn error occured in forward. Please forward snapshot_fw.dump for debugging.")
                 raise ex
         else:
-            num_rendered, color, alpha, normal, mdepth, radii, geomBuffer, binningBuffer, imgBuffer, tileBuffer, accum_metric_counts = _C.rasterize_gaussians(*args)
+            (
+                num_rendered,
+                color,
+                alpha,
+                normal,
+                mdepth,
+                radii,
+                geomBuffer,
+                binningBuffer,
+                imgBuffer,
+                tileBuffer,
+                accum_metric_counts,
+                transmittance_sum,
+                covered_count,
+            ) = _C.rasterize_gaussians(*args)
         # Keep relevant tensors for backward
         ctx.raster_settings = raster_settings
         ctx.num_rendered = num_rendered
@@ -136,10 +168,23 @@ class _RasterizeGaussians(torch.autograd.Function):
             imgBuffer,
             tileBuffer,
         )
+        if record_transmittance:
+            transmittance_avg = transmittance_sum / (covered_count.to(dtype=torch.float32) + 1e-6)
+            return color, radii, mdepth, alpha, normal, accum_metric_counts, transmittance_avg, covered_count
         return color, radii, mdepth, alpha, normal, accum_metric_counts
 
     @staticmethod
-    def backward(ctx, grad_color, grad_radii, grad_mdepth, grad_alpha, grad_normal, grad_metric):
+    def backward(
+        ctx,
+        grad_color,
+        grad_radii,
+        grad_mdepth,
+        grad_alpha,
+        grad_normal,
+        grad_metric,
+        grad_transmittance=None,
+        grad_covered_count=None,
+    ):
         # Restore necessary values from context
         num_rendered = ctx.num_rendered
         raster_settings = ctx.raster_settings
@@ -274,6 +319,7 @@ class GaussianRasterizationSettings(NamedTuple):
     debug: bool
     get_flag: bool
     metric_map: torch.Tensor
+    record_transmittance: bool = False
 
 
 class GaussianRasterizer(nn.Module):

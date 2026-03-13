@@ -61,6 +61,9 @@ public:
         bool require_depth = true,
         bool get_flag      = false,
         int* metricCount   = nullptr,
+        bool record_transmittance = false,
+        float* transmittance_sum  = nullptr,
+        int* covered_count        = nullptr,
         bool debug         = false);
 
     static void backward(

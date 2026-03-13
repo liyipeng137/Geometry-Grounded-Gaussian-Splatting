@@ -304,6 +304,9 @@ int CudaRasterizer::Rasterizer::forward(
     bool require_depth,
     bool get_flag,
     int* metricCount,
+    bool record_transmittance,
+    float* transmittance_sum,
+    int* covered_count,
     bool debug) {
     const float focal_y = height / (2.0f * tan_fovy);
     const float focal_x = width / (2.0f * tan_fovx);
@@ -430,6 +433,9 @@ int CudaRasterizer::Rasterizer::forward(
                    metric_map,
                    get_flag,
                    metricCount,
+                   record_transmittance,
+                   transmittance_sum,
+                   covered_count,
                    background,
                    out_color,
                    out_alpha,

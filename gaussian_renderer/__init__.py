@@ -26,6 +26,7 @@ def render(
     require_depth: bool = True,
     get_flag: bool = False,
     metric_map: Optional[torch.Tensor] = None,
+    record_transmittance: bool = False,
 ):
     """
     Render the scene. 
@@ -65,6 +66,7 @@ def render(
         debug=pipe.debug,
         get_flag=get_flag,
         metric_map=metric_map,
+        record_transmittance=record_transmittance,
     )
 
     rasterizer = GaussianRasterizer(raster_settings=raster_settings)
@@ -89,7 +91,7 @@ def render(
     sg_sharpness = pc.get_sg_sharpness
     sg_color = pc.get_sg_color
 
-    rendered_image, radii, rendered_median_depth, rendered_alpha, rendered_normal, accum_metric_counts = rasterizer(
+    raster_output = rasterizer(
         means3D = means3D,
         means2D = means2D,
         shs = shs,
@@ -100,7 +102,23 @@ def render(
         opacities = opacity,
         scales = scales,
         rotations = rotations,
-        cov3D_precomp = cov3D_precomp,)
+        cov3D_precomp = cov3D_precomp,
+    )
+    if record_transmittance:
+        (
+            rendered_image,
+            radii,
+            rendered_median_depth,
+            rendered_alpha,
+            rendered_normal,
+            accum_metric_counts,
+            transmittance_avg,
+            num_covered_pixels,
+        ) = raster_output
+    else:
+        rendered_image, radii, rendered_median_depth, rendered_alpha, rendered_normal, accum_metric_counts = raster_output
+        transmittance_avg = None
+        num_covered_pixels = None
 
 
 
@@ -114,6 +132,8 @@ def render(
             "radii": radii,
             "normal":rendered_normal,
             "accum_metric_counts": accum_metric_counts,
+            "transmittance_avg": transmittance_avg,
+            "num_covered_pixels": num_covered_pixels,
             }
 
 # integration is adopted from GOF for marching tetrahedra https://github.com/autonomousvision/gaussian-opacity-fields/blob/main/gaussian_renderer/__init__.py

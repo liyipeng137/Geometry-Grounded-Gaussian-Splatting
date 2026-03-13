@@ -119,6 +119,9 @@ class OptimizationParams(ParamGroup):
         self.opacity_reset_interval = 3000
         self.densify_from_iter = 500
         self.densify_until_iter = 15_000
+        self.contribution_prune_from_iter = 500
+        self.contribution_prune_interval = 100
+        self.contribution_prune_ratio = 0.1
 
 
         self.regularization_from_iter = 7000 # if scene case change to 3000
