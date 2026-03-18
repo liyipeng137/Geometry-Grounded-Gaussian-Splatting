@@ -34,12 +34,19 @@ def generate_ply_from_rgbd(
     print("Generating dense init ply from RGBD ...")
     if len(train_cam_infos) == 0:
         raise ValueError("No cameras provided for RGBD point cloud generation.")
-    if cam_intrinsics is None:
-        raise ValueError("cam_intrinsics is required for RGBD point cloud generation.")
+    # if cam_intrinsics is None:
+    #     raise ValueError("cam_intrinsics is required for RGBD point cloud generation.")
 
     train_example = train_cam_infos[0]
     w, h = train_example.width, train_example.height
-    fx, fy, cx, cy = _parse_colmap_intrinsics(cam_intrinsics)
+    # fx, fy, cx, cy = _parse_colmap_intrinsics(cam_intrinsics)
+    # "fl_x": 1435.1975781999997,
+    # "fl_y": 1435.1975781999997,
+    # "cx": 700.0,
+    # "cy": 952.0,
+    # "w": 1400,
+    # "h": 1904,
+    fx, fy, cx, cy = 1435.1975781999997, 1435.1975781999997, 700.0, 952.0
     samples_per_frame = max((num_points + len(train_cam_infos) - 1) // len(train_cam_infos), 1)
 
     volume = o3d.pipelines.integration.ScalableTSDFVolume(
@@ -58,8 +65,8 @@ def generate_ply_from_rgbd(
     for train_cam in train_cam_infos:
         image_path = train_cam.image_path
         image_name = train_cam.image_name
-        depth_path = os.path.join(source_path, "depths", f"{image_name}.png")
-        confidence_path = os.path.join(source_path, "confidence", f"{image_name}.png")
+        depth_path = os.path.join(source_path, "depth", f"{image_name}.png")
+        # confidence_path = os.path.join(source_path, "confidence", f"{image_name}.png")
 
         color_np = cv2.imread(image_path, cv2.IMREAD_COLOR)
         if color_np is None:
@@ -77,15 +84,17 @@ def generate_ply_from_rgbd(
         else:
             depth_u16 = np.clip(depth_raw.astype(np.float32), 0.0, 65535.0).astype(np.uint16)
 
-        confidence_raw = cv2.imread(confidence_path, cv2.IMREAD_UNCHANGED)
-        if confidence_raw is not None:
-            if confidence_raw.ndim == 3:
-                confidence_raw = confidence_raw[..., 0]
-            confidence = confidence_raw.astype(np.float32)
-            if confidence.max() > 1.0:
-                confidence = confidence / 255.0
-            conf_mask = confidence > conf_threshold
-            depth_u16 = np.where(conf_mask, depth_u16, 0).astype(np.uint16)
+        # confidence_raw = cv2.imread(confidence_path, cv2.IMREAD_UNCHANGED)
+        # if confidence_raw is not None:
+        #     if confidence_raw.ndim == 3:
+        #         confidence_raw = confidence_raw[..., 0]
+        #     confidence = confidence_raw.astype(np.float32)
+        #     if confidence.max() > 1.0:
+        #         confidence = confidence / 255.0
+        #     conf_mask = confidence > conf_threshold
+        #     depth_u16 = np.where(conf_mask, depth_u16, 0).astype(np.uint16)
+        # depth cut 0~10.0
+
 
         depth = o3d.geometry.Image(depth_u16)
 

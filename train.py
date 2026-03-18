@@ -360,7 +360,7 @@ def training(
         #         lambda_normal_prior_cur = 0.2
         #     lambda_multi_view_ncc_cur = 0.0
         # else:
-        lambda_multi_view_ncc_cur = 0.6
+        lambda_multi_view_ncc_cur = 0.02
         lambda_normal_prior_cur = 0.0
 
         reg_kick_on = iteration >= opt.regularization_from_iter
@@ -440,32 +440,35 @@ def training(
 
         if depth_prior_kick_on and depth_map is not None:
             gt_depth_prior = viewpoint_cam.depth_prior
-            valid_depth_mask = gt_depth_prior > 0
-            confidence_map = None
-            if viewpoint_cam.depth_confidence is not None:
-                confidence_map = viewpoint_cam.depth_confidence.clamp(0.0, 1.0)
-                # keep conf>0 as validity gate, and use confidence as soft weights.
-                valid_depth_mask = valid_depth_mask & (confidence_map > 0)
+            valid_depth_mask = gt_depth_prior > 0.0
+            # confidence_map = None
+            # if viewpoint_cam.depth_confidence is not None:
+            #     confidence_map = viewpoint_cam.depth_confidence.clamp(0.0, 1.0)
+            #     # keep conf>0 as validity gate, and use confidence as soft weights.
+            #     valid_depth_mask = valid_depth_mask & (confidence_map > 0)
 
             if valid_depth_mask.any().item():
-                if iteration <= 7000:
-                    conf_weights = None
-                    if confidence_map is not None:
-                        conf_weights = confidence_map.pow(2)
-                    depth_prior_loss = weighted_charbonnier_depth_loss(
-                        depth_map, gt_depth_prior, valid_depth_mask, weight_map=conf_weights, eps=1e-3
-                    )
-                else:
-                    pearson_loss = masked_pearson_depth_loss(depth_map, gt_depth_prior, valid_depth_mask)
-                    lp_loss = masked_local_pearson_loss(
-                        depth_map,
-                        gt_depth_prior,
-                        valid_depth_mask,
-                        confidence_map=confidence_map,
-                        box_p=128,
-                        p_corr=0.5,
-                    )
-                    depth_prior_loss = (pearson_loss + lp_loss) * 0.1
+                # if iteration <= 7000:
+                    # conf_weights = None
+                    # if confidence_map is not None:
+                    #     conf_weights = confidence_map.pow(2)
+                    # depth_prior_loss = weighted_charbonnier_depth_loss(
+                    #     depth_map, gt_depth_prior, valid_depth_mask, weight_map=conf_weights, eps=1e-3
+                    # )
+                depth_prior_loss = masked_l1_depth_loss(
+                    depth_map, gt_depth_prior, valid_depth_mask
+                )
+                # else:
+                #     pearson_loss = masked_pearson_depth_loss(depth_map, gt_depth_prior, valid_depth_mask)
+                #     lp_loss = masked_local_pearson_loss(
+                #         depth_map,
+                #         gt_depth_prior,
+                #         valid_depth_mask,
+                #         confidence_map=confidence_map,
+                #         box_p=128,
+                #         p_corr=0.5,
+                #     )
+                #     depth_prior_loss = (pearson_loss + lp_loss) * 0.1
             else:
                 depth_prior_loss = torch.tensor([0], dtype=torch.float32, device="cuda")
         else:
@@ -604,23 +607,23 @@ def training(
                     else:
                         gaussians.compute_3D_filter(cameras=trainCameras)
 
-                if iteration > opt.contribution_prune_from_iter and iteration % opt.contribution_prune_interval == 0:
-                    if iteration % opt.opacity_reset_interval == opt.contribution_prune_interval:
-                        print(f"[Iter {iteration}] Skipped contribution pruning near opacity reset.")
-                    else:
-                        prune_low_contribution_gaussians(
-                            gaussians,
-                            trainCameras[::2],
-                            pipe,
-                            background,
-                            kernel_size,
-                            K=1,
-                            prune_ratio=opt.contribution_prune_ratio,
-                        )
-                        if dataset.disable_filter3D:
-                            gaussians.reset_3D_filter()
-                        else:
-                            gaussians.compute_3D_filter(cameras=trainCameras)
+                # if iteration > opt.contribution_prune_from_iter and iteration % opt.contribution_prune_interval == 0:
+                #     if iteration % opt.opacity_reset_interval == opt.contribution_prune_interval:
+                #         print(f"[Iter {iteration}] Skipped contribution pruning near opacity reset.")
+                #     else:
+                #         prune_low_contribution_gaussians(
+                #             gaussians,
+                #             trainCameras[::2],
+                #             pipe,
+                #             background,
+                #             kernel_size,
+                #             K=1,
+                #             prune_ratio=opt.contribution_prune_ratio,
+                #         )
+                #         if dataset.disable_filter3D:
+                #             gaussians.reset_3D_filter()
+                #         else:
+                #             gaussians.compute_3D_filter(cameras=trainCameras)
 
                 if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
                     gaussians.reset_opacity()

@@ -957,6 +957,7 @@ class GaussianModel:
         importance_threshold=5,
         pruning_score=None,
         vcp_remove_ratio=0.5,
+        outside_prune_radius=None,
     ):
         grads = self.xyz_gradient_accum / self.denom
         grads[grads.isnan()] = 0.0
@@ -970,11 +971,15 @@ class GaussianModel:
             metric_mask = importance_score > importance_threshold
 
         before = self._xyz.shape[0]
-        self.densify_and_clone(grads, max_grad, grads_abs, Q, extent, metric_mask=metric_mask)
-        clone = self._xyz.shape[0]
-
-        self.densify_and_split(grads, max_grad, grads_abs, Q, extent, metric_mask=metric_mask)
-        split = self._xyz.shape[0]
+        if before <= 2500000:
+            self.densify_and_clone(grads, max_grad, grads_abs, Q, extent, metric_mask=metric_mask)
+            clone = self._xyz.shape[0]
+            self.densify_and_split(grads, max_grad, grads_abs, Q, extent, metric_mask=metric_mask)
+            split = self._xyz.shape[0]
+        else:
+            print(f"[densify_and_prune] point count {before} > 2500000, skip clone/split, prune only")
+            clone = before
+            split = before
 
         prune_mask = (self.get_opacity < min_opacity).squeeze()
         if pruning_score is not None:
@@ -993,17 +998,32 @@ class GaussianModel:
                     sampled_indices = torch.multinomial(padded_importance, sample_count, replacement=False)
                     selected_pts_mask[sampled_indices] = True
                     prune_mask = torch.logical_and(prune_mask, selected_pts_mask)
+        if outside_prune_radius is not None:
+            outside_mask = torch.linalg.norm(self.get_xyz, dim=1) > outside_prune_radius
+            prune_mask = torch.logical_or(prune_mask, outside_mask)
         self.prune_points(prune_mask)
         prune = self._xyz.shape[0]
+        print(f"[densify_and_prune] {before} → {prune} | "
+              f"+clone {clone - before}, +split {split - clone}, "
+              f"-prune {split - prune}")
         return clone - before, split - clone, split - prune
 
-    def final_prune_fastgs(self, min_opacity, pruning_score=None, score_threshold=0.9):
+    def final_prune_fastgs(self, min_opacity, pruning_score=None, score_threshold=0.9, outside_prune_radius=None):
         """Final-stage pruning used in FastGS: opacity OR high pruning_score."""
+        before = self.get_xyz.shape[0]
         prune_mask = (self.get_opacity < min_opacity).squeeze()
+        opacity_pruned = prune_mask.sum().item()
         if pruning_score is not None:
             score_mask = pruning_score > score_threshold
             prune_mask = torch.logical_or(prune_mask, score_mask)
+        if outside_prune_radius is not None:
+            outside_mask = torch.linalg.norm(self.get_xyz, dim=1) > outside_prune_radius
+            prune_mask = torch.logical_or(prune_mask, outside_mask)
+        total_pruned = prune_mask.sum().item()
         self.prune_points(prune_mask)
+        after = self.get_xyz.shape[0]
+        print(f"[final_prune_fastgs] {before} → {after} | pruned {total_pruned} "
+              f"(opacity<{min_opacity}: {opacity_pruned})")
 
     def add_densification_stats(self, viewspace_point_tensor, update_filter):
         self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter, :2], dim=-1, keepdim=True)

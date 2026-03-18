@@ -215,7 +215,7 @@ def marching_tetrahedra_with_binary_search_bounded(
     distance = torch.norm(left_points - right_points, dim=-1)
     scale = left_scale + right_scale
 
-    n_binary_steps = 10
+    n_binary_steps = 6
     for step in range(n_binary_steps):
         print("binary search in step {}".format(step))
         mid_points = (left_points + right_points) * 0.5
@@ -300,7 +300,7 @@ if __name__ == "__main__":
     # Mesh reduction parameters
     parser.add_argument("--alpha_threshold", default=0.5, type=float, 
                        help="Alpha threshold for surface extraction (0.5-0.7, higher = less volume)")
-    parser.add_argument("--scale_factor", default=0.8, type=float,
+    parser.add_argument("--scale_factor", default=0.7, type=float,
                        help="Scale factor for edge filtering (0.7-1.0, lower = fewer faces)")
     parser.add_argument("--min_triangles", default=50, type=int,
                        help="Minimum triangles per cluster (50-500, higher = remove more floaters)")
@@ -308,7 +308,7 @@ if __name__ == "__main__":
     # Boundary parameters
     parser.add_argument("--no_boundary", action="store_true",
                        help="Disable boundary constraint (extract unbounded mesh)")
-    parser.add_argument("--boundary_margin", default=1.2, type=float,
+    parser.add_argument("--boundary_margin", default=2.0, type=float,
                        help="Boundary margin factor (1.0-2.0, larger = more margin)")
     
     args = get_combined_args(parser)

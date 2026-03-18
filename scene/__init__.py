@@ -54,7 +54,7 @@ class Scene:
                 args.eval,
                 use_rgbd_init_ply=not args.disable_rgbd_init_ply,
             )
-        elif os.path.exists(os.path.join(args.source_path, "transforms_train.json")):
+        elif os.path.exists(os.path.join(args.source_path, "transforms.json")):
             print("Found transforms_train.json file, assuming Blender data set!")
             scene_info = sceneLoadTypeCallbacks["Blender"](args.source_path, args.white_background, args.eval)
 

@@ -68,7 +68,7 @@ class ModelParams(ParamGroup):
         self.mask_format = "png"
         self.normal_prior_dir = "normals"
         self.normal_prior_format = "png"
-        self.depth_prior_dir = "depths"
+        self.depth_prior_dir = "depth"
         self.depth_prior_format = "png"
         self.depth_prior_scale = 1000.0
         self.depth_confidence_dir = "confidence"
@@ -132,7 +132,7 @@ class OptimizationParams(ParamGroup):
 
         self.lambda_normal_prior = 0.1
         self.normal_prior_from_iter = 7000
-        self.lambda_depth_prior = 0.3
+        self.lambda_depth_prior = 0.4
         self.depth_prior_from_iter = 3000
         self.vcd_enable = True
         self.vcd_from_iter = 500
@@ -141,7 +141,7 @@ class OptimizationParams(ParamGroup):
         self.vcd_importance_thresh = 5
         self.vcp_enable = True
         self.vcp_from_iter = 500
-        self.vcp_remove_ratio = 0.5
+        self.vcp_remove_ratio = 0.9
         self.multi_view_patch_size = 3
         self.multi_view_pixel_noise_th = 1.0
         self.use_geo_occ_aware = True

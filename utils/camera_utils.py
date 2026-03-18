@@ -79,6 +79,7 @@ def _load_depth_prior(args, cam_info, resolution):
     if not os.path.exists(depth_path):
         return None
 
+    print(f"Load depth_path: {depth_path}")
     depth_img = Image.open(depth_path)
     depth_np = np.asarray(depth_img).astype(np.float32)
     if depth_np.ndim == 3:
@@ -154,7 +155,7 @@ def loadCam(args, id, cam_info, resolution_scale):
 
     normal_prior = _load_normal_prior(args, cam_info, resolution)
     depth_prior = _load_depth_prior(args, cam_info, resolution)
-    depth_confidence = _load_depth_confidence(args, cam_info, resolution)
+    # depth_confidence = _load_depth_confidence(args, cam_info, resolution)
 
     return Camera(colmap_id=cam_info.uid, R=cam_info.R, T=cam_info.T, 
                   FoVx=cam_info.FovX, FoVy=cam_info.FovY, 
@@ -162,7 +163,7 @@ def loadCam(args, id, cam_info, resolution_scale):
                   image_name=cam_info.image_name, uid=id,
                   normal_prior=normal_prior,
                   depth_prior=depth_prior,
-                  depth_confidence=depth_confidence,
+                  depth_confidence=None,
                   data_device=args.data_device)
 
 def cameraList_from_camInfos(cam_infos, resolution_scale, args):

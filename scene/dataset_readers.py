@@ -288,11 +288,18 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
 
     with open(os.path.join(path, transformsfile)) as json_file:
         contents = json.load(json_file)
-        fovx = contents["camera_angle_x"]
+        # fovx = contents["camera_angle_x"]
 
         frames = contents["frames"]
+        fl_x_global = contents.get("fl_x", None)
+        fl_y_global = contents.get("fl_y", None)
+        w_global = contents.get("w", None)
+        h_global = contents.get("h", None)
+        cx_global = contents.get("cx", None)
+        cy_global = contents.get("cy", None)
         for idx, frame in enumerate(frames):
-            cam_name = os.path.join(path, frame["file_path"] + extension)
+            # cam_name = os.path.join(path, frame["file_path"])
+            cam_name = frame["file_path"] 
 
             # NeRF 'transform_matrix' is a camera-to-world transform
             c2w = np.array(frame["transform_matrix"])
@@ -304,20 +311,36 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
             R = np.transpose(w2c[:3,:3])  # R is stored transposed due to 'glm' in CUDA code
             T = w2c[:3, 3]
 
-            image_path = os.path.join(path, cam_name)
+            image_path = os.path.join(path, "images", cam_name)
+            print(f"image_path: {image_path}")
             image_name = Path(cam_name).stem
-            image = Image.open(image_path)
+            # image = Image.open(image_path)
 
-            im_data = np.array(image.convert("RGBA"))
+            # im_data = np.array(image.convert("RGBA"))
 
             bg = np.array([1,1,1]) if white_background else np.array([0, 0, 0])
 
-            norm_data = im_data / 255.0
-            arr = norm_data[:,:,:3] * norm_data[:, :, 3:4] + bg * (1 - norm_data[:, :, 3:4])
-            image = Image.fromarray(np.array(arr*255.0, dtype=np.byte), "RGB")
+            # norm_data = im_data / 255.0
+            # arr = norm_data[:,:,:3] * norm_data[:, :, 3:4] + bg * (1 - norm_data[:, :, 3:4])
+            # image = Image.fromarray(np.array(arr*255.0, dtype=np.byte), "RGB")
 
-            fovy = focal2fov(fov2focal(fovx, image.size[0]), image.size[1])
-            FovY = fovy 
+            image = Image.open(image_path)
+
+            # fovy = focal2fov(fov2focal(fovx, image.size[0]), image.size[1])
+            # FovY = fovy 
+            # FovX = fovx
+
+            fl_x = frame.get("fl_x", fl_x_global)
+            fl_y = frame.get("fl_y", fl_y_global)
+            w = frame.get("w", w_global)
+            h = frame.get("h", h_global)
+            cx, cy = frame.get("cx", cx_global), frame.get("cy", cy_global)
+
+            print(f"fl_x: {fl_x}, fl_y: {fl_y}, w: {w}, h: {h}, cx: {cx}, cy: {cy}")
+
+            fovx = focal2fov(fl_x, w)
+            fovy = focal2fov(fl_y, h)
+            FovY = fovy
             FovX = fovx
 
             cam_infos.append(CameraInfo(uid=idx, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
@@ -327,10 +350,11 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
 
 def readNerfSyntheticInfo(path, white_background, eval, extension=".png"):
     print("Reading Training Transforms")
-    train_cam_infos = readCamerasFromTransforms(path, "transforms_train.json", white_background, extension)
+    train_cam_infos = readCamerasFromTransforms(path, "transforms.json", white_background, extension)
     print("Reading Test Transforms")
-    test_cam_infos = readCamerasFromTransforms(path, "transforms_test.json", white_background, extension)
+    # test_cam_infos = readCamerasFromTransforms(path, "transforms_test.json", white_background, extension)
     train_cam_infos = train_cam_infos
+    test_cam_infos = train_cam_infos
     print("train num:", len(train_cam_infos))
     # if not eval:
     #     train_cam_infos.extend(test_cam_infos)
@@ -338,22 +362,51 @@ def readNerfSyntheticInfo(path, white_background, eval, extension=".png"):
 
     nerf_normalization = getNerfppNorm(train_cam_infos)
 
-    ply_path = os.path.join(path, "points3d.ply")
-    if not os.path.exists(ply_path):
-        # Since this data set has no colmap data, we start with random points
-        num_pts = 100_000
-        print(f"Generating random point cloud ({num_pts})...")
-        
-        # We create random points inside the bounds of the synthetic Blender scenes
-        xyz = np.random.random((num_pts, 3)) * 2.6 - 1.3
-        shs = np.random.random((num_pts, 3)) / 255.0
-        pcd = BasicPointCloud(points=xyz, colors=SH2RGB(shs), normals=np.zeros((num_pts, 3)))
+    cam_intrinsics = None
+    if True:
+        rgbd_ply_path = os.path.join(path, "rgbd_init_points3D.ply")
+        if not os.path.exists(rgbd_ply_path):
+            try:
+                generate_ply_from_rgbd(
+                    train_cam_infos=train_cam_infos,
+                    num_points=200_000,
+                    ply_path=rgbd_ply_path,
+                    cam_intrinsics=cam_intrinsics,
+                )
+            except Exception as e:
+                print(f"[Warn] RGBD init ply generation failed, fallback to sparse point cloud. Reason: {e}")
+        if os.path.exists(rgbd_ply_path):
+            try:
+                print(f"Loading RGBD init point cloud: {rgbd_ply_path}")
+                ply_o3d = o3d.io.read_point_cloud(rgbd_ply_path)
+                if not ply_o3d.has_normals():
+                    ply_o3d.estimate_normals()
+                positions = np.asarray(ply_o3d.points)
+                colors = np.asarray(ply_o3d.colors)
+                normals = np.asarray(ply_o3d.normals) if ply_o3d.has_normals() else np.zeros_like(positions)
+                pcd = BasicPointCloud(points=positions, colors=colors, normals=normals)
+                ply_path = rgbd_ply_path
+                print(f"Loaded RGBD init point cloud: {ply_path}, points={positions.shape[0]}")
+            except Exception as e:
+                print(f"[Warn] Failed to load RGBD init point cloud, fallback to sparse point cloud. Reason: {e}")
 
-        storePly(ply_path, xyz, SH2RGB(shs) * 255)
-    try:
-        pcd = fetchPly(ply_path)
-    except:
-        pcd = None
+
+    # ply_path = os.path.join(path, "points3d.ply")
+    # if not os.path.exists(ply_path):
+    #     # Since this data set has no colmap data, we start with random points
+    #     num_pts = 100_000
+    #     print(f"Generating random point cloud ({num_pts})...")
+        
+    #     # We create random points inside the bounds of the synthetic Blender scenes
+    #     xyz = np.random.random((num_pts, 3)) * 2.6 - 1.3
+    #     shs = np.random.random((num_pts, 3)) / 255.0
+    #     pcd = BasicPointCloud(points=xyz, colors=SH2RGB(shs), normals=np.zeros((num_pts, 3)))
+
+    #     storePly(ply_path, xyz, SH2RGB(shs) * 255)
+    # try:
+    #     pcd = fetchPly(ply_path)
+    # except:
+    #     pcd = None
 
     scene_info = SceneInfo(train_cameras=train_cam_infos,
                            test_cameras=test_cam_infos,
