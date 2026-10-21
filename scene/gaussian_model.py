@@ -34,6 +34,22 @@ from utils.sh_utils import C0, RGB2SH
 from utils.system_utils import mkdir_p
 
 
+def _usable_init_rgb(colors, count):
+    if colors is None or count == 0:
+        return None
+    rgb = np.asarray(colors)
+    if rgb.ndim != 2 or rgb.shape[0] != count or rgb.shape[1] < 3 or rgb.size == 0:
+        return None
+    rgb = np.ascontiguousarray(rgb[:, :3], dtype=np.float32)
+    peak = float(rgb.max())
+    if peak > 1.0:
+        rgb = rgb / 255.0
+        peak = float(rgb.max())
+    if peak <= 1e-6:
+        return None
+    return rgb
+
+
 class GaussianModel:
     class App_model(Enum):
         NO = 0
@@ -333,11 +349,17 @@ class GaussianModel:
     def create_from_pcd(self, pcd, spatial_lr_scale: float):
         self.spatial_lr_scale = spatial_lr_scale
         if isinstance(pcd, BasicPointCloud):
-            fused_point_cloud = torch.tensor(np.asarray(pcd.points)).float().cuda()
-            fused_color = RGB2SH(torch.tensor(np.asarray(pcd.colors)).float().cuda())
+            points = np.asarray(pcd.points)
+            raw_colors = pcd.colors
         else:
-            fused_point_cloud = torch.tensor(np.asarray(pcd._xyz)).float().cuda()
-            fused_color = RGB2SH(torch.tensor(np.asarray(pcd._rgb)).float().cuda())
+            points = np.asarray(pcd._xyz)
+            raw_colors = getattr(pcd, "_rgb", None)
+        rgb = _usable_init_rgb(raw_colors, points.shape[0])
+        if rgb is None:
+            print(f"Init point colors are missing or black, assigning random RGB to {points.shape[0]} points")
+            rgb = np.random.uniform(1.0 / 255.0, 1.0, size=(points.shape[0], 3)).astype(np.float32)
+        fused_point_cloud = torch.tensor(points).float().cuda()
+        fused_color = RGB2SH(torch.tensor(rgb).float().cuda())
         features = torch.zeros((fused_color.shape[0], 3, (self.max_sh_degree + 1) ** 2)).float().cuda()
         features[:, :3, 0] = fused_color
         features[:, 3:, 1:] = 0.0

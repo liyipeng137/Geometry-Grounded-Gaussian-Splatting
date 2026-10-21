@@ -10,12 +10,65 @@
 #
 
 import math
+from collections import OrderedDict
 
 import numpy as np
 import torch
 from torch import nn
 
 from utils.graphics_utils import getProjectionMatrix, getWorld2View2
+
+_PAYLOAD_FIELDS = (
+    "original_image",
+    "gt_mask",
+    "normal_prior",
+    "normal_prior_mask",
+    "depth_prior",
+    "depth_confidence",
+)
+
+
+class FramePayloadCache:
+    def __init__(self, budget):
+        self.budget = budget
+        self.enabled = budget != -1
+        if self.enabled and budget < 1:
+            raise ValueError("frame_gpu_budget must be -1 or a positive integer")
+        self._cache = OrderedDict()
+
+    def ensure(self, camera, keep=()):
+        if not self.enabled:
+            return camera
+
+        key = id(camera)
+        if key in self._cache:
+            self._cache.move_to_end(key)
+            return camera
+
+        keep_ids = {id(item) for item in keep}
+        while len(self._cache) >= self.budget:
+            evicted = False
+            for old_key in list(self._cache.keys()):
+                if old_key == key or old_key in keep_ids:
+                    continue
+                old_camera = self._cache.pop(old_key)
+                old_camera.release_payload_from_device()
+                evicted = True
+                break
+            if not evicted:
+                break
+
+        camera.load_payload_to_device()
+        self._cache[key] = camera
+        return camera
+
+    def clear(self):
+        if not self.enabled:
+            return
+        for camera in self._cache.values():
+            camera.release_payload_from_device()
+        self._cache.clear()
+
 
 class Camera(nn.Module):
     def __init__(self, colmap_id, R, T, FoVx, FoVy, image, gt_alpha_mask,
@@ -24,6 +77,7 @@ class Camera(nn.Module):
                  depth_prior=None,
                  depth_confidence=None,
                  trans=np.array([0.0, 0.0, 0.0]), scale=1.0, data_device = "cuda",
+                 lazy_payload=False,
                  ):
         super(Camera, self).__init__()
 
@@ -43,35 +97,46 @@ class Camera(nn.Module):
 
         self.R = torch.tensor(R, dtype=torch.float32).cuda()
         self.T = torch.tensor(T, dtype=torch.float32).cuda()
+        self.lazy_payload = lazy_payload
 
-        self.original_image = image.clamp(0.0, 1.0).to(self.data_device)
-        self.gray_image = (0.299 * image[0] + 0.587 * image[1] + 0.114 * image[2])[None].to(self.data_device)
-        self.image_width = self.original_image.shape[2]
-        self.image_height = self.original_image.shape[1]
-        
+        if image.dtype != torch.uint8:
+            image = (image.clamp(0.0, 1.0) * 255.0).round().to(torch.uint8)
+        if gt_alpha_mask is not None:
+            if gt_alpha_mask.dtype != torch.uint8:
+                mask_f = gt_alpha_mask.clamp(0.0, 1.0).contiguous()
+                mask_u8 = (mask_f * 255.0).round().to(torch.uint8)
+            else:
+                mask_u8 = gt_alpha_mask
+                mask_f = gt_alpha_mask.float().mul(1.0 / 255.0).contiguous()
+            image = ((image.to(torch.int32) * mask_u8.to(torch.int32) + 127) // 255).to(torch.uint8)
+        else:
+            mask_f = None
+        image = image.contiguous()
+        self.image_width = image.shape[2]
+        self.image_height = image.shape[1]
+
         self.Fx = self.image_width / (2 * math.tan(self.FoVx / 2.))
         self.Fy = self.image_height / (2 * math.tan(self.FoVy / 2.))
         self.Cx = float(self.image_width - 1) / 2
         self.Cy = float(self.image_height - 1) / 2
 
-        if gt_alpha_mask is not None:
-            self.gt_mask = gt_alpha_mask.to(self.data_device)
-            self.original_image *= self.gt_mask
-            self.gray_image *= self.gt_mask
-        else:
-            self.gt_mask = None
-
+        self.has_gt_mask = mask_f is not None
         if normal_prior is not None:
-            self.normal_prior = normal_prior.to(self.data_device)
-            normal_norm = torch.norm(self.normal_prior, dim=0, keepdim=True)
-            self.normal_prior_mask = (normal_norm > 0.9) & (normal_norm < 1.1)
-            self.normal_prior = self.normal_prior / torch.clamp(normal_norm, min=1e-6)
+            normal_norm = torch.norm(normal_prior, dim=0, keepdim=True)
+            normal_prior_mask = (normal_norm > 0.9) & (normal_norm < 1.1)
+            normal_prior = normal_prior / torch.clamp(normal_norm, min=1e-6)
         else:
-            self.normal_prior = None
-            self.normal_prior_mask = None
+            normal_prior_mask = None
+        self.has_normal_prior = normal_prior is not None
+        self.has_depth_prior = depth_prior is not None
+        self.has_depth_confidence = depth_confidence is not None
 
-        self.depth_prior = depth_prior.to(self.data_device) if depth_prior is not None else None
-        self.depth_confidence = depth_confidence.to(self.data_device) if depth_confidence is not None else None
+        self._store_payload("original_image", image)
+        self._store_payload("gt_mask", mask_f)
+        self._store_payload("normal_prior", normal_prior)
+        self._store_payload("normal_prior_mask", normal_prior_mask)
+        self._store_payload("depth_prior", depth_prior)
+        self._store_payload("depth_confidence", depth_confidence)
 
         self.zfar = 100.0
         self.znear = 0.01
@@ -84,6 +149,40 @@ class Camera(nn.Module):
         self.full_proj_transform = (self.world_view_transform.unsqueeze(0).bmm(self.projection_matrix.unsqueeze(0))).squeeze(0)
         self.camera_center = self.world_view_transform.inverse()[3, :3]
 
+    def _store_payload(self, name, tensor):
+        if tensor is not None:
+            tensor = tensor.contiguous()
+        if self.lazy_payload:
+            setattr(self, name + "_cpu", tensor)
+            setattr(self, name, None)
+        else:
+            setattr(self, name + "_cpu", None)
+            setattr(self, name, None if tensor is None else tensor.to(self.data_device))
+
+    def load_payload_to_device(self):
+        if not self.lazy_payload:
+            return
+        for name in _PAYLOAD_FIELDS:
+            cpu_tensor = getattr(self, name + "_cpu")
+            if cpu_tensor is not None and getattr(self, name) is None:
+                setattr(self, name, cpu_tensor.to(self.data_device, non_blocking=True))
+
+    def release_payload_from_device(self):
+        if not self.lazy_payload:
+            return
+        for name in _PAYLOAD_FIELDS:
+            setattr(self, name, None)
+
+    def original_image_float(self):
+        image = self.original_image
+        if image.dtype == torch.uint8:
+            return image.float().mul(1.0 / 255.0)
+        return image
+
+    @property
+    def gray_image(self):
+        image = self.original_image_float()
+        return (0.299 * image[0] + 0.587 * image[1] + 0.114 * image[2])[None]
 
 
 class MiniCam:

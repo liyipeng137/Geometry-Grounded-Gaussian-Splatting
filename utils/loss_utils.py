@@ -15,7 +15,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.autograd import Variable
-from fused_ssim import fused_ssim
+from fused_ssim import fused_ssim, photometric_loss
 from scene import GaussianModel, Camera
 from utils.graphics_utils import (
     patch_offsets,
@@ -23,6 +23,13 @@ from utils.graphics_utils import (
 )
 from gaussian_renderer import sample_depth, render
 import warp_patch_ncc
+
+
+def _image_to_bgr_u8(image):
+    chw = image.detach()
+    if chw.dtype == torch.uint8:
+        return chw.permute(1, 2, 0)[:, :, [2, 1, 0]].cpu().numpy()
+    return (chw.permute(1, 2, 0).clamp(0, 1)[:, :, [2, 1, 0]] * 255).cpu().numpy().astype(np.uint8)
 
 
 def l1_loss(network_output, gt):
@@ -87,40 +94,40 @@ def get_img_grad_weight(img):
     return grad_img
 
 
-def L1_loss_appearance(image, gt_image, gaussians, view_idx):
+def photometric_rgb_loss(image, gt_image, gaussians, view_idx, lambda_dssim):
+    gt_image = gt_image.contiguous()
     app_model = gaussians.app_model
     if app_model is GaussianModel.App_model.NO:
-        return l1_loss(image, gt_image)
-    appearance_embedding = gaussians.get_apperance_embedding(view_idx)
+        rgb_loss, l1, _ = photometric_loss(image.contiguous(), gt_image, lambda_dssim)
+        return rgb_loss, l1
 
+    appearance_embedding = gaussians.get_apperance_embedding(view_idx)
+    pred = image
+    target = gt_image
     if app_model is GaussianModel.App_model.GS:
         exposure = appearance_embedding
-        transformed = torch.addmm(
+        pred = torch.addmm(
             exposure[:3, 3, None],
             exposure[:3, :3],
             image.reshape(3, -1),
         ).reshape_as(image)
-        return l1_loss(transformed, gt_image)
-
-    if app_model is GaussianModel.App_model.GOF:
+    elif app_model is GaussianModel.App_model.GOF:
         origH, origW = image.shape[1:]
         H, W = origH // 32 * 32, origW // 32 * 32
         top, left = (origH - H) // 2, (origW - W) // 2
-
         crop = image[:, top : top + H, left : left + W]
-        crop_gt = gt_image[:, top : top + H, left : left + W]
-
+        target = gt_image[:, top : top + H, left : left + W].contiguous()
         down = torch.nn.functional.interpolate(crop[None], size=(H // 32, W // 32), mode="bilinear", align_corners=True)[0]
         embedding_map = appearance_embedding[None].repeat(H // 32, W // 32, 1).permute(2, 0, 1)
         net_in = torch.cat([down, embedding_map], dim=0)[None]
+        pred = gaussians.appearance_network(net_in) * crop
+    elif app_model is GaussianModel.App_model.PGSR:
+        pred = torch.addcmul(appearance_embedding[1], torch.exp(appearance_embedding[0]), image)
 
-        mapping = gaussians.appearance_network(net_in)
-        transformed = mapping * crop
-        return l1_loss(transformed, crop_gt)
-
-    if app_model is GaussianModel.App_model.PGSR:
-        transformed = torch.addcmul(appearance_embedding[1], torch.exp(appearance_embedding[0]), image)
-        return l1_loss(transformed, gt_image)
+    _, l1, _ = photometric_loss(pred.contiguous(), target, 0.0)
+    ssim_term, _, _ = photometric_loss(image.contiguous(), gt_image, 1.0)
+    rgb_loss = (1.0 - lambda_dssim) * l1 + lambda_dssim * ssim_term
+    return rgb_loss, l1
 
 
 class PatchMatch:
@@ -200,13 +207,11 @@ class PatchMatch:
 
         if iteration % 200 == 0 and self.debug:
             with torch.no_grad():
-                gt_img_show = (viewpoint_cam.original_image.permute(1, 2, 0).clamp(0, 1)[:, :, [2, 1, 0]] * 255).detach().cpu().numpy().astype(np.uint8)
+                gt_img_show = _image_to_bgr_u8(viewpoint_cam.original_image)
                 img_show = ((render_pkg["render"]).permute(1, 2, 0).clamp(0, 1)[:, :, [2, 1, 0]] * 255).detach().cpu().numpy().astype(np.uint8)
                 normal_show = (((render_pkg["normal"] + 1.0) * 0.5).permute(1, 2, 0).clamp(0, 1) * 255).detach().cpu().numpy().astype(np.uint8)
                 if depth_normal is None:
-                    depth_normal_show = (
-                        (nearest_cam.original_image.permute(1, 2, 0).clamp(0, 1)[:, :, [2, 1, 0]] * 255).detach().cpu().numpy().astype(np.uint8)
-                    )
+                    depth_normal_show = _image_to_bgr_u8(nearest_cam.original_image)
                 else:
                     depth_normal_show = (((depth_normal + 1.0) * 0.5).permute(1, 2, 0).clamp(0, 1) * 255).detach().cpu().numpy().astype(np.uint8)
                 d_mask_show = (weights.float() * 255).detach().cpu().numpy().astype(np.uint8)

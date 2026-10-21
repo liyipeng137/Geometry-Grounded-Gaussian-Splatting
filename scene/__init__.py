@@ -33,6 +33,11 @@ class Scene:
         :param path: Path to colmap scene main folder.
         """
         self.model_path = args.model_path
+        frame_gpu_budget = getattr(args, "frame_gpu_budget", -1)
+        if frame_gpu_budget is None:
+            frame_gpu_budget = -1
+        if frame_gpu_budget != -1 and frame_gpu_budget < 1:
+            raise ValueError("frame_gpu_budget must be -1 or a positive integer")
         self.loaded_iter = None
         self.gaussians = gaussians
 

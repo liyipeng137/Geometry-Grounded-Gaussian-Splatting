@@ -19,9 +19,10 @@ from tqdm import tqdm
 from arguments import ModelParams, PipelineParams, get_combined_args
 from gaussian_renderer import GaussianModel, render
 from scene import Scene
+from scene.cameras import FramePayloadCache
 from utils.general_utils import safe_state
 
-def render_set(model_path, name, iteration, views, gaussians, pipeline, background, kernel_size):
+def render_set(model_path, name, iteration, views, gaussians, pipeline, background, kernel_size, frame_cache):
     render_path = os.path.join(model_path, name, "ours_{}".format(iteration), "renders")
     gts_path = os.path.join(model_path, name, "ours_{}".format(iteration), "gt")
 
@@ -29,8 +30,10 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
     os.makedirs(gts_path, exist_ok=True)
 
     for idx, view in enumerate(tqdm(views, desc="Rendering progress")):
+        if frame_cache is not None:
+            view = frame_cache.ensure(view)
         rendering = render(view, gaussians, pipeline, background, kernel_size=kernel_size)["render"]
-        gt = view.original_image[0:3, :, :]
+        gt = view.original_image_float()[0:3, :, :]
         torchvision.utils.save_image(rendering, os.path.join(render_path, '{0:05d}'.format(idx) + ".png"))
         torchvision.utils.save_image(gt, os.path.join(gts_path, '{0:05d}'.format(idx) + ".png"))
 
@@ -41,12 +44,16 @@ def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParam
 
         bg_color = [1,1,1] if dataset.white_background else [0, 0, 0]
         background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
+        frame_gpu_budget = getattr(dataset, "frame_gpu_budget", -1)
+        if frame_gpu_budget is None:
+            frame_gpu_budget = -1
+        frame_cache = None if frame_gpu_budget == -1 else FramePayloadCache(frame_gpu_budget)
 
         if not skip_train:
-             render_set(dataset.model_path, "train", scene.loaded_iter, scene.getTrainCameras(), gaussians, pipeline, background, dataset.kernel_size)
+             render_set(dataset.model_path, "train", scene.loaded_iter, scene.getTrainCameras(), gaussians, pipeline, background, dataset.kernel_size, frame_cache)
 
         if not skip_test:
-             render_set(dataset.model_path, "test", scene.loaded_iter, scene.getTestCameras(), gaussians, pipeline, background, dataset.kernel_size)
+             render_set(dataset.model_path, "test", scene.loaded_iter, scene.getTestCameras(), gaussians, pipeline, background, dataset.kernel_size, frame_cache)
 
 if __name__ == "__main__":
     # Set up command line argument parser

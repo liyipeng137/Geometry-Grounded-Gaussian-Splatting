@@ -19,7 +19,6 @@ from typing import NamedTuple
 import numpy as np
 import open3d as o3d
 import trimesh
-from PIL import Image
 from plyfile import PlyData, PlyElement
 from scipy.spatial.transform import Rotation
 
@@ -154,9 +153,8 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
 
         image_path = os.path.join(images_folder, os.path.basename(extr.name))
         image_name = os.path.basename(image_path).split(".")[0]
-        image = Image.open(image_path)
 
-        cam_info = CameraInfo(uid=uid, R=R, T=T, FovY=FovY, FovX=FovX, image=image,  
+        cam_info = CameraInfo(uid=uid, R=R, T=T, FovY=FovY, FovX=FovX, image=None,
                               image_path=image_path, image_name=image_name, width=width, height=height)
         cam_infos.append(cam_info)
     sys.stdout.write('\n')
@@ -165,9 +163,16 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
 def fetchPly(path):
     plydata = PlyData.read(path)
     vertices = plydata['vertex']
+    names = vertices.data.dtype.names or ()
     positions = np.vstack([vertices['x'], vertices['y'], vertices['z']]).T
-    colors = np.vstack([vertices['red'], vertices['green'], vertices['blue']]).T / 255.0
-    normals = np.vstack([vertices['nx'], vertices['ny'], vertices['nz']]).T
+    if {'red', 'green', 'blue'}.issubset(names):
+        colors = np.vstack([vertices['red'], vertices['green'], vertices['blue']]).T / 255.0
+    else:
+        colors = np.zeros((positions.shape[0], 3), dtype=np.float32)
+    if {'nx', 'ny', 'nz'}.issubset(names):
+        normals = np.vstack([vertices['nx'], vertices['ny'], vertices['nz']]).T
+    else:
+        normals = np.zeros_like(positions)
     return BasicPointCloud(points=positions, colors=colors, normals=normals)
 
 def fetchOpen3DPly(path):
@@ -314,21 +319,6 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
             image_path = os.path.join(path, "images", cam_name)
             print(f"image_path: {image_path}")
             image_name = Path(cam_name).stem
-            # image = Image.open(image_path)
-
-            # im_data = np.array(image.convert("RGBA"))
-
-            bg = np.array([1,1,1]) if white_background else np.array([0, 0, 0])
-
-            # norm_data = im_data / 255.0
-            # arr = norm_data[:,:,:3] * norm_data[:, :, 3:4] + bg * (1 - norm_data[:, :, 3:4])
-            # image = Image.fromarray(np.array(arr*255.0, dtype=np.byte), "RGB")
-
-            image = Image.open(image_path)
-
-            # fovy = focal2fov(fov2focal(fovx, image.size[0]), image.size[1])
-            # FovY = fovy 
-            # FovX = fovx
 
             fl_x = frame.get("fl_x", fl_x_global)
             fl_y = frame.get("fl_y", fl_y_global)
@@ -343,8 +333,8 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
             FovY = fovy
             FovX = fovx
 
-            cam_infos.append(CameraInfo(uid=idx, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
-                            image_path=image_path, image_name=image_name, width=image.size[0], height=image.size[1], mask=None))
+            cam_infos.append(CameraInfo(uid=idx, R=R, T=T, FovY=FovY, FovX=FovX, image=None,
+                            image_path=image_path, image_name=image_name, width=w, height=h, mask=None))
             
     return cam_infos
 

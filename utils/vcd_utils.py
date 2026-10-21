@@ -105,6 +105,7 @@ def compute_vcd_vcp_scores(
     loss_thresh,
     need_vcd=True,
     need_vcp=True,
+    frame_cache=None,
 ):
     if len(camlist) == 0 or (not need_vcd and not need_vcp):
         return None, None
@@ -113,6 +114,8 @@ def compute_vcd_vcp_scores(
     full_metric_score = None
     with torch.no_grad():
         for cam in camlist:
+            if frame_cache is not None:
+                cam = frame_cache.ensure(cam)
             render_pkg = render(
                 cam,
                 gaussians,
@@ -122,7 +125,7 @@ def compute_vcd_vcp_scores(
                 require_depth=False,
             )
             corrected_image = apply_appearance_correction(render_pkg["render"], gaussians, cam.uid)
-            gt_image = cam.original_image.cuda()
+            gt_image = cam.original_image_float()
             photometric_loss = _compute_masked_photometric_loss(corrected_image, gt_image, cam.gt_mask)
             metric_map = build_metric_map(corrected_image, gt_image, cam.gt_mask, loss_thresh)
 

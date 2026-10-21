@@ -55,8 +55,13 @@ def extract_mesh(dataset, pipe, iteration, num_cluster=1):
         rendered_img = torch.clamp(render_pkg["render"], min=0, max=1.0).cpu().numpy().transpose(1, 2, 0)
         color_list.append(np.ascontiguousarray(rendered_img))
         depth = render_pkg["median_depth"].clone()
-        if viewpoint_cam.gt_mask is not None:
+        release_payload = viewpoint_cam.lazy_payload and viewpoint_cam.original_image is None
+        if viewpoint_cam.has_gt_mask:
+            if release_payload:
+                viewpoint_cam.load_payload_to_device()
             depth[(viewpoint_cam.gt_mask < 0.5)] = 0
+            if release_payload:
+                viewpoint_cam.release_payload_from_device()
         depth_list.append(depth[0].cpu().numpy())
 
     torch.cuda.empty_cache()

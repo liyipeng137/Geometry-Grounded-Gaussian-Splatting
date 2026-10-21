@@ -42,8 +42,11 @@ def post_process_mesh(mesh, cluster_to_keep=1):
 
 @torch.no_grad()
 def evaluation_validation(view, points, inside):
-    if view.gt_mask is None:
+    if not view.has_gt_mask:
         return inside
+    release_payload = view.lazy_payload and view.gt_mask is None
+    if release_payload:
+        view.load_payload_to_device()
 
     points_cam = points @ view.R + view.T
     pts2d = points_cam[:, :2] / points_cam[:, 2:]
@@ -58,7 +61,10 @@ def evaluation_validation(view, points, inside):
         pts2d,
     )
     sampled_mask = torch.nn.functional.grid_sample(view.gt_mask[None].cuda(), pts2d[None, None], align_corners=True)
-    return (sampled_mask.squeeze() > 0.5) & inside
+    inside = (sampled_mask.squeeze() > 0.5) & inside
+    if release_payload:
+        view.release_payload_from_device()
+    return inside
 
 
 @torch.no_grad()

@@ -11,6 +11,7 @@
 
 from errno import EEXIST
 from os import makedirs, path
+import gc
 import os
 
 def mkdir_p(folder_path):
@@ -26,3 +27,14 @@ def mkdir_p(folder_path):
 def searchForMaxIteration(folder):
     saved_iters = [int(fname.split("_")[-1]) for fname in os.listdir(folder)]
     return max(saved_iters)
+
+def trim_process_memory():
+    gc.collect()
+    if os.name != "posix":
+        return False
+    try:
+        import ctypes
+        libc = ctypes.CDLL("libc.so.6")
+        return libc.malloc_trim(0) == 1
+    except Exception:
+        return False

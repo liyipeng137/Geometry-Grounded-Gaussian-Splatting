@@ -95,6 +95,9 @@ def cull_mesh(cameras, mesh):
     for camera in cameras:
         c2w = (camera.world_view_transform.T).inverse()
         w2c = torch.inverse(c2w).cuda()
+        release_payload = camera.lazy_payload and camera.gt_mask is None and camera.has_gt_mask
+        if release_payload:
+            camera.load_payload_to_device()
         mask = camera.gt_mask
         intrinsic = torch.eye(4)
         intrinsic[0, 0] = camera.Fx
@@ -117,6 +120,8 @@ def cull_mesh(cameras, mesh):
             
             # dialate mask similar to unisurf
             maski = mask[0, :, :].cpu().numpy().astype(np.float32) / 256.
+            if release_payload:
+                camera.release_payload_from_device()
             # maski = torch.from_numpy(binary_dilation(maski, disk(14))).float()[None, None].cuda()
             maski = torch.from_numpy(binary_dilation(maski, disk(6))).float()[None, None].cuda()
             

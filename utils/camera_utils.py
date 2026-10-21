@@ -10,17 +10,27 @@
 #
 
 import os
+from concurrent.futures import ThreadPoolExecutor
 
+import cv2
+import numpy as np
+import torch
+import torch.nn.functional as F
 from PIL import Image
 
 from scene.cameras import Camera
-import numpy as np
 from utils.general_utils import PILtoTorch
 from utils.graphics_utils import fov2focal
-import torch
-import torch.nn.functional as F
+from utils.system_utils import trim_process_memory
 
 WARNED = False
+
+
+def _frame_gpu_budget(args):
+    budget = getattr(args, "frame_gpu_budget", -1)
+    if budget is None:
+        return -1
+    return budget
 
 
 def _resolve_prior_root(source_path, prior_dir):
@@ -123,55 +133,76 @@ def _load_depth_confidence(args, cam_info, resolution):
 #     return PILtoTorch(delight_img, resolution)[:3]
 
 def loadCam(args, id, cam_info, resolution_scale):
-    orig_w, orig_h = cam_info.image.size
+    image = cam_info.image or Image.open(cam_info.image_path)
+    try:
+        orig_w, orig_h = image.size
 
-    if args.resolution in [1, 2, 4, 8]:
-        resolution = round(orig_w/(resolution_scale * args.resolution)), round(orig_h/(resolution_scale * args.resolution))
-    else:  # should be a type that converts to float
-        if args.resolution == -1:
-            if orig_w > 1600:
-                global WARNED
-                if not WARNED:
-                    print("[ INFO ] Encountered quite large input images (>1.6K pixels width), rescaling to 1.6K.\n "
-                        "If this is not desired, please explicitly specify '--resolution/-r' as 1")
-                    WARNED = True
-                global_down = orig_w / 1600
+        if args.resolution in [1, 2, 4, 8]:
+            resolution = round(orig_w/(resolution_scale * args.resolution)), round(orig_h/(resolution_scale * args.resolution))
+        else:  # should be a type that converts to float
+            if args.resolution == -1:
+                if orig_w > 1600:
+                    global WARNED
+                    if not WARNED:
+                        print("[ INFO ] Encountered quite large input images (>1.6K pixels width), rescaling to 1.6K.\n "
+                            "If this is not desired, please explicitly specify '--resolution/-r' as 1")
+                        WARNED = True
+                    global_down = orig_w / 1600
+                else:
+                    global_down = 1
             else:
-                global_down = 1
+                global_down = orig_w / args.resolution
+
+            scale = float(global_down) * float(resolution_scale)
+            resolution = (int(orig_w / scale), int(orig_h / scale))
+
+        if len(image.split()) > 3:
+            channels = image.split()
+            gt_image = torch.cat([PILtoTorch(im, resolution, scale=False) for im in channels[:3]], dim=0)
+            loaded_mask = PILtoTorch(channels[3], resolution, scale=False).float() / 255.0
         else:
-            global_down = orig_w / args.resolution
+            gt_image = PILtoTorch(image, resolution, scale=False)[:3]
+            loaded_mask = _load_gt_mask(args, cam_info, resolution)
 
-        scale = float(global_down) * float(resolution_scale)
-        resolution = (int(orig_w / scale), int(orig_h / scale))
+        normal_prior = _load_normal_prior(args, cam_info, resolution)
+        depth_prior = _load_depth_prior(args, cam_info, resolution)
+        # depth_confidence = _load_depth_confidence(args, cam_info, resolution)
 
-    if len(cam_info.image.split()) > 3:
-        resized_image_rgb = torch.cat([PILtoTorch(im, resolution) for im in cam_info.image.split()[:3]], dim=0)
-        loaded_mask = PILtoTorch(cam_info.image.split()[3], resolution)
-        gt_image = resized_image_rgb
-    else:
-        resized_image_rgb = PILtoTorch(cam_info.image, resolution)
-        loaded_mask = _load_gt_mask(args, cam_info, resolution)
-        gt_image = resized_image_rgb
-
-    normal_prior = _load_normal_prior(args, cam_info, resolution)
-    depth_prior = _load_depth_prior(args, cam_info, resolution)
-    # depth_confidence = _load_depth_confidence(args, cam_info, resolution)
-
-    return Camera(colmap_id=cam_info.uid, R=cam_info.R, T=cam_info.T, 
-                  FoVx=cam_info.FovX, FoVy=cam_info.FovY, 
-                  image=gt_image, gt_alpha_mask=loaded_mask,
-                  image_name=cam_info.image_name, uid=id,
-                  normal_prior=normal_prior,
-                  depth_prior=depth_prior,
-                  depth_confidence=None,
-                  data_device=args.data_device)
+        return Camera(colmap_id=cam_info.uid, R=cam_info.R, T=cam_info.T,
+                      FoVx=cam_info.FovX, FoVy=cam_info.FovY,
+                      image=gt_image, gt_alpha_mask=loaded_mask,
+                      image_name=cam_info.image_name, uid=id,
+                      normal_prior=normal_prior,
+                      depth_prior=depth_prior,
+                      depth_confidence=None,
+                      data_device=args.data_device,
+                      lazy_payload=_frame_gpu_budget(args) != -1)
+    finally:
+        if cam_info.image is None:
+            image.close()
 
 def cameraList_from_camInfos(cam_infos, resolution_scale, args):
-    camera_list = []
+    total_cameras = len(cam_infos)
+    if total_cameras == 0:
+        return []
 
-    for id, c in enumerate(cam_infos):
-        camera_list.append(loadCam(args, id, c, resolution_scale))
+    torch_threads = torch.get_num_threads()
+    cv_threads = cv2.getNumThreads()
+    torch.set_num_threads(1)
+    cv2.setNumThreads(1)
+    try:
+        camera_list = [loadCam(args, 0, cam_infos[0], resolution_scale)]
+        if total_cameras > 1:
+            with ThreadPoolExecutor(max_workers=min(16, os.cpu_count() or 1, total_cameras - 1)) as pool:
+                camera_list.extend(pool.map(
+                    lambda item: loadCam(args, item[0], item[1], resolution_scale),
+                    enumerate(cam_infos[1:], start=1),
+                ))
+    finally:
+        torch.set_num_threads(torch_threads)
+        cv2.setNumThreads(cv_threads)
 
+    trim_process_memory()
     return camera_list
 
 def camera_to_JSON(id, camera : Camera):
