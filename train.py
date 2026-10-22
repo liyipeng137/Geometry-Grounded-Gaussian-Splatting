@@ -408,12 +408,13 @@ def training(
         # depth prior loss
         if depth_prior_kick_on and depth_map is not None:
             gt_depth_prior = viewpoint_cam.depth_prior
-            valid_depth_mask = gt_depth_prior > 0.0
+            valid_depth_mask = gt_depth_prior > 0.01
             if valid_depth_mask.any().item():
                 depth_prior_loss = masked_l1_depth_loss(
                     depth_map, gt_depth_prior, valid_depth_mask
                 )
             else:
+                print(f"[ITER {iteration}] valid_depth_mask none for {viewpoint_cam.image_name}")
                 depth_prior_loss = torch.tensor([0], dtype=torch.float32, device="cuda")
         else:
             depth_prior_loss = torch.tensor([0], dtype=torch.float32, device="cuda")
@@ -462,14 +463,16 @@ def training(
                 progress_bar.set_postfix(
                     {
                         "Loss": f"{ema_loss_for_log:.{4}f}",
+                        "loss_depth_prior": f"{ema_depth_prior_loss_for_log:.{4}f}",
                         "loss_mask": f"{ema_mask_loss_for_log:.{4}f}",
                         "loss_normal": f"{ema_normal_loss_for_log:.{4}f}",
                         "loss_normal_prior": f"{ema_normal_prior_loss_for_log:.{4}f}",
-                        "loss_depth_prior": f"{ema_depth_prior_loss_for_log:.{4}f}",
                         "loss_ncc": f"{ema_ncc_loss_for_log:.{4}f}",
                     }
                 )
                 progress_bar.update(10)
+            if iteration % 100 == 0:
+                print(f"\n[ITER {iteration}] depth_prior_loss {ema_depth_prior_loss_for_log:.4f}")
             if iteration == opt.iterations:
                 progress_bar.close()
 
@@ -731,8 +734,8 @@ if __name__ == "__main__":
     parser.add_argument("--port", type=int, default=6009)
     parser.add_argument("--debug_from", type=int, default=-1)
     parser.add_argument("--detect_anomaly", action="store_true", default=False)
-    parser.add_argument("--test_iterations", nargs="+", type=int, default=[3000, 20000])
-    parser.add_argument("--save_iterations", nargs="+", type=int, default=[3000, 20000])
+    parser.add_argument("--test_iterations", nargs="+", type=int, default=[3000,7000, 20000])
+    parser.add_argument("--save_iterations", nargs="+", type=int, default=[3000,7000, 20000])
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[30000])
     parser.add_argument("--start_checkpoint", type=str, default=None)

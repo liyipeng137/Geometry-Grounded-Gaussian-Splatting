@@ -79,24 +79,36 @@ def _load_normal_prior(args, cam_info, resolution):
     return normal_prior
 
 
+def _resize_depth(depth_np, resolution):
+    depth_prior = torch.from_numpy(np.ascontiguousarray(depth_np))[None, None]
+    return F.interpolate(depth_prior, size=(resolution[1], resolution[0]), mode="nearest")[0]
+
+
 def _load_depth_prior(args, cam_info, resolution):
     depth_root = _resolve_prior_root(args.source_path, args.depth_prior_dir)
     if depth_root is None:
         return None
 
+    npy_path = os.path.join(depth_root, f"{cam_info.image_name}.npy")
+    if os.path.exists(npy_path):
+        depth_np = np.squeeze(np.load(npy_path)).astype(np.float32, copy=False)
+        if depth_np.ndim == 3:
+            depth_np = depth_np[..., 0]
+        depth_np = np.nan_to_num(depth_np, nan=0.0, posinf=0.0, neginf=0.0)
+        return _resize_depth(depth_np, resolution)
+
     depth_format = args.depth_prior_format.lower().lstrip(".")
+    if depth_format == "npy":
+        return None
     depth_path = os.path.join(depth_root, f"{cam_info.image_name}.{depth_format}")
     if not os.path.exists(depth_path):
         return None
 
-    print(f"Load depth_path: {depth_path}")
-    depth_img = Image.open(depth_path)
-    depth_np = np.asarray(depth_img).astype(np.float32)
+    with Image.open(depth_path) as depth_img:
+        depth_np = np.asarray(depth_img).astype(np.float32)
     if depth_np.ndim == 3:
         depth_np = depth_np[..., 0]
-    depth_prior = torch.from_numpy(depth_np)[None, None] / float(args.depth_prior_scale)
-    depth_prior = F.interpolate(depth_prior, size=(resolution[1], resolution[0]), mode="nearest")[0]
-    return depth_prior
+    return _resize_depth(depth_np / float(args.depth_prior_scale), resolution)
 
 
 def _load_depth_confidence(args, cam_info, resolution):
