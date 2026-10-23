@@ -50,6 +50,54 @@ def _usable_init_rgb(colors, count):
     return rgb
 
 
+def _restore_saturated_opacity_logits(logits, epsilon=1e-6):
+    if torch.isnan(logits).any().item():
+        raise ValueError("Checkpoint opacity logits contain NaN")
+    positive, negative = torch.isposinf(logits), torch.isneginf(logits)
+    positive_count, negative_count = int(positive.sum().item()), int(negative.sum().item())
+    report = {
+        "restored_count": positive_count + negative_count,
+        "positive_infinity_count": positive_count,
+        "negative_infinity_count": negative_count,
+        "maximum_probability_change": 0.0,
+        "finite_logits_unchanged": True,
+    }
+    if not report["restored_count"]:
+        return logits, report
+    epsilon = max(epsilon, torch.finfo(logits.dtype).eps)
+    restored = logits.detach().clone()
+    restored[positive] = torch.logit(logits.new_tensor(1 - epsilon))
+    restored[negative] = torch.logit(logits.new_tensor(epsilon))
+    changed = positive | negative
+    report["maximum_probability_change"] = float((torch.sigmoid(restored[changed]) - torch.sigmoid(logits[changed])).abs().max().item())
+    report["epsilon"] = epsilon
+    return restored, report
+
+
+def _require_finite_restore_values(value, label="checkpoint"):
+    if torch.is_tensor(value):
+        if not torch.isfinite(value).all().item():
+            raise ValueError(f"Nonfinite restore tensor outside permitted opacity saturation: {label}")
+    elif isinstance(value, dict):
+        for key, child in value.items():
+            _require_finite_restore_values(child, f"{label}.{key}")
+    elif isinstance(value, (tuple, list)):
+        for index, child in enumerate(value):
+            _require_finite_restore_values(child, f"{label}[{index}]")
+
+
+def _reset_opacity_probabilities(logits, coefficient, maximum_filtered_opacity=0.01, epsilon=1e-6):
+    if torch.isnan(logits).any().item() or not torch.isfinite(coefficient).all().item() or (coefficient < 0).any().item() or (coefficient > 1 + 1e-6).any().item():
+        raise ValueError("Opacity reset received NaN logits or an invalid 3D-filter coefficient")
+    probability = torch.sigmoid(logits)
+    positive = coefficient > 0
+    safe_coefficient = torch.where(positive, coefficient, torch.ones_like(coefficient))
+    capped = torch.minimum(probability, maximum_filtered_opacity / safe_coefficient)
+    result = torch.where(positive, capped, probability)
+    epsilon = max(epsilon, torch.finfo(result.dtype).eps)
+    return result.clamp(epsilon, 1 - epsilon)
+
+
 class GaussianModel:
     class App_model(Enum):
         NO = 0
@@ -177,6 +225,12 @@ class GaussianModel:
                 app_dict,
                 _appearance_embeddings,
             ) = model_args
+        restored_opacity, self.opacity_restore_report = _restore_saturated_opacity_logits(self._opacity)
+        if restored_opacity is not self._opacity:
+            self._opacity = nn.Parameter(restored_opacity, requires_grad=self._opacity.requires_grad)
+        validated_payload = list(model_args)
+        validated_payload[7] = self._opacity
+        _require_finite_restore_values(validated_payload)
         self.training_setup(training_args)
         self.xyz_gradient_accum = xyz_gradient_accum
         self.denom = denom
@@ -391,6 +445,7 @@ class GaussianModel:
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
 
     def training_setup(self, training_args: OptimizationParams) -> None:
+        self.dense_optimizer_updates = getattr(training_args, "dense_optimizer_updates", False)
         self._init_gradient_accumulators()
         base_param_groups = self._build_base_param_groups(training_args)
         sh_param_groups = [{"params": [self._features_rest], "lr": training_args.feature_rest_lr, "name": "f_rest"}]
@@ -506,6 +561,13 @@ class GaussianModel:
     def optimizer_step(self, iteration: int):
         """FastGS-style optimizer schedule (default optimizer path)."""
         if self.optimizer is None:
+            return
+        if getattr(self, "dense_optimizer_updates", False):
+            self.optimizer.step()
+            self.optimizer.zero_grad(set_to_none=True)
+            if self.shoptimizer is not None and iteration % 16 == 0:
+                self.shoptimizer.step()
+                self.shoptimizer.zero_grad(set_to_none=True)
             return
         if self.shoptimizer is None:
             self.optimizer.step()
@@ -665,9 +727,6 @@ class GaussianModel:
 
     def reset_opacity(self):
         # reset opacity to by considering 3D filter
-        current_opacity_with_filter = self.get_opacity_with_3D_filter
-        opacities_new = torch.min(current_opacity_with_filter, torch.ones_like(current_opacity_with_filter) * 0.01)
-
         # apply 3D filter
         scales = self.get_scaling
 
@@ -677,7 +736,7 @@ class GaussianModel:
         scales_after_square = scales_square + torch.square(self.filter_3D)
         det2 = scales_after_square.prod(dim=1)
         coef = torch.sqrt(det1 / det2)
-        opacities_new = opacities_new / coef[..., None]
+        opacities_new = _reset_opacity_probabilities(self._opacity, coef[..., None])
         opacities_new = self.inverse_opacity_activation(opacities_new)
 
         optimizable_tensors = self.replace_tensor_to_optimizer(opacities_new, "opacity")

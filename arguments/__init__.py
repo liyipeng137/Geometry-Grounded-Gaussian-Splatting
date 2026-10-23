@@ -75,11 +75,24 @@ class ModelParams(ParamGroup):
         self.depth_confidence_dir = "confidence"
         self.depth_confidence_format = "png"
         self.disable_rgbd_init_ply = False
+        self.pseudo_manifest = ""
+        self.train_exclude_images = ""
+        self.allow_train_split_expansion = False
+        self.pseudo_seed_manifest = ""
+        self.custom_init_ply = ""
+        self.custom_init_metadata = ""
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args):
         g = super().extract(args)
         g.source_path = os.path.abspath(g.source_path)
+        g.pseudo_manifest = os.path.abspath(g.pseudo_manifest) if getattr(g, "pseudo_manifest", "") else ""
+        g.train_exclude_images = os.path.abspath(g.train_exclude_images) if getattr(g, "train_exclude_images", "") else ""
+        g.pseudo_seed_manifest = os.path.abspath(g.pseudo_seed_manifest) if getattr(g, "pseudo_seed_manifest", "") else ""
+        if bool(getattr(g, "custom_init_ply", "")) != bool(getattr(g, "custom_init_metadata", "")):
+            raise ValueError("custom_init_ply and custom_init_metadata must be supplied together")
+        g.custom_init_ply = os.path.abspath(g.custom_init_ply) if getattr(g, "custom_init_ply", "") else ""
+        g.custom_init_metadata = os.path.abspath(g.custom_init_metadata) if getattr(g, "custom_init_metadata", "") else ""
         return g
 
 class PipelineParams(ParamGroup):
@@ -92,6 +105,7 @@ class PipelineParams(ParamGroup):
 class OptimizationParams(ParamGroup):
     def __init__(self, parser):
         self.iterations = 20_000
+        self.dense_optimizer_updates = False
         self.position_lr_init = 0.00016
         self.position_lr_final = 0.0000016
         self.position_lr_delay_mult = 0.01
@@ -118,6 +132,7 @@ class OptimizationParams(ParamGroup):
         self.lambda_mask = 0.0
         self.densification_interval = 100
         self.opacity_reset_interval = 3000
+        self.opacity_reset_min_remaining = 0
         self.densify_from_iter = 500
         self.densify_until_iter = 15_000
         self.contribution_prune_from_iter = 500
@@ -134,7 +149,28 @@ class OptimizationParams(ParamGroup):
         self.lambda_normal_prior = 0.1
         self.normal_prior_from_iter = 7000
         self.lambda_depth_prior = 0.4
+        self.real_depth_loss_mode = "absolute"
+        self.real_depth_relative_epsilon = 0.01
+        self.real_depth_relative_floor = 0.05
         self.depth_prior_from_iter = 3000
+        self.depth_prior_ramp_iters = 0
+        self.pseudo_from_iter = 3000
+        self.pseudo_real_updates = 4
+        self.pseudo_rgb_weight = 0.15
+        self.pseudo_depth_weight = 0.0
+        self.pseudo_densification_weight = 0.0
+        self.pseudo_densification_depth_tolerance = 0.08
+        self.pseudo_densification_min_confidence = 0.05
+        self.pseudo_gradient_diagnostics_interval = 0
+        self.pseudo_seed_max_fraction = 0.02
+        self.pseudo_seed_max_points = 20000
+        self.pseudo_seed_min_confidence = 0.9
+        self.pseudo_seed_voxel_size = 0.02
+        self.pseudo_seed_min_distance = 0.02
+        self.pseudo_seed_opacity = 0.03
+        self.pseudo_seed_depth_tolerance = 0.05
+        self.pseudo_ramp_iters = 500
+        self.pseudo_additive = False
         self.vcd_enable = True
         self.vcd_from_iter = 500
         self.vcd_num_cams = 10 # if scene case change to 15

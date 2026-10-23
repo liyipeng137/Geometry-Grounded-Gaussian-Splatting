@@ -180,7 +180,7 @@ def loadCam(args, id, cam_info, resolution_scale):
         depth_prior = _load_depth_prior(args, cam_info, resolution)
         # depth_confidence = _load_depth_confidence(args, cam_info, resolution)
 
-        return Camera(colmap_id=cam_info.uid, R=cam_info.R, T=cam_info.T,
+        camera = Camera(colmap_id=cam_info.uid, R=cam_info.R, T=cam_info.T,
                       FoVx=cam_info.FovX, FoVy=cam_info.FovY,
                       image=gt_image, gt_alpha_mask=loaded_mask,
                       image_name=cam_info.image_name, uid=id,
@@ -189,6 +189,14 @@ def loadCam(args, id, cam_info, resolution_scale):
                       depth_confidence=None,
                       data_device=args.data_device,
                       lazy_payload=_frame_gpu_budget(args) != -1)
+        camera.source_image_name = cam_info.colmap_image_name or os.path.basename(cam_info.image_path)
+        camera.pixel_center_convention = "colmap_half_integer"
+        camera.source_K_colmap = np.array([
+            [camera.Fx, 0.0, camera.Cx + 0.5],
+            [0.0, camera.Fy, camera.Cy + 0.5],
+            [0.0, 0.0, 1.0],
+        ])
+        return camera
     finally:
         if cam_info.image is None:
             image.close()

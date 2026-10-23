@@ -9,6 +9,7 @@
 # For inquiries contact  george.drettakis@inria.fr
 #
 
+import hashlib
 import json
 import os
 import re
@@ -32,6 +33,8 @@ from scene.colmap_loader import (
     read_points3D_text,
 )
 from scene.gaussian_model import BasicPointCloud
+from scene.custom_initialization import load_custom_initialization
+from scene.train_split import calibration_fingerprint, load_excluded_image_names, partition_cameras, training_camera_fingerprint
 from utils.graphics_utils import focal2fov, fov2focal, getWorld2View2
 from utils.pd_utils import generate_ply_from_rgbd
 from utils.sh_utils import SH2RGB
@@ -48,6 +51,7 @@ class CameraInfo(NamedTuple):
     width: int
     height: int
     mask: np.array = None
+    colmap_image_name: str = None
 
 class SceneInfo(NamedTuple):
     point_cloud: BasicPointCloud
@@ -155,7 +159,8 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
         image_name = os.path.basename(image_path).split(".")[0]
 
         cam_info = CameraInfo(uid=uid, R=R, T=T, FovY=FovY, FovX=FovX, image=None,
-                              image_path=image_path, image_name=image_name, width=width, height=height)
+                              image_path=image_path, image_name=image_name, width=width, height=height,
+                              colmap_image_name=extr.name)
         cam_infos.append(cam_info)
     sys.stdout.write('\n')
     return cam_infos
@@ -202,7 +207,10 @@ def storePly(path, xyz, rgb):
     ply_data = PlyData([vertex_element])
     ply_data.write(path)
 
-def readColmapSceneInfo(path, images, eval, llffhold=8, use_rgbd_init_ply=False):
+def readColmapSceneInfo(path, images, eval, llffhold=8, use_rgbd_init_ply=False,
+                       train_exclude_images="", init_cache_dir=None,
+                       allow_train_split_expansion=False, custom_init_ply="",
+                       custom_init_metadata=""):
     try:
         cameras_extrinsic_file = os.path.join(path, "sparse/0", "images.bin")
         cameras_intrinsic_file = os.path.join(path, "sparse/0", "cameras.bin")
@@ -222,20 +230,58 @@ def readColmapSceneInfo(path, images, eval, llffhold=8, use_rgbd_init_ply=False)
     )
     cam_infos = sorted(cam_infos_unsorted.copy(), key = lambda x : x.image_name)
 
-    if eval:
-        train_cam_infos = [c for idx, c in enumerate(cam_infos) if idx % llffhold != 0]
-        test_cam_infos = [c for idx, c in enumerate(cam_infos) if idx % llffhold == 0]
-    else:
-        train_cam_infos = cam_infos
-        test_cam_infos = []
+    excluded_names, split_source = load_excluded_image_names(train_exclude_images)
+    custom_initialization = bool(custom_init_ply or custom_init_metadata)
+    if custom_initialization and not (custom_init_ply and custom_init_metadata):
+        raise ValueError("Custom initialization requires both point cloud and metadata")
+    strict_split = bool(train_exclude_images) or allow_train_split_expansion or custom_initialization
+    if strict_split and eval:
+        raise ValueError("Explicit training split contracts cannot be combined with implicit --eval splitting")
+    train_cam_infos, test_cam_infos = partition_cameras(cam_infos, excluded_names, eval, llffhold)
+    train_fingerprint = training_camera_fingerprint(train_cam_infos)
+    camera_calibrations = {}
+    if strict_split:
+        for extrinsic in cam_extrinsics.values():
+            intrinsic = cam_intrinsics[extrinsic.camera_id]
+            definition = {
+                "width": int(intrinsic.width), "height": int(intrinsic.height),
+                "camera_model": intrinsic.model, "camera_params": np.asarray(intrinsic.params).tolist(),
+                "world_to_camera_rotation": qvec2rotmat(extrinsic.qvec).tolist(),
+                "world_to_camera_translation": np.asarray(extrinsic.tvec).tolist(),
+                "pixel_center_convention": "colmap_half_integer",
+            }
+            camera_calibrations[extrinsic.name] = calibration_fingerprint(definition)
+    init_algorithm = "rgbd_colmap_half_integer_v2" if strict_split else "legacy_array_integer"
+    init_identity = train_fingerprint + init_algorithm
+    if strict_split:
+        training_calibrations = {camera.colmap_image_name: camera_calibrations[camera.colmap_image_name] for camera in train_cam_infos}
+        init_identity += calibration_fingerprint(training_calibrations)
+    init_fingerprint = hashlib.sha256(init_identity.encode("utf-8")).hexdigest()
+    if strict_split and not use_rgbd_init_ply and not custom_initialization:
+        raise ValueError("Explicit training exclusion requires train-only RGBD initialization; disable_rgbd_init_ply is incompatible")
+    if strict_split and init_cache_dir is None:
+        raise ValueError("Explicit training exclusion requires an initialization cache directory")
 
     nerf_normalization = getNerfppNorm(train_cam_infos)
     print(f'cameras extent: {nerf_normalization["radius"]}')
 
     pcd = None
     ply_path = None
-    if use_rgbd_init_ply:
-        rgbd_ply_path = os.path.join(path, "rgbd_init_points3D.ply")
+    initialization_record = None
+    if custom_initialization:
+        pcd, initialization_record = load_custom_initialization(
+            custom_init_ply, custom_init_metadata, path, camera_calibrations,
+            [camera.colmap_image_name for camera in train_cam_infos],
+            [camera.colmap_image_name for camera in test_cam_infos],
+        )
+        ply_path = str(Path(custom_init_ply).resolve())
+        print(f"Loaded explicit supported-surface cold-start point cloud: {ply_path}, points={len(pcd.points)}")
+    if use_rgbd_init_ply and not custom_initialization:
+        if strict_split:
+            os.makedirs(init_cache_dir, exist_ok=True)
+            rgbd_ply_path = os.path.join(init_cache_dir, f"rgbd_init_train_{init_fingerprint[:16]}.ply")
+        else:
+            rgbd_ply_path = os.path.join(path, "rgbd_init_points3D.ply")
         if not os.path.exists(rgbd_ply_path):
             try:
                 generate_ply_from_rgbd(
@@ -243,8 +289,12 @@ def readColmapSceneInfo(path, images, eval, llffhold=8, use_rgbd_init_ply=False)
                     num_points=200_000,
                     ply_path=rgbd_ply_path,
                     cam_intrinsics=cam_intrinsics,
+                    source_path=path,
+                    pixel_center_convention="colmap_half_integer" if strict_split else "array_integer",
                 )
             except Exception as e:
+                if strict_split:
+                    raise RuntimeError("Train-only RGBD initialization failed; refusing full-data sparse fallback") from e
                 print(f"[Warn] RGBD init ply generation failed, fallback to sparse point cloud. Reason: {e}")
         if os.path.exists(rgbd_ply_path):
             try:
@@ -252,12 +302,16 @@ def readColmapSceneInfo(path, images, eval, llffhold=8, use_rgbd_init_ply=False)
                 if not ply_o3d.has_normals():
                     ply_o3d.estimate_normals()
                 positions = np.asarray(ply_o3d.points)
+                if positions.size == 0:
+                    raise ValueError("RGBD initialization point cloud is empty")
                 colors = np.asarray(ply_o3d.colors)
                 normals = np.asarray(ply_o3d.normals) if ply_o3d.has_normals() else np.zeros_like(positions)
                 pcd = BasicPointCloud(points=positions, colors=colors, normals=normals)
                 ply_path = rgbd_ply_path
                 print(f"Loaded RGBD init point cloud: {ply_path}, points={positions.shape[0]}")
             except Exception as e:
+                if strict_split:
+                    raise RuntimeError("Train-only RGBD cache could not be loaded; refusing full-data sparse fallback") from e
                 print(f"[Warn] Failed to load RGBD init point cloud, fallback to sparse point cloud. Reason: {e}")
 
     if pcd is None:
@@ -280,6 +334,25 @@ def readColmapSceneInfo(path, images, eval, llffhold=8, use_rgbd_init_ply=False)
                 pcd = BasicPointCloud(points=pcd.vertices[point_id], colors=pcd.colors[point_id][:,:3].astype(np.float32)/255, normals=None)
             except:
                 pcd = None
+
+    if strict_split:
+        split_record = {
+            "schema_version": 2,
+            "dataset_root": str(Path(path).resolve()),
+            "camera_calibration_fingerprints": camera_calibrations,
+            "calibration_fingerprint": calibration_fingerprint(camera_calibrations),
+            "source": split_source,
+            "train_camera_fingerprint": train_fingerprint,
+            "train_image_names": [camera.colmap_image_name for camera in train_cam_infos],
+            "test_image_names": [camera.colmap_image_name for camera in test_cam_infos],
+            "initialization": initialization_record or {
+                "kind": "train_only_rgbd", "ply_path": os.path.abspath(ply_path),
+                "algorithm": init_algorithm, "cache_fingerprint": init_fingerprint,
+            },
+            "scope": "All source cameras are training views; no heldout cameras remain" if not test_cam_infos else "RGB/depth supervision, RGBD initialization, neighbors, pruning and 3D filter exclude test cameras; FFBA poses/K were estimated upstream using the full capture",
+        }
+        with open(os.path.join(init_cache_dir, "camera_split.json"), "w") as split_file:
+            json.dump(split_record, split_file, indent=2)
 
     scene_info = SceneInfo(point_cloud=pcd,
                            train_cameras=train_cam_infos,

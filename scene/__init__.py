@@ -40,6 +40,8 @@ class Scene:
             raise ValueError("frame_gpu_budget must be -1 or a positive integer")
         self.loaded_iter = None
         self.gaussians = gaussians
+        if load_iteration is not None and (getattr(args, "custom_init_ply", "") or getattr(args, "custom_init_metadata", "")):
+            raise ValueError("Custom point-cloud initialization is cold-start only, not native Gaussian loading")
 
         if load_iteration:
             if load_iteration == -1:
@@ -58,12 +60,19 @@ class Scene:
                 args.images,
                 args.eval,
                 use_rgbd_init_ply=not args.disable_rgbd_init_ply,
+                train_exclude_images=getattr(args, "train_exclude_images", ""),
+                allow_train_split_expansion=getattr(args, "allow_train_split_expansion", False),
+                custom_init_ply=getattr(args, "custom_init_ply", ""),
+                custom_init_metadata=getattr(args, "custom_init_metadata", ""),
+                init_cache_dir=self.model_path,
             )
         elif os.path.exists(os.path.join(args.source_path, "transforms.json")):
             print("Found transforms_train.json file, assuming Blender data set!")
             scene_info = sceneLoadTypeCallbacks["Blender"](args.source_path, args.white_background, args.eval)
 
         if not self.loaded_iter:
+            if getattr(args, "custom_init_ply", "") and os.path.realpath(scene_info.ply_path) == os.path.realpath(os.path.join(self.model_path, "input.ply")):
+                raise ValueError("Custom initialization source must be separate from the training input.ply snapshot")
             with open(scene_info.ply_path, "rb") as src_file, open(os.path.join(self.model_path, "input.ply"), "wb") as dest_file:
                 dest_file.write(src_file.read())
             json_cams = []

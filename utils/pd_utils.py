@@ -18,7 +18,7 @@ def _intrinsic_from_sparse(intr):
     return fx, fy, cx, cy, int(intr.width), int(intr.height)
 
 
-def _frame_intrinsic(cam, cam_intrinsics, color_hw):
+def _frame_intrinsic(cam, cam_intrinsics, color_hw, pixel_center_convention="array_integer"):
     intr = None if not cam_intrinsics else cam_intrinsics.get(cam.uid)
     if intr is None and cam_intrinsics and len(cam_intrinsics) == 1:
         intr = next(iter(cam_intrinsics.values()))
@@ -35,6 +35,11 @@ def _frame_intrinsic(cam, cam_intrinsics, color_hw):
         sy = image_h / float(height)
         fx, cx = fx * sx, cx * sx
         fy, cy = fy * sy, cy * sy
+    if pixel_center_convention == "colmap_half_integer":
+        cx -= 0.5
+        cy -= 0.5
+    elif pixel_center_convention != "array_integer":
+        raise ValueError(f"Unsupported RGBD pixel center convention: {pixel_center_convention}")
     return o3d.camera.PinholeCameraIntrinsic(image_w, image_h, fx, fy, cx, cy), (fx, fy, cx, cy)
 
 
@@ -68,6 +73,8 @@ def generate_ply_from_rgbd(
     depth_min=0.05,
     depth_max=50.0,
     conf_threshold=200.0 / 255.0,
+    source_path=None,
+    pixel_center_convention="array_integer",
 ):
     print("Generating dense init ply from RGBD ...")
     if len(train_cam_infos) == 0:
@@ -85,7 +92,7 @@ def generate_ply_from_rgbd(
     printed_cameras = set()
     dropped_cameras = 0
 
-    source_path = os.path.dirname(ply_path)
+    source_path = source_path or os.path.dirname(ply_path)
     for train_cam in train_cam_infos:
         image_path = train_cam.image_path
         image_name = train_cam.image_name
@@ -112,7 +119,9 @@ def generate_ply_from_rgbd(
         color = o3d.geometry.Image(color_np)
         depth = o3d.geometry.Image(np.ascontiguousarray(depth_u16))
 
-        camera_intrinsics, (fx, fy, cx, cy) = _frame_intrinsic(train_cam, cam_intrinsics, color_np.shape[:2])
+        camera_intrinsics, (fx, fy, cx, cy) = _frame_intrinsic(
+            train_cam, cam_intrinsics, color_np.shape[:2], pixel_center_convention=pixel_center_convention
+        )
         if train_cam.uid not in printed_cameras:
             print(f"fx: {fx}, fy: {fy}, cx: {cx}, cy: {cy}, size: {color_np.shape[1]}x{color_np.shape[0]}")
             printed_cameras.add(train_cam.uid)
