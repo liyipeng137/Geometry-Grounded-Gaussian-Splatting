@@ -78,6 +78,8 @@ def read_next_bytes(fid, num_bytes, format_char_sequence, endian_character="<"):
     :return: Tuple of read and unpacked values.
     """
     data = fid.read(num_bytes)
+    if len(data) != num_bytes:
+        raise ValueError("Truncated COLMAP binary model")
     return struct.unpack(endian_character + format_char_sequence, data)
 
 def read_points3D_text(path):
@@ -156,10 +158,13 @@ def read_intrinsics_text(path):
                 elems = line.split()
                 camera_id = int(elems[0])
                 model = elems[1]
-                assert model == "PINHOLE", "While the loader support other types, the rest of the code assumes PINHOLE"
+                if model not in ("SIMPLE_PINHOLE", "PINHOLE"):
+                    raise ValueError("Undistorted SIMPLE_PINHOLE/PINHOLE cameras required")
                 width = int(elems[2])
                 height = int(elems[3])
                 params = np.array(tuple(map(float, elems[4:])))
+                if camera_id in cameras:
+                    raise ValueError(f"Duplicate camera ID: {camera_id}")
                 cameras[camera_id] = Camera(id=camera_id, model=model,
                                             width=width, height=height,
                                             params=params)
@@ -181,10 +186,10 @@ def read_extrinsics_binary(path_to_model_file):
             qvec = np.array(binary_image_properties[1:5])
             tvec = np.array(binary_image_properties[5:8])
             camera_id = binary_image_properties[8]
-            image_name = ""
+            image_name = bytearray()
             current_char = read_next_bytes(fid, 1, "c")[0]
             while current_char != b"\x00":   # look for the ASCII 0 entry
-                image_name += current_char.decode("utf-8")
+                image_name.extend(current_char)
                 current_char = read_next_bytes(fid, 1, "c")[0]
             num_points2D = read_next_bytes(fid, num_bytes=8,
                                            format_char_sequence="Q")[0]
@@ -193,9 +198,11 @@ def read_extrinsics_binary(path_to_model_file):
             xys = np.column_stack([tuple(map(float, x_y_id_s[0::3])),
                                    tuple(map(float, x_y_id_s[1::3]))])
             point3D_ids = np.array(tuple(map(int, x_y_id_s[2::3])))
+            if image_id in images:
+                raise ValueError(f"Duplicate image ID: {image_id}")
             images[image_id] = Image(
                 id=image_id, qvec=qvec, tvec=tvec,
-                camera_id=camera_id, name=image_name,
+                camera_id=camera_id, name=image_name.decode("utf-8"),
                 xys=xys, point3D_ids=point3D_ids)
     return images
 
@@ -220,6 +227,8 @@ def read_intrinsics_binary(path_to_model_file):
             num_params = CAMERA_MODEL_IDS[model_id].num_params
             params = read_next_bytes(fid, num_bytes=8*num_params,
                                      format_char_sequence="d"*num_params)
+            if camera_id in cameras:
+                raise ValueError(f"Duplicate camera ID: {camera_id}")
             cameras[camera_id] = Camera(id=camera_id,
                                         model=model_name,
                                         width=width,
@@ -241,7 +250,7 @@ def read_extrinsics_text(path):
                 break
             line = line.strip()
             if len(line) > 0 and line[0] != "#":
-                elems = line.split()
+                elems = line.split(maxsplit=9)
                 image_id = int(elems[0])
                 qvec = np.array(tuple(map(float, elems[1:5])))
                 tvec = np.array(tuple(map(float, elems[5:8])))
@@ -251,6 +260,8 @@ def read_extrinsics_text(path):
                 xys = np.column_stack([tuple(map(float, elems[0::3])),
                                        tuple(map(float, elems[1::3]))])
                 point3D_ids = np.array(tuple(map(int, elems[2::3])))
+                if image_id in images:
+                    raise ValueError(f"Duplicate image ID: {image_id}")
                 images[image_id] = Image(
                     id=image_id, qvec=qvec, tvec=tvec,
                     camera_id=camera_id, name=image_name,

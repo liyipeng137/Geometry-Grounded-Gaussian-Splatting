@@ -78,6 +78,7 @@ class Camera(nn.Module):
                  depth_confidence=None,
                  trans=np.array([0.0, 0.0, 0.0]), scale=1.0, data_device = "cuda",
                  lazy_payload=False,
+                 K=None,
                  ):
         super(Camera, self).__init__()
 
@@ -95,8 +96,8 @@ class Camera(nn.Module):
             print(f"[Warning] Custom device {data_device} failed, fallback to default cuda device" )
             self.data_device = torch.device("cuda")
 
-        self.R = torch.tensor(R, dtype=torch.float32).cuda()
-        self.T = torch.tensor(T, dtype=torch.float32).cuda()
+        self.R = torch.tensor(R, dtype=torch.float32, device=self.data_device)
+        self.T = torch.tensor(T, dtype=torch.float32, device=self.data_device)
         self.lazy_payload = lazy_payload
 
         if image.dtype != torch.uint8:
@@ -115,10 +116,21 @@ class Camera(nn.Module):
         self.image_width = image.shape[2]
         self.image_height = image.shape[1]
 
-        self.Fx = self.image_width / (2 * math.tan(self.FoVx / 2.))
-        self.Fy = self.image_height / (2 * math.tan(self.FoVy / 2.))
-        self.Cx = float(self.image_width - 1) / 2
-        self.Cy = float(self.image_height - 1) / 2
+        if K is None:
+            fx = self.image_width / (2 * math.tan(self.FoVx / 2.))
+            fy = self.image_height / (2 * math.tan(self.FoVy / 2.))
+            K = np.array([[fx, 0, self.image_width / 2], [0, fy, self.image_height / 2], [0, 0, 1]])
+        K = np.asarray(K, dtype=np.float64)
+        if K.shape != (3, 3) or not np.isfinite(K).all() or min(K[0, 0], K[1, 1]) <= 0:
+            raise ValueError("Camera K must be a finite positive-focal 3x3 matrix")
+        if not np.allclose(K[2], [0, 0, 1]) or K[0, 1] != 0 or K[1, 0] != 0:
+            raise ValueError("Camera K must describe an undistorted pinhole camera without skew")
+        self.source_K_colmap = K.copy()
+        self.pixel_center_convention = "colmap_half_integer"
+        self.Fx, self.Fy = float(K[0, 0]), float(K[1, 1])
+        self.Cx, self.Cy = float(K[0, 2]) - 0.5, float(K[1, 2]) - 0.5
+        self.FoVx = 2 * math.atan(self.image_width / (2 * self.Fx))
+        self.FoVy = 2 * math.atan(self.image_height / (2 * self.Fy))
 
         self.has_gt_mask = mask_f is not None
         if normal_prior is not None:
@@ -144,10 +156,26 @@ class Camera(nn.Module):
         self.trans = trans
         self.scale = scale
 
-        self.world_view_transform = torch.tensor(getWorld2View2(R, T, trans, scale)).transpose(0, 1).cuda()
-        self.projection_matrix = getProjectionMatrix(znear=self.znear, zfar=self.zfar, fovX=self.FoVx, fovY=self.FoVy).transpose(0,1).cuda()
-        self.full_proj_transform = (self.world_view_transform.unsqueeze(0).bmm(self.projection_matrix.unsqueeze(0))).squeeze(0)
+        self.world_view_transform = torch.tensor(getWorld2View2(R, T, trans, scale), device=self.data_device).transpose(0, 1)
+        projection = getProjectionMatrix(znear=self.znear, zfar=self.zfar, fovX=self.FoVx, fovY=self.FoVy)
+        projection[0, 2] = 2 * K[0, 2] / self.image_width - 1
+        projection[1, 2] = 2 * K[1, 2] / self.image_height - 1
+        self.projection_matrix = projection.transpose(0, 1).to(self.data_device)
+        self.full_proj_transform = self.world_view_transform @ self.projection_matrix
         self.camera_center = self.world_view_transform.inverse()[3, :3]
+
+    def camera_z_depth(self, depth):
+        """Convert the rasterizer's centered-ray depth to this camera's Z."""
+        if tuple(depth.shape[-2:]) != (self.image_height, self.image_width):
+            raise ValueError("Rendered depth dimensions differ from camera K/grid")
+        center_x, center_y = (self.image_width - 1) / 2, (self.image_height - 1) / 2
+        if self.Cx == center_x and self.Cy == center_y:
+            return depth
+        y = torch.arange(self.image_height, device=depth.device, dtype=depth.dtype)[:, None]
+        x = torch.arange(self.image_width, device=depth.device, dtype=depth.dtype)[None, :]
+        raster_radius = torch.sqrt(1 + ((x - center_x) / self.Fx) ** 2 + ((y - center_y) / self.Fy) ** 2)
+        camera_radius = torch.sqrt(1 + ((x - self.Cx) / self.Fx) ** 2 + ((y - self.Cy) / self.Fy) ** 2)
+        return depth * (raster_radius / camera_radius)
 
     def _store_payload(self, name, tensor):
         if tensor is not None:

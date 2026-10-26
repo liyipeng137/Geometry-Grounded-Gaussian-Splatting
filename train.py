@@ -38,7 +38,6 @@ from gaussian_renderer import network_gui, render
 from scene import GaussianModel, Scene
 from scene.cameras import Camera, FramePayloadCache
 from scene.pseudo_views import accumulate_pseudo_densification, load_pseudo_manifest, make_pseudo_cameras, pseudo_depth_l1, pseudo_rgb_l1, ramp_weight, screen_gradient_statistics
-from scene.pseudo_seeds import admit_pseudo_seeds
 from scene.train_split import CHECKPOINT_STATE_KEY, checkpoint_training_state, read_checkpoint_split, validate_checkpoint_split
 from utils.general_utils import safe_state
 from utils.graphics_utils import depth_to_normal
@@ -73,6 +72,15 @@ def record_source_losses(training_stats, source, rgb_loss, depth_loss, rgb_weigh
     record["total_loss_sum"] += float(total_loss.detach().item())
     for field in ("rgb_loss", "weighted_rgb_loss", "depth_loss", "weighted_depth_loss", "total_loss"):
         record[field + "_mean"] = record[field + "_sum"] / record["samples"]
+
+
+def require_r2c_checkpoint_state(state, iteration):
+    if not isinstance(state, dict) or state.get("schema_version") != 1 or state.get("recipe") != "r2c" or state.get("iteration") != iteration:
+        raise ValueError("Resume requires an embedded checkpoint from the formal r2c recipe at its recorded iteration")
+    split = state.get("camera_split")
+    if not isinstance(split, dict) or split.get("initialization", {}).get("kind") != "train_only_rgbd":
+        raise ValueError("Formal checkpoints require the real RGBD initialization contract")
+    return state
 
 
 def weighted_charbonnier_depth_loss(
@@ -247,8 +255,6 @@ def training(
         raise ValueError("real_depth_relative_epsilon must be finite and positive")
     if not math.isfinite(opt.real_depth_relative_floor) or opt.real_depth_relative_floor <= 0:
         raise ValueError("real_depth_relative_floor must be finite and positive")
-    if checkpoint and (getattr(dataset, "custom_init_ply", "") or getattr(dataset, "custom_init_metadata", "")):
-        raise ValueError("Custom point-cloud initialization is a coldstart and cannot be combined with start_checkpoint")
     if not math.isfinite(opt.pseudo_densification_weight) or opt.pseudo_densification_weight < 0:
         raise ValueError("pseudo_densification_weight must be finite and nonnegative")
     if not math.isfinite(opt.pseudo_densification_depth_tolerance) or not 0 < opt.pseudo_densification_depth_tolerance < 1:
@@ -266,22 +272,9 @@ def training(
         model_params, first_iter = torch.load(checkpoint, weights_only=False)
         embedded_checkpoint_state = checkpoint_training_state(model_params, first_iter)
     checkpoint_split_record = None
-    checkpoint_state_path = Path(checkpoint).with_suffix(".state.json") if checkpoint else None
-    checkpoint_state = embedded_checkpoint_state
-    if checkpoint_state is None:
-        checkpoint_state = json.loads(checkpoint_state_path.read_text()) if checkpoint_state_path is not None and checkpoint_state_path.exists() else {}
-        if checkpoint_state.get("seed_admissions"):
-            raise ValueError("Legacy seeded checkpoint lacks embedded provenance; refusing an unverifiable seed resume")
-    seed_admissions = list(checkpoint_state.get("seed_admissions", []))
-    allow_split_expansion = bool(getattr(dataset, "allow_train_split_expansion", False))
-    explicit_split = bool(getattr(dataset, "train_exclude_images", "")) or allow_split_expansion
-    if allow_split_expansion and not checkpoint:
-        raise ValueError("--allow_train_split_expansion requires an existing verified checkpoint")
-    if checkpoint and (explicit_split or checkpoint_state.get("camera_split") is not None or (Path(checkpoint).parent / "camera_split.json").exists()):
+    if checkpoint:
+        require_r2c_checkpoint_state(embedded_checkpoint_state, first_iter)
         checkpoint_split_record = read_checkpoint_split(checkpoint, embedded_state=embedded_checkpoint_state)
-    if checkpoint_split_record is not None and not explicit_split:
-        raise ValueError("Resuming an explicit-split checkpoint requires an explicit exclusion list; use an empty list and --allow_train_split_expansion to absorb former heldout cameras")
-    split_expansion_report = checkpoint_state.get("split_expansion")
     tb_writer = prepare_output_and_logger(dataset, opt, pipe, execution_args)
     gaussians = GaussianModel(dataset.sh_degree, dataset.sg_degree)
     scene = Scene(dataset, gaussians)
@@ -292,17 +285,9 @@ def training(
     gaussians.training_setup(opt)
     if checkpoint:
         if checkpoint_split_record is not None:
-            previous_appearance = model_params[16] if len(model_params) == 19 else model_params[17]
-            expansion = validate_checkpoint_split(
+            validate_checkpoint_split(
                 checkpoint, dataset.model_path, previous_record=checkpoint_split_record,
-                allow_expansion=allow_split_expansion,
-                current_appearance=dataset.use_decoupled_appearance,
-                checkpoint_appearance=previous_appearance,
             )
-            if expansion["expanded"]:
-                split_expansion_report = {**expansion, "checkpoint": str(Path(checkpoint).resolve())}
-                (Path(dataset.model_path) / "train_split_expansion.json").write_text(json.dumps(split_expansion_report, indent=2))
-                print(f"[Split] Explicitly expanded training cameras {expansion['previous_train_count']} -> {expansion['current_train_count']}; former heldout images are now training views")
         gaussians.restore(model_params, opt)
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
@@ -312,14 +297,6 @@ def training(
     iter_end = torch.cuda.Event(enable_timing=True)
 
     trainCameras = scene.getTrainCameras().copy()
-    seed_report = admit_pseudo_seeds(
-        dataset.pseudo_seed_manifest, gaussians, trainCameras, opt, dataset.model_path, first_iter,
-        previous_admissions=seed_admissions,
-    )
-    if seed_report is not None:
-        if seed_report["appended_gaussians"] > 0:
-            seed_admissions.append(seed_report["source_sha256"])
-        print(f"[Seeds] Appended {seed_report['appended_gaussians']} verified real-depth Gaussians")
     pseudo_cameras = []
     if dataset.pseudo_manifest:
         if opt.pseudo_real_updates < 1 or opt.pseudo_from_iter < 0 or opt.pseudo_ramp_iters < 0:
@@ -334,7 +311,7 @@ def training(
         if opt.pseudo_depth_weight > 0 and not any(view["depth"] is not None for view in pseudo_views):
             raise ValueError("Positive pseudo_depth_weight requires at least one depth-supervised pseudo view")
         if opt.pseudo_densification_weight > 0 and not any(view["densification_mask"] is not None and view["densification_mask"].any().item() for view in pseudo_views):
-            raise ValueError("Pseudo densification requires actual real-depth-supported geometry pixels")
+            raise ValueError("Pseudo densification requires real-reprojected geometry support pixels")
         pseudo_cameras = make_pseudo_cameras(pseudo_views, dataset.data_device, frame_cache is not None)
         manifest_snapshot = []
         for view in pseudo_views:
@@ -542,6 +519,7 @@ def training(
             render_pkg["radii"],
         )
         gt_image = viewpoint_cam.original_image.cuda()
+        loss_image = rendered_image
 
         pseudo_weight = 0.0
         pseudo_depth_weight = 0.0
@@ -550,7 +528,7 @@ def training(
         pseudo_source = None
         if is_pseudo:
             Ll1_render = pseudo_rgb_l1(
-                rendered_image, gt_image, viewpoint_cam.pseudo_valid_mask_cpu, gaussians, viewpoint_cam.uid,
+                loss_image, gt_image, viewpoint_cam.pseudo_valid_mask_cpu, gaussians, viewpoint_cam.uid,
                 viewpoint_cam.pseudo_confidence_cpu,
             )
             pseudo_l1_loss = Ll1_render
@@ -565,7 +543,7 @@ def training(
                 )
         else:
             rgb_loss, Ll1_render = photometric_rgb_loss(
-                rendered_image, gt_image, gaussians, viewpoint_cam.uid, opt.lambda_dssim
+                loss_image, gt_image, gaussians, viewpoint_cam.uid, opt.lambda_dssim
             )
         # normal consistency / depth-derived normal
         if reg_kick_on or normal_prior_kick_on or depth_prior_kick_on:
@@ -673,8 +651,9 @@ def training(
                 pseudo_cam = frame_cache.ensure(pseudo_cam, keep=(viewpoint_cam,))
             pseudo_depth_kick_on = opt.pseudo_depth_weight > 0 and pseudo_cam.pseudo_has_depth
             pseudo_render_pkg = render(pseudo_cam, gaussians, pipe, background, kernel_size, require_depth=pseudo_depth_kick_on)
+            pseudo_loss_image = pseudo_render_pkg["render"]
             pseudo_l1_loss = pseudo_rgb_l1(
-                pseudo_render_pkg["render"], pseudo_cam.original_image.cuda(),
+                pseudo_loss_image, pseudo_cam.original_image.cuda(),
                 pseudo_cam.pseudo_valid_mask_cpu, gaussians, pseudo_cam.uid,
                 pseudo_cam.pseudo_confidence_cpu,
             )
@@ -921,13 +900,13 @@ def training(
                 split_path = Path(scene.model_path) / "camera_split.json"
                 checkpoint_state = {
                     "schema_version": 1,
+                    "recipe": "r2c",
                     "iteration": iteration,
                     "training_seed": getattr(execution_args, "training_seed", 0),
                     "rng_resume_policy": "Process seed reset; checkpoint RNG and camera/pseudo stack states are not restored",
-                    "camera_split": json.loads(split_path.read_text()) if split_path.exists() else None,
-                    "seed_admissions": seed_admissions,
-                    "split_expansion": split_expansion_report,
+                    "camera_split": json.loads(split_path.read_text()),
                 }
+                require_r2c_checkpoint_state(checkpoint_state, iteration)
                 captured = gaussians.capture()
                 captured[14][CHECKPOINT_STATE_KEY] = checkpoint_state
                 checkpoint_path = Path(scene.model_path) / f"chkpnt{iteration}.pth"
@@ -990,6 +969,7 @@ def prepare_output_and_logger(args, opt=None, pipe=None, execution_args=None):
                 "loss_units": "scene" if opt.real_depth_loss_mode == "absolute" else "dimensionless_relative",
             } if opt is not None else {},
             "effective_optimizer_schedule": "dense_main_sh_every_16" if opt is not None and opt.dense_optimizer_updates else "legacy_fastgs",
+            "effective_pseudo_depth_loss": {"mode": "absolute", "units": "scene", "source": "real_aligned_depth_reprojection", "normalization": "Sum of confidence-weighted errors divided by binary depth-valid pixel count"},
             "argv": sys.argv,
         }, config_file, indent=2)
 

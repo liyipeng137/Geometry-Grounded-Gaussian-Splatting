@@ -343,6 +343,8 @@ class GaussianModel:
             valid_depth = z > 0.2
 
             uv = xyz_cam[:, :2] / z.unsqueeze(-1)
+            uv[:, 0] += (camera.Cx - (camera.image_width - 1) / 2) / camera.Fx
+            uv[:, 1] += (camera.Cy - (camera.image_height - 1) / 2) / camera.Fy
             uv_abs = torch.abs(uv)
 
             boundry_x = camera.image_width / camera.Fx * 0.575
@@ -354,6 +356,24 @@ class GaussianModel:
             distance = torch.where(valid, torch.minimum(distance, z), distance)
             valid_points = torch.logical_or(valid_points, valid)
             focal_length = max(focal_length, camera.Fx)
+
+        if not bool(valid_points.any()):
+            # Scene units need not be meters. Retain the established z > .2
+            # behavior whenever it works; otherwise admit positive near surfaces
+            # through the same exact-K frusta instead of reducing an empty set.
+            for camera in cameras:
+                xyz_cam = torch.addmm(camera.T[None, :], xyz, camera.R)
+                z = xyz_cam[:, 2]
+                uv = xyz_cam[:, :2] / z.unsqueeze(-1)
+                uv[:, 0] += (camera.Cx - (camera.image_width - 1) / 2) / camera.Fx
+                uv[:, 1] += (camera.Cy - (camera.image_height - 1) / 2) / camera.Fy
+                uv_abs = torch.abs(uv)
+                in_screen = (uv_abs[:, 0] <= camera.image_width / camera.Fx * 0.575) & (uv_abs[:, 1] <= camera.image_height / camera.Fy * 0.575)
+                valid = (z > 1e-6) & in_screen
+                distance = torch.where(valid, torch.minimum(distance, z), distance)
+                valid_points = valid_points | valid
+            if not bool(valid_points.any()):
+                raise ValueError("3D filter requires a positive-depth point inside at least one camera frustum")
 
         distance[~valid_points] = distance[valid_points].max()
 

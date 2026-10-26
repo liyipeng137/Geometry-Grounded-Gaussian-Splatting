@@ -53,6 +53,7 @@ class ModelParams(ParamGroup):
         self._images = "images"
         self._dataset = ""
         self._resolution = -1
+        self.max_image_width = 0
         self._white_background = False
         self.data_device = "cuda"
         self.frame_gpu_budget = -1
@@ -77,22 +78,16 @@ class ModelParams(ParamGroup):
         self.disable_rgbd_init_ply = False
         self.pseudo_manifest = ""
         self.train_exclude_images = ""
-        self.allow_train_split_expansion = False
-        self.pseudo_seed_manifest = ""
-        self.custom_init_ply = ""
-        self.custom_init_metadata = ""
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args):
         g = super().extract(args)
         g.source_path = os.path.abspath(g.source_path)
+        g.max_image_width = getattr(g, "max_image_width", 0) or 0
+        if g.max_image_width < 0:
+            raise ValueError("max_image_width must be nonnegative")
         g.pseudo_manifest = os.path.abspath(g.pseudo_manifest) if getattr(g, "pseudo_manifest", "") else ""
         g.train_exclude_images = os.path.abspath(g.train_exclude_images) if getattr(g, "train_exclude_images", "") else ""
-        g.pseudo_seed_manifest = os.path.abspath(g.pseudo_seed_manifest) if getattr(g, "pseudo_seed_manifest", "") else ""
-        if bool(getattr(g, "custom_init_ply", "")) != bool(getattr(g, "custom_init_metadata", "")):
-            raise ValueError("custom_init_ply and custom_init_metadata must be supplied together")
-        g.custom_init_ply = os.path.abspath(g.custom_init_ply) if getattr(g, "custom_init_ply", "") else ""
-        g.custom_init_metadata = os.path.abspath(g.custom_init_metadata) if getattr(g, "custom_init_metadata", "") else ""
         return g
 
 class PipelineParams(ParamGroup):
@@ -162,13 +157,6 @@ class OptimizationParams(ParamGroup):
         self.pseudo_densification_depth_tolerance = 0.08
         self.pseudo_densification_min_confidence = 0.05
         self.pseudo_gradient_diagnostics_interval = 0
-        self.pseudo_seed_max_fraction = 0.02
-        self.pseudo_seed_max_points = 20000
-        self.pseudo_seed_min_confidence = 0.9
-        self.pseudo_seed_voxel_size = 0.02
-        self.pseudo_seed_min_distance = 0.02
-        self.pseudo_seed_opacity = 0.03
-        self.pseudo_seed_depth_tolerance = 0.05
         self.pseudo_ramp_iters = 500
         self.pseudo_additive = False
         self.vcd_enable = True

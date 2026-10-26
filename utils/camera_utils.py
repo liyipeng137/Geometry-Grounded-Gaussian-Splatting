@@ -10,6 +10,7 @@
 #
 
 import os
+from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 
 import cv2
@@ -24,6 +25,13 @@ from utils.graphics_utils import fov2focal
 from utils.system_utils import trim_process_memory
 
 WARNED = False
+
+
+def capped_image_resolution(width, height, maximum_width, resolution_scale=1.0):
+    if width <= 0 or height <= 0 or maximum_width <= 0 or resolution_scale <= 0:
+        raise ValueError("Image dimensions, width cap and resolution scale must be positive")
+    scale = max(width / maximum_width, 1.0) * resolution_scale
+    return max(1, round(width / scale)), max(1, round(height / scale))
 
 
 def _frame_gpu_budget(args):
@@ -42,13 +50,18 @@ def _resolve_prior_root(source_path, prior_dir):
     return os.path.join(source_path, prior_dir)
 
 
+def _prior_name(cam_info, extension):
+    full_name = getattr(cam_info, "colmap_image_name", None)
+    return str(Path(full_name).with_suffix("." + extension)) if full_name else cam_info.image_name + "." + extension
+
+
 def _load_gt_mask(args, cam_info, resolution):
     mask_root = _resolve_prior_root(args.source_path, args.mask_dir)
     if mask_root is None:
         return None
 
     mask_format = args.mask_format.lower().lstrip(".")
-    mask_path = os.path.join(mask_root, f"{cam_info.image_name}.{mask_format}")
+    mask_path = os.path.join(mask_root, _prior_name(cam_info, mask_format))
     if not os.path.exists(mask_path):
         return None
 
@@ -65,7 +78,7 @@ def _load_normal_prior(args, cam_info, resolution):
         normal_root = os.path.join(os.path.dirname(os.path.dirname(cam_info.image_path)), "normals")
 
     normal_format = args.normal_prior_format.lower().lstrip(".")
-    normal_path = os.path.join(normal_root, f"{cam_info.image_name}.{normal_format}")
+    normal_path = os.path.join(normal_root, _prior_name(cam_info, normal_format))
     if not os.path.exists(normal_path):
         return None
 
@@ -81,7 +94,7 @@ def _load_normal_prior(args, cam_info, resolution):
 
 def _resize_depth(depth_np, resolution):
     depth_prior = torch.from_numpy(np.ascontiguousarray(depth_np))[None, None]
-    return F.interpolate(depth_prior, size=(resolution[1], resolution[0]), mode="nearest")[0]
+    return F.interpolate(depth_prior, size=(resolution[1], resolution[0]), mode="nearest-exact")[0]
 
 
 def _load_depth_prior(args, cam_info, resolution):
@@ -89,18 +102,18 @@ def _load_depth_prior(args, cam_info, resolution):
     if depth_root is None:
         return None
 
-    npy_path = os.path.join(depth_root, f"{cam_info.image_name}.npy")
+    npy_path = os.path.join(depth_root, _prior_name(cam_info, "npy"))
     if os.path.exists(npy_path):
-        depth_np = np.squeeze(np.load(npy_path)).astype(np.float32, copy=False)
-        if depth_np.ndim == 3:
-            depth_np = depth_np[..., 0]
-        depth_np = np.nan_to_num(depth_np, nan=0.0, posinf=0.0, neginf=0.0)
+        depth_np = np.load(npy_path, allow_pickle=False).astype(np.float32, copy=False)
+        if depth_np.ndim != 2 or depth_np.shape != (cam_info.height, cam_info.width):
+            raise ValueError(f"Depth must match the original camera grid: {npy_path}")
+        depth_np = np.where(np.isfinite(depth_np) & (depth_np > 0), depth_np, 0).astype(np.float32)
         return _resize_depth(depth_np, resolution)
 
     depth_format = args.depth_prior_format.lower().lstrip(".")
     if depth_format == "npy":
         return None
-    depth_path = os.path.join(depth_root, f"{cam_info.image_name}.{depth_format}")
+    depth_path = os.path.join(depth_root, _prior_name(cam_info, depth_format))
     if not os.path.exists(depth_path):
         return None
 
@@ -117,7 +130,7 @@ def _load_depth_confidence(args, cam_info, resolution):
         return None
 
     confidence_format = args.depth_confidence_format.lower().lstrip(".")
-    confidence_path = os.path.join(confidence_root, f"{cam_info.image_name}.{confidence_format}")
+    confidence_path = os.path.join(confidence_root, _prior_name(cam_info, confidence_format))
     if not os.path.exists(confidence_path):
         return None
 
@@ -149,7 +162,12 @@ def loadCam(args, id, cam_info, resolution_scale):
     try:
         orig_w, orig_h = image.size
 
-        if args.resolution in [1, 2, 4, 8]:
+        maximum_width = getattr(args, "max_image_width", 0) or 0
+        if maximum_width < 0:
+            raise ValueError("max_image_width must be nonnegative")
+        if maximum_width > 0:
+            resolution = capped_image_resolution(orig_w, orig_h, maximum_width, resolution_scale)
+        elif args.resolution in [1, 2, 4, 8]:
             resolution = round(orig_w/(resolution_scale * args.resolution)), round(orig_h/(resolution_scale * args.resolution))
         else:  # should be a type that converts to float
             if args.resolution == -1:
@@ -178,8 +196,9 @@ def loadCam(args, id, cam_info, resolution_scale):
 
         normal_prior = _load_normal_prior(args, cam_info, resolution)
         depth_prior = _load_depth_prior(args, cam_info, resolution)
-        # depth_confidence = _load_depth_confidence(args, cam_info, resolution)
 
+        native_K = getattr(cam_info, "K", None)
+        scaled_K = None if native_K is None else np.diag([resolution[0] / orig_w, resolution[1] / orig_h, 1]) @ native_K
         camera = Camera(colmap_id=cam_info.uid, R=cam_info.R, T=cam_info.T,
                       FoVx=cam_info.FovX, FoVy=cam_info.FovY,
                       image=gt_image, gt_alpha_mask=loaded_mask,
@@ -188,14 +207,8 @@ def loadCam(args, id, cam_info, resolution_scale):
                       depth_prior=depth_prior,
                       depth_confidence=None,
                       data_device=args.data_device,
-                      lazy_payload=_frame_gpu_budget(args) != -1)
+                      lazy_payload=_frame_gpu_budget(args) != -1, K=scaled_K)
         camera.source_image_name = cam_info.colmap_image_name or os.path.basename(cam_info.image_path)
-        camera.pixel_center_convention = "colmap_half_integer"
-        camera.source_K_colmap = np.array([
-            [camera.Fx, 0.0, camera.Cx + 0.5],
-            [0.0, camera.Fy, camera.Cy + 0.5],
-            [0.0, 0.0, 1.0],
-        ])
         return camera
     finally:
         if cam_info.image is None:
@@ -237,11 +250,13 @@ def camera_to_JSON(id, camera : Camera):
     serializable_array_2d = [x.tolist() for x in rot]
     camera_entry = {
         'id' : id,
-        'img_name' : camera.image_name,
+        'img_name' : camera.colmap_image_name or camera.image_name,
         'width' : camera.width,
         'height' : camera.height,
         'position': pos.tolist(),
         'rotation': serializable_array_2d,
+        'K': None if getattr(camera, 'K', None) is None else camera.K.tolist(),
+        'pixel_center_convention': 'colmap_half_integer',
         'fy' : fov2focal(camera.FovY, camera.height),
         'fx' : fov2focal(camera.FovX, camera.width)
     }

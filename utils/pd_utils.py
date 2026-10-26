@@ -18,7 +18,7 @@ def _intrinsic_from_sparse(intr):
     return fx, fy, cx, cy, int(intr.width), int(intr.height)
 
 
-def _frame_intrinsic(cam, cam_intrinsics, color_hw, pixel_center_convention="array_integer"):
+def _frame_intrinsic(cam, cam_intrinsics, color_hw, pixel_center_convention="colmap_half_integer"):
     intr = None if not cam_intrinsics else cam_intrinsics.get(cam.uid)
     if intr is None and cam_intrinsics and len(cam_intrinsics) == 1:
         intr = next(iter(cam_intrinsics.values()))
@@ -44,23 +44,14 @@ def _frame_intrinsic(cam, cam_intrinsics, color_hw, pixel_center_convention="arr
 
 
 def _load_tsdf_depth(source_path, image_name):
-    depth_dir = os.path.join(source_path, "depth")
-    npy_path = os.path.join(depth_dir, f"{image_name}.npy")
-    if os.path.exists(npy_path):
-        depth_np = np.squeeze(np.load(npy_path)).astype(np.float32, copy=False)
-        if depth_np.ndim == 3:
-            depth_np = depth_np[..., 0]
-        return np.nan_to_num(depth_np, nan=0.0, posinf=0.0, neginf=0.0)
-
-    png_path = os.path.join(depth_dir, f"{image_name}.png")
-    if not os.path.exists(png_path):
+    from pathlib import Path
+    path = Path(source_path) / "depth" / Path(image_name).with_suffix(".npy")
+    if not path.is_file():
         return None
-    depth_raw = cv2.imread(png_path, cv2.IMREAD_UNCHANGED)
-    if depth_raw is None:
-        return None
-    if depth_raw.ndim == 3:
-        depth_raw = depth_raw[..., 0]
-    return depth_raw.astype(np.float32) / 1000.0
+    depth = np.load(path, allow_pickle=False)
+    if depth.ndim != 2 or depth.dtype.kind != "f":
+        raise ValueError(f"Aligned depth must be an HxW floating camera-Z NPY: {path}")
+    return np.where(np.isfinite(depth) & (depth > 0), depth, 0).astype(np.float32)
 
 
 def generate_ply_from_rgbd(
@@ -95,7 +86,7 @@ def generate_ply_from_rgbd(
     source_path = source_path or os.path.dirname(ply_path)
     for train_cam in train_cam_infos:
         image_path = train_cam.image_path
-        image_name = train_cam.image_name
+        image_name = train_cam.colmap_image_name or train_cam.image_name
         # confidence_path = os.path.join(source_path, "confidence", f"{image_name}.png")
 
         depth_m = _load_tsdf_depth(source_path, image_name)
@@ -109,15 +100,14 @@ def generate_ply_from_rgbd(
             continue
         color_np = cv2.cvtColor(color_np, cv2.COLOR_BGR2RGB)
         if depth_m.shape[:2] != color_np.shape[:2]:
-            depth_m = cv2.resize(depth_m, (color_np.shape[1], color_np.shape[0]), interpolation=cv2.INTER_NEAREST)
+            raise ValueError(f"RGB/depth must share the original camera grid: {image_name}")
         valid = np.isfinite(depth_m) & (depth_m > depth_min) & (depth_m < depth_max)
         if not np.any(valid):
             dropped_cameras += 1
             continue
         depth_m = np.where(valid, depth_m, 0.0).astype(np.float32)
-        depth_u16 = np.clip(depth_m * 1000.0, 0.0, 65535.0).astype(np.uint16)
         color = o3d.geometry.Image(color_np)
-        depth = o3d.geometry.Image(np.ascontiguousarray(depth_u16))
+        depth = o3d.geometry.Image(np.ascontiguousarray(depth_m))
 
         camera_intrinsics, (fx, fy, cx, cy) = _frame_intrinsic(
             train_cam, cam_intrinsics, color_np.shape[:2], pixel_center_convention=pixel_center_convention
@@ -140,7 +130,7 @@ def generate_ply_from_rgbd(
         rgbd = o3d.geometry.RGBDImage.create_from_color_and_depth(
             color,
             depth,
-            depth_scale=1000.0,
+            depth_scale=1.0,
             depth_trunc=float(depth_max),
             convert_rgb_to_intensity=False,
         )
@@ -167,6 +157,7 @@ def generate_ply_from_rgbd(
     out_pcd = o3d.geometry.PointCloud()
     out_pcd.points = o3d.utility.Vector3dVector(points)
     out_pcd.colors = o3d.utility.Vector3dVector(colors)
-    o3d.io.write_point_cloud(ply_path, out_pcd)
+    if not o3d.io.write_point_cloud(ply_path, out_pcd):
+        raise RuntimeError(f"Failed to write RGBD initialization: {ply_path}")
     print(f"Dropped cameras without usable depth: {dropped_cameras}")
     print(f"RGBD init ply saved to {ply_path}, points={points.shape[0]}")

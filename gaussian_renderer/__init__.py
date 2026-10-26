@@ -122,6 +122,9 @@ def render(
 
 
 
+    if require_depth and hasattr(viewpoint_camera, "camera_z_depth"):
+        rendered_median_depth = viewpoint_camera.camera_z_depth(rendered_median_depth)
+
     # Those Gaussians that were frustum culled or had a radius of 0 were not visible.
     # They will be excluded from value updates used in the splitting criteria.
     return {"render": rendered_image,
@@ -265,6 +268,23 @@ def evaluate_sdf(points3D, viewpoint_camera, pc : GaussianModel, pipe, kernel_si
             "inside": inside}
 
 
+def _sampled_points_to_camera_rays(points_world, sampled_points, camera):
+    """Retain sampled range while replacing the CUDA sampler's centered ray.
+
+    The native sampler returns XYZ on its centered pixel ray. Exact-K projection
+    selects the correct pixel, but an off-center camera needs its actual ray to
+    reconstruct camera coordinates for multiview geometry losses.
+    """
+    center_x, center_y = (camera.image_width - 1) / 2, (camera.image_height - 1) / 2
+    if getattr(camera, "Cx", center_x) == center_x and getattr(camera, "Cy", center_y) == center_y:
+        return sampled_points
+    query_camera = points_world @ camera.R + camera.T
+    query_length = torch.linalg.vector_norm(query_camera, dim=-1, keepdim=True)
+    sample_range = torch.linalg.vector_norm(sampled_points, dim=-1, keepdim=True)
+    denominator = query_length.clamp_min(torch.finfo(query_camera.dtype).tiny)
+    return query_camera / denominator * sample_range
+
+
 def sample_depth(points3D, viewpoint_camera, pc : GaussianModel, pipe : torch.Tensor, kernel_size : float, scaling_modifier = 1.0):
 
     # Set up rasterization configuration
@@ -319,5 +339,6 @@ def sample_depth(points3D, viewpoint_camera, pc : GaussianModel, pipe : torch.Te
 
     # Those Gaussians that were frustum culled or had a radius of 0 were not visible.
     # They will be excluded from value updates used in the splitting criteria.
+    depth = _sampled_points_to_camera_rays(points3D, depth, viewpoint_camera)
     return {"sampled_depth": depth,
             "inside": inside}

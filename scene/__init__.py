@@ -40,8 +40,6 @@ class Scene:
             raise ValueError("frame_gpu_budget must be -1 or a positive integer")
         self.loaded_iter = None
         self.gaussians = gaussians
-        if load_iteration is not None and (getattr(args, "custom_init_ply", "") or getattr(args, "custom_init_metadata", "")):
-            raise ValueError("Custom point-cloud initialization is cold-start only, not native Gaussian loading")
 
         if load_iteration:
             if load_iteration == -1:
@@ -59,11 +57,8 @@ class Scene:
                 args.source_path,
                 args.images,
                 args.eval,
-                use_rgbd_init_ply=not args.disable_rgbd_init_ply,
+                use_rgbd_init_ply=True,
                 train_exclude_images=getattr(args, "train_exclude_images", ""),
-                allow_train_split_expansion=getattr(args, "allow_train_split_expansion", False),
-                custom_init_ply=getattr(args, "custom_init_ply", ""),
-                custom_init_metadata=getattr(args, "custom_init_metadata", ""),
                 init_cache_dir=self.model_path,
             )
         elif os.path.exists(os.path.join(args.source_path, "transforms.json")):
@@ -71,8 +66,6 @@ class Scene:
             scene_info = sceneLoadTypeCallbacks["Blender"](args.source_path, args.white_background, args.eval)
 
         if not self.loaded_iter:
-            if getattr(args, "custom_init_ply", "") and os.path.realpath(scene_info.ply_path) == os.path.realpath(os.path.join(self.model_path, "input.ply")):
-                raise ValueError("Custom initialization source must be separate from the training input.ply snapshot")
             with open(scene_info.ply_path, "rb") as src_file, open(os.path.join(self.model_path, "input.ply"), "wb") as dest_file:
                 dest_file.write(src_file.read())
             json_cams = []
@@ -90,7 +83,7 @@ class Scene:
         #     random.shuffle(scene_info.train_cameras)  # Multi-res consistent random shuffling
         #     random.shuffle(scene_info.test_cameras)  # Multi-res consistent random shuffling
 
-        self.cameras_extent = scene_info.nerf_normalization["radius"]
+        self.cameras_extent = max(scene_info.nerf_normalization["radius"], 1e-6)
 
         for resolution_scale in resolution_scales:
             self.train_cameras[resolution_scale] = cameraList_from_camInfos(scene_info.train_cameras, resolution_scale, args)
@@ -114,7 +107,7 @@ class Scene:
                 center_rays = torch.nn.functional.normalize(center_rays, dim=-1)
                 diss = torch.norm(camera_centers[:, None] - camera_centers[None], dim=-1).detach().cpu().numpy()
                 tmp = torch.sum(center_rays[:, None] * center_rays[None], dim=-1)
-                angles_torch = torch.arccos(tmp) * 180 / 3.14159
+                angles_torch = torch.arccos(tmp.clamp(-1.0, 1.0)) * 180 / 3.14159
                 angles_np = angles_torch.detach().cpu().numpy()
                 with open(os.path.join(self.model_path, "multi_view.json"), "w") as file:
                     for id, cur_cam in enumerate(self.train_cameras[resolution_scale]):
