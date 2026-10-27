@@ -76,6 +76,9 @@ class ModelParams(ParamGroup):
         self.depth_confidence_dir = "confidence"
         self.depth_confidence_format = "png"
         self.disable_rgbd_init_ply = False
+        self.initialization_kind = "rgbd"
+        self.initialization_ply = ""
+        self.initialization_manifest = ""
         self.pseudo_manifest = ""
         self.train_exclude_images = ""
         super().__init__(parser, "Loading Parameters", sentinel)
@@ -88,6 +91,19 @@ class ModelParams(ParamGroup):
             raise ValueError("max_image_width must be nonnegative")
         g.pseudo_manifest = os.path.abspath(g.pseudo_manifest) if getattr(g, "pseudo_manifest", "") else ""
         g.train_exclude_images = os.path.abspath(g.train_exclude_images) if getattr(g, "train_exclude_images", "") else ""
+        g.initialization_kind = getattr(g, "initialization_kind", None) or "rgbd"
+        g.initialization_ply = getattr(g, "initialization_ply", None) or ""
+        g.initialization_manifest = getattr(g, "initialization_manifest", None) or ""
+        if g.initialization_kind not in ("rgbd", "mesh_surface"):
+            raise ValueError("initialization_kind must be rgbd or mesh_surface")
+        if g.initialization_kind == "rgbd" and (g.initialization_ply or g.initialization_manifest):
+            raise ValueError("RGBD initialization does not accept an alternate PLY or manifest")
+        if g.initialization_kind == "mesh_surface":
+            for field in ("initialization_ply", "initialization_manifest"):
+                value = getattr(g, field)
+                if not value or not os.path.isabs(value):
+                    raise ValueError(field + " must be an explicit absolute path for mesh_surface")
+                setattr(g, field, os.path.realpath(value))
         return g
 
 class PipelineParams(ParamGroup):

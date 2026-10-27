@@ -38,7 +38,8 @@ from gaussian_renderer import network_gui, render
 from scene import GaussianModel, Scene
 from scene.cameras import Camera, FramePayloadCache
 from scene.pseudo_views import accumulate_pseudo_densification, load_pseudo_manifest, make_pseudo_cameras, pseudo_depth_l1, pseudo_rgb_l1, ramp_weight, screen_gradient_statistics
-from scene.train_split import CHECKPOINT_STATE_KEY, checkpoint_training_state, read_checkpoint_split, validate_checkpoint_split
+from scene.train_split import CHECKPOINT_STATE_KEY, checkpoint_training_state, read_checkpoint_split, validate_checkpoint_split, validate_initialization_proof
+from scene.training_sampling import CameraSamplingSchedule
 from utils.general_utils import safe_state
 from utils.graphics_utils import depth_to_normal
 from utils.image_utils import psnr
@@ -74,12 +75,15 @@ def record_source_losses(training_stats, source, rgb_loss, depth_loss, rgb_weigh
         record[field + "_mean"] = record[field + "_sum"] / record["samples"]
 
 
-def require_r2c_checkpoint_state(state, iteration):
-    if not isinstance(state, dict) or state.get("schema_version") != 1 or state.get("recipe") != "r2c" or state.get("iteration") != iteration:
-        raise ValueError("Resume requires an embedded checkpoint from the formal r2c recipe at its recorded iteration")
+def require_r2c_checkpoint_state(state, iteration, expected_recipe=None):
+    if not isinstance(state, dict) or state.get("schema_version") != 1 or state.get("recipe") not in ("r2c", "real_only") or state.get("iteration") != iteration:
+        raise ValueError("Resume requires an embedded formal recipe checkpoint at its recorded iteration")
+    if expected_recipe is not None and state["recipe"] != expected_recipe:
+        raise ValueError("Checkpoint recipe differs from the requested training recipe")
     split = state.get("camera_split")
-    if not isinstance(split, dict) or split.get("initialization", {}).get("kind") != "train_only_rgbd":
-        raise ValueError("Formal checkpoints require the real RGBD initialization contract")
+    accepted = ("train_only_rgbd",) if state["recipe"] == "r2c" else ("train_only_rgbd", "mesh_surface")
+    if not isinstance(split, dict) or split.get("initialization", {}).get("kind") not in accepted:
+        raise ValueError("Formal checkpoint initialization must match its recipe")
     return state
 
 
@@ -247,6 +251,13 @@ def training(
     debug_from,
     execution_args=None,
 ):
+    reconstruction_recipe = getattr(execution_args, "reconstruction_recipe", "r2c")
+    if reconstruction_recipe not in ("r2c", "real_only"):
+        raise ValueError("reconstruction_recipe must be r2c or real_only")
+    if reconstruction_recipe == "real_only" and dataset.pseudo_manifest:
+        raise ValueError("real_only training does not accept a pseudo manifest")
+    if reconstruction_recipe != "real_only" and getattr(dataset, "initialization_kind", "rgbd") != "rgbd":
+        raise ValueError("Alternate mesh initialization requires the explicit real_only recipe")
     if opt.opacity_reset_min_remaining < 0:
         raise ValueError("opacity_reset_min_remaining must be nonnegative")
     if opt.real_depth_loss_mode not in ("absolute", "relative_charbonnier"):
@@ -273,7 +284,7 @@ def training(
         embedded_checkpoint_state = checkpoint_training_state(model_params, first_iter)
     checkpoint_split_record = None
     if checkpoint:
-        require_r2c_checkpoint_state(embedded_checkpoint_state, first_iter)
+        require_r2c_checkpoint_state(embedded_checkpoint_state, first_iter, expected_recipe=reconstruction_recipe)
         checkpoint_split_record = read_checkpoint_split(checkpoint, embedded_state=embedded_checkpoint_state)
     tb_writer = prepare_output_and_logger(dataset, opt, pipe, execution_args)
     gaussians = GaussianModel(dataset.sh_degree, dataset.sg_degree)
@@ -297,6 +308,7 @@ def training(
     iter_end = torch.cuda.Event(enable_timing=True)
 
     trainCameras = scene.getTrainCameras().copy()
+    camera_schedule = CameraSamplingSchedule(trainCameras, getattr(execution_args, "training_seed", 0)) if reconstruction_recipe == "real_only" else None
     pseudo_cameras = []
     if dataset.pseudo_manifest:
         if opt.pseudo_real_updates < 1 or opt.pseudo_from_iter < 0 or opt.pseudo_ramp_iters < 0:
@@ -375,6 +387,7 @@ def training(
     training_stats = {
         "start_iteration": first_iter,
         "training_seed": getattr(execution_args, "training_seed", 0),
+        "reconstruction_recipe": reconstruction_recipe,
         "pseudo_sampling_seed": 0,
         "rng_resume_policy": "Process seed reset; checkpoint RNG and camera/pseudo stack states are not restored",
         "real_samples": 0,
@@ -475,9 +488,12 @@ def training(
                 pseudo_stack = pseudo_cameras.copy()
             viewpoint_cam = pseudo_stack.pop(randint(0, len(pseudo_stack) - 1))
         else:
-            if not viewpoint_stack:
-                viewpoint_stack = scene.getTrainCameras().copy()
-            viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack) - 1))
+            if camera_schedule is not None:
+                viewpoint_cam = camera_schedule.draw_real()
+            else:
+                if not viewpoint_stack:
+                    viewpoint_stack = scene.getTrainCameras().copy()
+                viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack) - 1))
         training_stats["pseudo_samples" if is_pseudo else "real_samples"] += 1
         if frame_cache is not None:
             viewpoint_cam = frame_cache.ensure(viewpoint_cam)
@@ -614,7 +630,9 @@ def training(
 
         # patch match loss
         if reg_kick_on and (lambda_multi_view_ncc_cur > 0 or opt.lambda_multi_view_geo):
-            nearest_cam = None if len(viewpoint_cam.nearest_id) == 0 else scene.getTrainCameras()[sample(viewpoint_cam.nearest_id, 1)[0]]
+            nearest_cam = camera_schedule.draw_neighbor(viewpoint_cam) if camera_schedule is not None else (
+                None if len(viewpoint_cam.nearest_id) == 0 else scene.getTrainCameras()[sample(viewpoint_cam.nearest_id, 1)[0]]
+            )
             if nearest_cam is not None and frame_cache is not None:
                 nearest_cam = frame_cache.ensure(nearest_cam, keep=(viewpoint_cam,))
             ncc_loss, geo_loss = patchmatch(gaussians, render_pkg, viewpoint_cam, nearest_cam, iteration, depth_normal)
@@ -890,6 +908,8 @@ def training(
 
             if iteration % 100 == 0 or iteration in checkpoint_iterations or iteration == opt.iterations:
                 training_stats["last_iteration"] = iteration
+                if camera_schedule is not None:
+                    training_stats.update(camera_schedule.proof())
                 with open(os.path.join(dataset.model_path, "training_stats.json"), "w") as stats_file:
                     json.dump(training_stats, stats_file, indent=2)
                 if pseudo_cameras:
@@ -900,13 +920,14 @@ def training(
                 split_path = Path(scene.model_path) / "camera_split.json"
                 checkpoint_state = {
                     "schema_version": 1,
-                    "recipe": "r2c",
+                    "recipe": reconstruction_recipe,
                     "iteration": iteration,
                     "training_seed": getattr(execution_args, "training_seed", 0),
                     "rng_resume_policy": "Process seed reset; checkpoint RNG and camera/pseudo stack states are not restored",
                     "camera_split": json.loads(split_path.read_text()),
                 }
-                require_r2c_checkpoint_state(checkpoint_state, iteration)
+                require_r2c_checkpoint_state(checkpoint_state, iteration, expected_recipe=reconstruction_recipe)
+                validate_initialization_proof(checkpoint_state["camera_split"])
                 captured = gaussians.capture()
                 captured[14][CHECKPOINT_STATE_KEY] = checkpoint_state
                 checkpoint_path = Path(scene.model_path) / f"chkpnt{iteration}.pth"
@@ -1091,6 +1112,7 @@ if __name__ == "__main__":
     parser.add_argument("--save_iterations", nargs="+", type=int, default=[3000,7000, 20000])
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--training_seed", type=int, default=0)
+    parser.add_argument("--reconstruction_recipe", choices=("r2c", "real_only"), default="r2c")
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[30000])
     parser.add_argument("--start_checkpoint", type=str, default=None)
     args = parser.parse_args(sys.argv[1:])

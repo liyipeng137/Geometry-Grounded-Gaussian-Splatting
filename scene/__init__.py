@@ -60,6 +60,9 @@ class Scene:
                 use_rgbd_init_ply=True,
                 train_exclude_images=getattr(args, "train_exclude_images", ""),
                 init_cache_dir=self.model_path,
+                initialization_kind=getattr(args, "initialization_kind", "rgbd"),
+                initialization_ply=getattr(args, "initialization_ply", ""),
+                initialization_manifest=getattr(args, "initialization_manifest", ""),
             )
         elif os.path.exists(os.path.join(args.source_path, "transforms.json")):
             print("Found transforms_train.json file, assuming Blender data set!")

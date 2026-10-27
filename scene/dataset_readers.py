@@ -36,6 +36,7 @@ from scene.colmap_loader import (
 )
 from scene.gaussian_model import BasicPointCloud
 from scene.train_split import calibration_fingerprint, load_excluded_image_names, partition_cameras, training_camera_fingerprint
+from scene.mesh_initialization import MESH_INITIALIZATION_ALGORITHM, validate_mesh_manifest
 from utils.graphics_utils import focal2fov, fov2focal, getWorld2View2
 from utils.pd_utils import generate_ply_from_rgbd
 from utils.sh_utils import SH2RGB
@@ -227,12 +228,17 @@ def _write_record(path, value):
 
 
 def readColmapSceneInfo(path, images, eval, llffhold=8, use_rgbd_init_ply=True,
-                       train_exclude_images="", init_cache_dir=None):
-    """Always use current-split RGBD and half-integer calibration; no fallback."""
+                       train_exclude_images="", init_cache_dir=None, initialization_kind="rgbd",
+                       initialization_ply="", initialization_manifest=""):
+    """Use explicit current-split RGBD or a content-bound mesh surface point cloud."""
+    if initialization_kind not in ("rgbd", "mesh_surface"):
+        raise ValueError("initialization_kind must be rgbd or mesh_surface")
+    if initialization_kind == "rgbd" and (initialization_ply or initialization_manifest):
+        raise ValueError("RGBD initialization does not accept alternate PLY/manifest inputs")
     if not use_rgbd_init_ply:
-        raise ValueError("Formal COLMAP input requires training-camera RGBD initialization")
+        raise ValueError("Formal COLMAP input requires an explicit initialization contract")
     if init_cache_dir is None:
-        raise ValueError("COLMAP RGBD initialization requires an owned output cache directory")
+        raise ValueError("COLMAP initialization requires an owned output cache directory")
     if (Path(path) / "mixed_dataset.json").exists():
         raise ValueError("Mixed/generated ordinary-camera datasets are outside the formal FFBA input contract")
     model = Path(path) / "sparse/0"
@@ -259,53 +265,105 @@ def readColmapSceneInfo(path, images, eval, llffhold=8, use_rgbd_init_ply=True,
         assets[camera.colmap_image_name] = {"rgb_sha256": _sha256_file(camera.image_path),
                                           "depth_sha256": _sha256_file(depth) if depth.is_file() else None}
     train_assets = {camera.colmap_image_name: assets[camera.colmap_image_name] for camera in train}
-    if not any(record["depth_sha256"] for record in train_assets.values()):
-        raise ValueError("No training camera has aligned NPY depth; refusing sparse/full-capture initialization fallback")
-    algorithm = "rgbd_colmap_half_integer_float32_v3"
-    operator_sha256 = _sha256_file(generate_ply_from_rgbd.__code__.co_filename)
-    identity = {"algorithm": algorithm, "operator_sha256": operator_sha256,
-                "train_assets": train_assets,
-                "calibrations": {name: calibrations[name] for name in train_assets},
-                "parameters": {"num_points": 200000, "voxel_length": 0.02, "sdf_trunc": 0.06, "depth_min": 0.05, "depth_max": 50.0}}
-    init_fingerprint = calibration_fingerprint(identity)
     cache = Path(init_cache_dir)
     cache.mkdir(parents=True, exist_ok=True)
-    ply_path = cache / f"rgbd_init_train_{init_fingerprint[:16]}.ply"
-    metadata_path = ply_path.with_suffix(".ply.json")
-    with ply_path.with_suffix(".lock").open("a+") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
-        if ply_path.exists() != metadata_path.exists():
-            raise ValueError(f"Incomplete RGBD cache/proof pair: {ply_path}")
-        if not ply_path.exists():
-            temporary = None
-            try:
-                with tempfile.NamedTemporaryFile(dir=cache, suffix=".ply", delete=False) as stream:
-                    temporary = Path(stream.name)
-                generate_ply_from_rgbd(train, num_points=200000, ply_path=str(temporary), cam_intrinsics=cam_intrinsics,
-                                      source_path=path, pixel_center_convention="colmap_half_integer")
-                pcd = fetchOpen3DPly(str(temporary))
-                if not len(pcd.points) or not np.isfinite(pcd.points).all() or not np.isfinite(pcd.colors).all():
-                    raise ValueError("RGBD initialization produced no finite colored points")
-                for camera in infos:
-                    depth = Path(path) / "depth" / Path(camera.colmap_image_name).with_suffix(".npy")
-                    current = {"rgb_sha256": _sha256_file(camera.image_path), "depth_sha256": _sha256_file(depth) if depth.is_file() else None}
-                    if current != assets[camera.colmap_image_name]:
-                        raise RuntimeError("RGB/depth source changed during RGBD fusion")
-                temporary.replace(ply_path)
-                _write_record(metadata_path, {"schema_version": 1, "cache_fingerprint": init_fingerprint,
-                                              "identity": identity, "ply_sha256": _sha256_file(ply_path),
-                                              "point_count": len(pcd.points)})
-            finally:
-                if temporary is not None:
-                    temporary.unlink(missing_ok=True)
-        metadata = json.loads(metadata_path.read_text())
-        if metadata.get("cache_fingerprint") != init_fingerprint or metadata.get("identity") != identity or metadata.get("ply_sha256") != _sha256_file(ply_path):
-            raise ValueError("RGBD cache/proof differs from the current training data/operator")
-        pcd = fetchOpen3DPly(str(ply_path))
+    if initialization_kind == "mesh_surface":
+        manifest, manifest_sha256 = validate_mesh_manifest(
+            initialization_ply, initialization_manifest, str(Path(path).resolve()),
+            [camera.colmap_image_name for camera in train],
+        )
+        extension = "bin" if (model / "cameras.bin").is_file() and (model / "images.bin").is_file() else "txt"
+        expected_calibration_paths = {str((model / f"{name}.{extension}").resolve()) for name in ("cameras", "images")}
+        if set(manifest["calibration_sha256"]) != expected_calibration_paths:
+            raise ValueError("Mesh coloring calibration paths differ from the training dataset")
+        color_views = {view["name"]: view for view in manifest["views"]}
+        for camera in train:
+            view = color_views[camera.colmap_image_name]
+            if Path(view["image_path"]).resolve() != Path(camera.image_path).resolve() or view["image_sha256"] != train_assets[camera.colmap_image_name]["rgb_sha256"]:
+                raise ValueError("Mesh coloring RGB differs from the current training camera")
+        ply_path = Path(initialization_ply).resolve()
+        # A Gaussian checkpoint or triangle mesh is never a point-cloud initializer.
+        ply_document = PlyData.read(str(ply_path))
+        if ("face" in ply_document and len(ply_document["face"])) or "vertex" not in ply_document:
+            raise ValueError("mesh_surface initialization must be a sampled point PLY, not a mesh")
+        fields = set(ply_document["vertex"].data.dtype.names or ())
+        if not {"x", "y", "z", "red", "green", "blue"}.issubset(fields) or "opacity" in fields:
+            raise ValueError("mesh_surface PLY requires explicit XYZ/RGB and cannot be a Gaussian checkpoint")
+        pcd = fetchPly(str(ply_path))
         if not len(pcd.points) or not np.isfinite(pcd.points).all() or not np.isfinite(pcd.colors).all():
-            raise ValueError("RGBD cache must contain finite, nonempty XYZ/RGB")
-        if metadata.get("point_count") != len(pcd.points):
-            raise ValueError("RGBD proof point count disagrees with its PLY")
+            raise ValueError("mesh_surface initialization requires finite, nonempty XYZ/RGB")
+        if np.any(pcd.colors < 0) or np.any(pcd.colors > 1) or not np.any(pcd.colors > 0):
+            raise ValueError("mesh_surface RGB must be in range and cannot trigger random-color fallback")
+        if len(pcd.points) != manifest["initialization_ply"]["point_count"]:
+            raise ValueError("Mesh initialization manifest point count disagrees with its PLY")
+        identity = {
+            "algorithm": MESH_INITIALIZATION_ALGORITHM, "manifest_sha256": manifest_sha256,
+            "train_camera_fingerprint": training_camera_fingerprint(train),
+            "calibration_fingerprint": calibration_fingerprint(calibrations),
+            "dataset_content_fingerprint": calibration_fingerprint(assets),
+        }
+        initialization = {
+            "kind": "mesh_surface", "algorithm": MESH_INITIALIZATION_ALGORITHM,
+            "ply_path": str(ply_path), "ply_sha256": manifest["initialization_ply"]["sha256"],
+            "point_count": len(pcd.points), "cache_fingerprint": calibration_fingerprint(identity),
+            "proof_path": str(Path(initialization_manifest).resolve()), "proof_sha256": manifest_sha256,
+            "identity": identity,
+        }
+        # The preserved producer proof is the source of sampling/color provenance.
+        if validate_mesh_manifest(initialization_ply, initialization_manifest, str(Path(path).resolve()),
+                                  [camera.colmap_image_name for camera in train])[1] != manifest_sha256:
+            raise RuntimeError("Mesh initialization source changed while loading")
+    else:
+        if not any(record["depth_sha256"] for record in train_assets.values()):
+            raise ValueError("No training camera has aligned NPY depth; refusing sparse/full-capture initialization fallback")
+        algorithm = "rgbd_colmap_half_integer_float32_v3"
+        operator_sha256 = _sha256_file(generate_ply_from_rgbd.__code__.co_filename)
+        identity = {"algorithm": algorithm, "operator_sha256": operator_sha256,
+                    "train_assets": train_assets,
+                    "calibrations": {name: calibrations[name] for name in train_assets},
+                    "parameters": {"num_points": 200000, "voxel_length": 0.02, "sdf_trunc": 0.06, "depth_min": 0.05, "depth_max": 50.0}}
+        init_fingerprint = calibration_fingerprint(identity)
+        cache = Path(init_cache_dir)
+        cache.mkdir(parents=True, exist_ok=True)
+        ply_path = cache / f"rgbd_init_train_{init_fingerprint[:16]}.ply"
+        metadata_path = ply_path.with_suffix(".ply.json")
+        with ply_path.with_suffix(".lock").open("a+") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            if ply_path.exists() != metadata_path.exists():
+                raise ValueError(f"Incomplete RGBD cache/proof pair: {ply_path}")
+            if not ply_path.exists():
+                temporary = None
+                try:
+                    with tempfile.NamedTemporaryFile(dir=cache, suffix=".ply", delete=False) as stream:
+                        temporary = Path(stream.name)
+                    generate_ply_from_rgbd(train, num_points=200000, ply_path=str(temporary), cam_intrinsics=cam_intrinsics,
+                                          source_path=path, pixel_center_convention="colmap_half_integer")
+                    pcd = fetchOpen3DPly(str(temporary))
+                    if not len(pcd.points) or not np.isfinite(pcd.points).all() or not np.isfinite(pcd.colors).all():
+                        raise ValueError("RGBD initialization produced no finite colored points")
+                    for camera in infos:
+                        depth = Path(path) / "depth" / Path(camera.colmap_image_name).with_suffix(".npy")
+                        current = {"rgb_sha256": _sha256_file(camera.image_path), "depth_sha256": _sha256_file(depth) if depth.is_file() else None}
+                        if current != assets[camera.colmap_image_name]:
+                            raise RuntimeError("RGB/depth source changed during RGBD fusion")
+                    temporary.replace(ply_path)
+                    _write_record(metadata_path, {"schema_version": 1, "cache_fingerprint": init_fingerprint,
+                                                  "identity": identity, "ply_sha256": _sha256_file(ply_path),
+                                                  "point_count": len(pcd.points)})
+                finally:
+                    if temporary is not None:
+                        temporary.unlink(missing_ok=True)
+            metadata = json.loads(metadata_path.read_text())
+            if metadata.get("cache_fingerprint") != init_fingerprint or metadata.get("identity") != identity or metadata.get("ply_sha256") != _sha256_file(ply_path):
+                raise ValueError("RGBD cache/proof differs from the current training data/operator")
+            pcd = fetchOpen3DPly(str(ply_path))
+            if not len(pcd.points) or not np.isfinite(pcd.points).all() or not np.isfinite(pcd.colors).all():
+                raise ValueError("RGBD cache must contain finite, nonempty XYZ/RGB")
+            if metadata.get("point_count") != len(pcd.points):
+                raise ValueError("RGBD proof point count disagrees with its PLY")
+        initialization = {"kind": "train_only_rgbd", "algorithm": algorithm, "ply_path": str(ply_path.resolve()),
+                          "ply_sha256": metadata["ply_sha256"], "point_count": metadata["point_count"],
+                          "cache_fingerprint": init_fingerprint, "proof_path": str(metadata_path.resolve())}
     # Recheck content after fusion: mutable source files cannot earn a proof.
     for camera in infos:
         depth = Path(path) / "depth" / Path(camera.colmap_image_name).with_suffix(".npy")
@@ -318,11 +376,9 @@ def readColmapSceneInfo(path, images, eval, llffhold=8, use_rgbd_init_ply=True,
         "dataset_content_fingerprint": calibration_fingerprint(assets),
         "train_camera_fingerprint": training_camera_fingerprint(train),
         "train_image_names": [camera.colmap_image_name for camera in train], "test_image_names": [camera.colmap_image_name for camera in test],
-        "initialization": {"kind": "train_only_rgbd", "algorithm": algorithm, "ply_path": str(ply_path.resolve()),
-                           "ply_sha256": metadata["ply_sha256"], "point_count": metadata["point_count"],
-                           "cache_fingerprint": init_fingerprint, "proof_path": str(metadata_path.resolve())},
+        "initialization": initialization,
         "pixel_center_convention": "colmap_half_integer",
-        "scope": "All input cameras are training views" if not test else "RGBD initialization, supervision and neighbors exclude validation cameras",
+        "scope": "All input cameras are training views" if not test else "Initialization and supervision membership are explicit; neighbors exclude validation cameras",
     }
     _write_record(cache / "camera_split.json", split_record)
     return SceneInfo(point_cloud=pcd, train_cameras=train, test_cameras=test,
