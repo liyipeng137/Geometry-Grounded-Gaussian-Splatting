@@ -40,6 +40,7 @@ from scene.cameras import Camera, FramePayloadCache
 from scene.pseudo_views import accumulate_pseudo_densification, load_pseudo_manifest, make_pseudo_cameras, pseudo_depth_l1, pseudo_rgb_l1, ramp_weight, screen_gradient_statistics
 from scene.train_split import CHECKPOINT_STATE_KEY, checkpoint_training_state, read_checkpoint_split, validate_checkpoint_split, validate_initialization_proof
 from scene.training_sampling import CameraSamplingSchedule
+from scene.real_depth_completion import RealDepthCompletion
 from utils.general_utils import safe_state
 from utils.graphics_utils import depth_to_normal
 from utils.image_utils import psnr
@@ -309,6 +310,12 @@ def training(
 
     trainCameras = scene.getTrainCameras().copy()
     camera_schedule = CameraSamplingSchedule(trainCameras, getattr(execution_args, "training_seed", 0)) if reconstruction_recipe == "real_only" else None
+    completion_config = getattr(execution_args, "real_depth_completion_config", "")
+    depth_completion = RealDepthCompletion(
+        completion_config, trainCameras, recipe=reconstruction_recipe, checkpoint=checkpoint,
+    ) if completion_config else None
+    if depth_completion is not None and depth_completion.config["trigger_iteration"] >= opt.iterations:
+        raise ValueError("real depth completion must trigger before the final training iteration")
     pseudo_cameras = []
     if dataset.pseudo_manifest:
         if opt.pseudo_real_updates < 1 or opt.pseudo_from_iter < 0 or opt.pseudo_ramp_iters < 0:
@@ -417,6 +424,8 @@ def training(
         "late_prune_iterations": [],
         "late_prune_gaussian_counts": [],
     }
+    if depth_completion is not None:
+        training_stats["real_depth_completion"] = depth_completion.record
 
     def count_main_step(optimizer, step_args, step_kwargs):
         training_stats["actual_main_optimizer_steps"] += 1
@@ -513,10 +522,13 @@ def training(
             lambda_normal_prior_cur > 0
             and viewpoint_cam.normal_prior is not None
         )
+        real_depth_weight = opt.lambda_depth_prior * ramp_weight(iteration, opt.depth_prior_from_iter, opt.depth_prior_ramp_iters)
+        if depth_completion is not None:
+            real_depth_weight = depth_completion.weight_for(viewpoint_cam, iteration, real_depth_weight)
         depth_prior_kick_on = (
-            not is_pseudo and opt.lambda_depth_prior > 0
-            and iteration >= opt.depth_prior_from_iter
-            and viewpoint_cam.depth_prior is not None
+            not is_pseudo and (real_depth_weight > 0 if depth_completion is not None else (
+                opt.lambda_depth_prior > 0 and iteration >= opt.depth_prior_from_iter
+            )) and viewpoint_cam.depth_prior is not None
         )
         pseudo_depth_kick_on = is_pseudo and opt.pseudo_depth_weight > 0 and viewpoint_cam.pseudo_has_depth
         render_pkg = render(
@@ -653,7 +665,7 @@ def training(
             + opt.lambda_mask * mask_loss
             + opt.lambda_depth_normal * depth_normal_loss
             + lambda_normal_prior_cur * normal_prior_loss
-            + opt.lambda_depth_prior * ramp_weight(iteration, opt.depth_prior_from_iter, opt.depth_prior_ramp_iters) * depth_prior_loss
+            + real_depth_weight * depth_prior_loss
             + lambda_multi_view_ncc_cur * ncc_loss
             + opt.lambda_multi_view_geo * geo_loss
         )
@@ -709,9 +721,11 @@ def training(
             if real_loss is not None:
                 record_source_losses(
                     training_stats, "real", rgb_loss, depth_prior_loss, 1.0,
-                    opt.lambda_depth_prior * ramp_weight(iteration, opt.depth_prior_from_iter, opt.depth_prior_ramp_iters),
+                    real_depth_weight,
                     real_loss,
                 )
+                if depth_completion is not None:
+                    depth_completion.record_loss(viewpoint_cam, iteration, depth_prior_loss, real_depth_weight)
             if pseudo_source is not None:
                 pseudo_total_loss = pseudo_weight * pseudo_l1_loss
                 if pseudo_depth_loss is not None:
@@ -896,6 +910,12 @@ def training(
             if iteration < opt.iterations:
                 gaussians.optimizer_step(iteration)
 
+            if depth_completion is not None:
+                depth_completion.maybe_run(
+                    iteration, training_stats["actual_main_optimizer_steps"], gaussians,
+                    render, pipe, background, kernel_size, frame_cache,
+                )
+
             if tb_writer and pseudo_cameras:
                 tb_writer.add_scalar("pseudo/rgb_weight", pseudo_weight, iteration)
                 tb_writer.add_scalar("pseudo/depth_weight", pseudo_depth_weight, iteration)
@@ -926,6 +946,8 @@ def training(
                     "rng_resume_policy": "Process seed reset; checkpoint RNG and camera/pseudo stack states are not restored",
                     "camera_split": json.loads(split_path.read_text()),
                 }
+                if depth_completion is not None:
+                    checkpoint_state["real_depth_completion"] = depth_completion.record
                 require_r2c_checkpoint_state(checkpoint_state, iteration, expected_recipe=reconstruction_recipe)
                 validate_initialization_proof(checkpoint_state["camera_split"])
                 captured = gaussians.capture()
@@ -1113,6 +1135,7 @@ if __name__ == "__main__":
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--training_seed", type=int, default=0)
     parser.add_argument("--reconstruction_recipe", choices=("r2c", "real_only"), default="r2c")
+    parser.add_argument("--real_depth_completion_config", type=str, default="")
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[30000])
     parser.add_argument("--start_checkpoint", type=str, default=None)
     args = parser.parse_args(sys.argv[1:])
