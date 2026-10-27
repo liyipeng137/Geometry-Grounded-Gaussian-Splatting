@@ -273,13 +273,16 @@ def readColmapSceneInfo(path, images, eval, llffhold=8, use_rgbd_init_ply=True,
             [camera.colmap_image_name for camera in train],
         )
         extension = "bin" if (model / "cameras.bin").is_file() and (model / "images.bin").is_file() else "txt"
-        expected_calibration_paths = {str((model / f"{name}.{extension}").resolve()) for name in ("cameras", "images")}
-        if set(manifest["calibration_sha256"]) != expected_calibration_paths:
-            raise ValueError("Mesh coloring calibration paths differ from the training dataset")
+        expected_calibration_hashes = {f"{name}.{extension}": _sha256_file(model / f"{name}.{extension}")
+                                       for name in ("cameras", "images")}
+        preserved_calibration_hashes = {Path(name).name: checksum
+                                        for name, checksum in manifest["calibration_sha256"].items()}
+        if preserved_calibration_hashes != expected_calibration_hashes:
+            raise ValueError("Mesh coloring calibration content differs from the training dataset")
         color_views = {view["name"]: view for view in manifest["views"]}
         for camera in train:
             view = color_views[camera.colmap_image_name]
-            if Path(view["image_path"]).resolve() != Path(camera.image_path).resolve() or view["image_sha256"] != train_assets[camera.colmap_image_name]["rgb_sha256"]:
+            if view["image_sha256"] != train_assets[camera.colmap_image_name]["rgb_sha256"]:
                 raise ValueError("Mesh coloring RGB differs from the current training camera")
         ply_path = Path(initialization_ply).resolve()
         # A Gaussian checkpoint or triangle mesh is never a point-cloud initializer.
@@ -306,6 +309,7 @@ def readColmapSceneInfo(path, images, eval, llffhold=8, use_rgbd_init_ply=True,
             "kind": "mesh_surface", "algorithm": MESH_INITIALIZATION_ALGORITHM,
             "ply_path": str(ply_path), "ply_sha256": manifest["initialization_ply"]["sha256"],
             "point_count": len(pcd.points), "cache_fingerprint": calibration_fingerprint(identity),
+            "sampling_dataset_root": manifest["dataset_root"],
             "proof_path": str(Path(initialization_manifest).resolve()), "proof_sha256": manifest_sha256,
             "identity": identity,
         }

@@ -4,6 +4,7 @@ import ast
 import json
 from pathlib import Path
 import random
+import shutil
 import sys
 import tempfile
 from types import SimpleNamespace
@@ -16,7 +17,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from scene.dataset_readers import readColmapSceneInfo
-from scene.mesh_initialization import sha256_file
+from scene.mesh_initialization import sha256_file, validate_mesh_manifest
 from scene.train_split import validate_checkpoint_split, validate_initialization_proof
 from scene.training_sampling import CameraSamplingSchedule
 
@@ -82,8 +83,9 @@ class MeshInitializationTests(unittest.TestCase):
             elements.append(PlyElement.describe(face, "face"))
         PlyData(elements, text=False).write(str(self.ply))
 
-    def read(self, cache="run"):
-        return readColmapSceneInfo(str(self.dataset), None, False, init_cache_dir=str(self.root / cache), **self.kwargs)
+    def read(self, cache="run", dataset=None):
+        return readColmapSceneInfo(str(dataset or self.dataset), None, False,
+                                  init_cache_dir=str(self.root / cache), **self.kwargs)
 
     def test_mesh_reader_and_same_source_resume_preserve_proof(self):
         scene = self.read()
@@ -118,16 +120,78 @@ class MeshInitializationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "manifest content changed"):
             validate_initialization_proof(proof)
 
-    def test_wrong_camera_membership_or_root_rejected(self):
+    def test_wrong_camera_membership_or_invalid_sampling_root_rejected(self):
         self.manifest["train_image_names"] = self.names[:1]
         self.write_manifest()
         with self.assertRaisesRegex(ValueError, "membership"):
             self.read()
         self.manifest["train_image_names"] = self.names
-        self.manifest["dataset_root"] = str(self.root)
+        self.manifest["dataset_root"] = "relative/dataset"
         self.write_manifest()
         with self.assertRaisesRegex(ValueError, "dataset root"):
             self.read()
+
+    def test_same_samples_rebind_to_copied_rgb_calibration_with_new_depth(self):
+        self.read("original")
+        original = json.loads((self.root / "original/camera_split.json").read_text())
+        preserved_manifest = self.manifest_path.read_bytes()
+        preserved_ply = self.ply.read_bytes()
+        copied = self.root / "mesh_depth_dataset"
+        shutil.copytree(self.dataset, copied)
+        for name in self.names:
+            np.save(copied / "depth" / Path(name).with_suffix(".npy"), np.full((6, 8), 3, np.float32))
+        self.read("new_depth", copied)
+        current = json.loads((self.root / "new_depth/camera_split.json").read_text())
+        validate_initialization_proof(current)
+        self.assertEqual(current["dataset_root"], str(copied))
+        self.assertEqual(current["initialization"]["sampling_dataset_root"], str(self.dataset))
+        self.assertEqual(current["initialization"]["ply_sha256"], original["initialization"]["ply_sha256"])
+        self.assertEqual(current["initialization"]["proof_sha256"], original["initialization"]["proof_sha256"])
+        self.assertEqual(current["calibration_fingerprint"], original["calibration_fingerprint"])
+        self.assertNotEqual(current["dataset_content_fingerprint"], original["dataset_content_fingerprint"])
+        self.assertNotEqual(current["initialization"]["cache_fingerprint"], original["initialization"]["cache_fingerprint"])
+        self.assertEqual(self.manifest_path.read_bytes(), preserved_manifest)
+        self.assertEqual(self.ply.read_bytes(), preserved_ply)
+        with self.assertRaisesRegex(ValueError, "dataset/calibration/split changed: dataset_content_fingerprint"):
+            validate_checkpoint_split(self.root / "checkpoint.pth", self.root / "new_depth", previous_record=original)
+        self.read("new_depth_resume", copied)
+        validate_checkpoint_split(self.root / "checkpoint.pth", self.root / "new_depth_resume", previous_record=current)
+
+    def test_different_active_rgb_rejected_even_when_original_sources_unchanged(self):
+        copied = self.root / "other_dataset"
+        shutil.copytree(self.dataset, copied)
+        Image.new("RGB", (8, 6), (1, 2, 3)).save(copied / "images" / self.names[0])
+        with self.assertRaisesRegex(ValueError, "current color RGB.*changed"):
+            self.read(dataset=copied)
+        self.assertEqual(sha256_file(self.dataset / "images" / self.names[0]),
+                         self.manifest["views"][0]["image_sha256"])
+
+    def test_different_active_intrinsics_or_poses_rejected(self):
+        copied = self.root / "other_dataset"
+        shutil.copytree(self.dataset, copied)
+        changes = {"cameras.txt": b"1 SIMPLE_PINHOLE 8 6 6 4 3\n",
+                   "images.txt": b"1 1 0 0 0 0 0 0 1 frame_000001.png\n\n2 1 0 0 0 .2 0 0 1 frame_000002.png\n\n"}
+        for filename, changed in changes.items():
+            with self.subTest(filename=filename):
+                path = copied / "sparse/0" / filename
+                original = path.read_bytes()
+                path.write_bytes(changed)
+                with self.assertRaisesRegex(ValueError, "current calibration.*changed"):
+                    validate_mesh_manifest(str(self.ply), str(self.manifest_path), str(copied), self.names)
+                path.write_bytes(original)
+
+    def test_rebinding_still_requires_preserved_color_and_calibration_sources(self):
+        copied = self.root / "other_dataset"
+        shutil.copytree(self.dataset, copied)
+        sources = ((self.dataset / "images" / self.names[0], "color RGB"),
+                   (self.dataset / "sparse/0/images.txt", "calibration"))
+        for path, label in sources:
+            with self.subTest(label=label):
+                original = path.read_bytes()
+                path.write_bytes(original + b"changed")
+                with self.assertRaisesRegex(ValueError, label + ".*changed"):
+                    validate_mesh_manifest(str(self.ply), str(self.manifest_path), str(copied), self.names)
+                path.write_bytes(original)
 
     def test_non_point_or_invalid_xyz_rgb_rejected(self):
         for invalid, expected in (("faces", "not a mesh"), ("gaussian", "Gaussian checkpoint"),
