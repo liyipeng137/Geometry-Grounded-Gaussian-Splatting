@@ -41,6 +41,7 @@ from scene.pseudo_views import accumulate_pseudo_densification, load_pseudo_mani
 from scene.train_split import CHECKPOINT_STATE_KEY, checkpoint_training_state, read_checkpoint_split, validate_checkpoint_split, validate_initialization_proof
 from scene.training_sampling import CameraSamplingSchedule
 from scene.real_depth_completion import RealDepthCompletion
+from scene.fixed_real_depth_priors import FixedRealDepthPriors, validate_fixed_prior_options
 from utils.general_utils import safe_state
 from utils.graphics_utils import depth_to_normal
 from utils.image_utils import psnr
@@ -255,6 +256,9 @@ def training(
     reconstruction_recipe = getattr(execution_args, "reconstruction_recipe", "r2c")
     if reconstruction_recipe not in ("r2c", "real_only"):
         raise ValueError("reconstruction_recipe must be r2c or real_only")
+    fixed_prior_config = getattr(execution_args, "real_depth_prior_config", "")
+    completion_config = getattr(execution_args, "real_depth_completion_config", "")
+    validate_fixed_prior_options(fixed_prior_config, completion_config, reconstruction_recipe, checkpoint)
     if reconstruction_recipe == "real_only" and dataset.pseudo_manifest:
         raise ValueError("real_only training does not accept a pseudo manifest")
     if reconstruction_recipe != "real_only" and getattr(dataset, "initialization_kind", "rgbd") != "rgbd":
@@ -310,12 +314,17 @@ def training(
 
     trainCameras = scene.getTrainCameras().copy()
     camera_schedule = CameraSamplingSchedule(trainCameras, getattr(execution_args, "training_seed", 0)) if reconstruction_recipe == "real_only" else None
-    completion_config = getattr(execution_args, "real_depth_completion_config", "")
     depth_completion = RealDepthCompletion(
         completion_config, trainCameras, recipe=reconstruction_recipe, checkpoint=checkpoint,
     ) if completion_config else None
     if depth_completion is not None and depth_completion.config["trigger_iteration"] >= opt.iterations:
         raise ValueError("real depth completion must trigger before the final training iteration")
+    fixed_depth_priors = FixedRealDepthPriors(
+        fixed_prior_config, trainCameras, recipe=reconstruction_recipe, checkpoint=checkpoint,
+        completion_config=completion_config,
+    ) if fixed_prior_config else None
+    if fixed_depth_priors is not None and fixed_depth_priors.config["from_iter"] >= opt.iterations:
+        raise ValueError("fixed real depth priors must activate before the final training iteration")
     pseudo_cameras = []
     if dataset.pseudo_manifest:
         if opt.pseudo_real_updates < 1 or opt.pseudo_from_iter < 0 or opt.pseudo_ramp_iters < 0:
@@ -426,6 +435,8 @@ def training(
     }
     if depth_completion is not None:
         training_stats["real_depth_completion"] = depth_completion.record
+    if fixed_depth_priors is not None:
+        training_stats["real_depth_prior"] = fixed_depth_priors.record
 
     def count_main_step(optimizer, step_args, step_kwargs):
         training_stats["actual_main_optimizer_steps"] += 1
@@ -525,8 +536,10 @@ def training(
         real_depth_weight = opt.lambda_depth_prior * ramp_weight(iteration, opt.depth_prior_from_iter, opt.depth_prior_ramp_iters)
         if depth_completion is not None:
             real_depth_weight = depth_completion.weight_for(viewpoint_cam, iteration, real_depth_weight)
+        if fixed_depth_priors is not None:
+            real_depth_weight = fixed_depth_priors.weight_for(viewpoint_cam, iteration, real_depth_weight)
         depth_prior_kick_on = (
-            not is_pseudo and (real_depth_weight > 0 if depth_completion is not None else (
+            not is_pseudo and (real_depth_weight > 0 if depth_completion is not None or fixed_depth_priors is not None else (
                 opt.lambda_depth_prior > 0 and iteration >= opt.depth_prior_from_iter
             )) and viewpoint_cam.depth_prior is not None
         )
@@ -726,6 +739,8 @@ def training(
                 )
                 if depth_completion is not None:
                     depth_completion.record_loss(viewpoint_cam, iteration, depth_prior_loss, real_depth_weight)
+                if fixed_depth_priors is not None:
+                    fixed_depth_priors.record_loss(viewpoint_cam, iteration, depth_prior_loss, real_depth_weight)
             if pseudo_source is not None:
                 pseudo_total_loss = pseudo_weight * pseudo_l1_loss
                 if pseudo_depth_loss is not None:
@@ -948,6 +963,8 @@ def training(
                 }
                 if depth_completion is not None:
                     checkpoint_state["real_depth_completion"] = depth_completion.record
+                if fixed_depth_priors is not None:
+                    checkpoint_state["real_depth_prior"] = fixed_depth_priors.record
                 require_r2c_checkpoint_state(checkpoint_state, iteration, expected_recipe=reconstruction_recipe)
                 validate_initialization_proof(checkpoint_state["camera_split"])
                 captured = gaussians.capture()
@@ -1136,6 +1153,7 @@ if __name__ == "__main__":
     parser.add_argument("--training_seed", type=int, default=0)
     parser.add_argument("--reconstruction_recipe", choices=("r2c", "real_only"), default="r2c")
     parser.add_argument("--real_depth_completion_config", type=str, default="")
+    parser.add_argument("--real_depth_prior_config", type=str, default="")
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[30000])
     parser.add_argument("--start_checkpoint", type=str, default=None)
     args = parser.parse_args(sys.argv[1:])
