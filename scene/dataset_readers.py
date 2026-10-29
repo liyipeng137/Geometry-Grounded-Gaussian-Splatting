@@ -37,6 +37,7 @@ from scene.colmap_loader import (
 from scene.gaussian_model import BasicPointCloud
 from scene.train_split import calibration_fingerprint, load_excluded_image_names, partition_cameras, training_camera_fingerprint
 from scene.mesh_initialization import MESH_INITIALIZATION_ALGORITHM, validate_mesh_manifest
+from scene.ffba_tsdf_initialization import FFBA_TSDF_INITIALIZATION_ALGORITHM, FFBA_TSDF_EVALUATION_SCOPE, validate_ffba_tsdf_manifest
 from utils.graphics_utils import focal2fov, fov2focal, getWorld2View2
 from utils.pd_utils import generate_ply_from_rgbd
 from utils.sh_utils import SH2RGB
@@ -231,8 +232,8 @@ def readColmapSceneInfo(path, images, eval, llffhold=8, use_rgbd_init_ply=True,
                        train_exclude_images="", init_cache_dir=None, initialization_kind="rgbd",
                        initialization_ply="", initialization_manifest=""):
     """Use explicit current-split RGBD or a content-bound mesh surface point cloud."""
-    if initialization_kind not in ("rgbd", "mesh_surface"):
-        raise ValueError("initialization_kind must be rgbd or mesh_surface")
+    if initialization_kind not in ("rgbd", "mesh_surface", "ffba_tsdf"):
+        raise ValueError("initialization_kind must be rgbd, mesh_surface or ffba_tsdf")
     if initialization_kind == "rgbd" and (initialization_ply or initialization_manifest):
         raise ValueError("RGBD initialization does not accept alternate PLY/manifest inputs")
     if not use_rgbd_init_ply:
@@ -267,7 +268,41 @@ def readColmapSceneInfo(path, images, eval, llffhold=8, use_rgbd_init_ply=True,
     train_assets = {camera.colmap_image_name: assets[camera.colmap_image_name] for camera in train}
     cache = Path(init_cache_dir)
     cache.mkdir(parents=True, exist_ok=True)
-    if initialization_kind == "mesh_surface":
+    if initialization_kind == "ffba_tsdf":
+        manifest, manifest_sha256 = validate_ffba_tsdf_manifest(
+            initialization_ply, initialization_manifest, str(Path(path).resolve()),
+            [camera.colmap_image_name for camera in train],
+            [camera.colmap_image_name for camera in infos],
+        )
+        ply_path = Path(initialization_ply).resolve()
+        pcd = fetchOpen3DPly(str(ply_path))
+        if (not len(pcd.points) or not np.isfinite(pcd.points).all() or
+                not np.isfinite(pcd.colors).all() or np.any(pcd.colors < 0) or np.any(pcd.colors > 1)):
+            raise ValueError("FFBA TSDF initialization requires finite nonempty XYZ and RGB in [0,1]")
+        if len(pcd.points) != manifest["initialization_ply"]["point_count"]:
+            raise ValueError("FFBA TSDF manifest point count disagrees with its loaded PLY")
+        identity = {
+            "algorithm": FFBA_TSDF_INITIALIZATION_ALGORITHM, "manifest_sha256": manifest_sha256,
+            "train_camera_fingerprint": training_camera_fingerprint(train),
+            "calibration_fingerprint": calibration_fingerprint(calibrations),
+            "dataset_content_fingerprint": calibration_fingerprint(assets),
+        }
+        initialization = {
+            "kind": "ffba_tsdf", "algorithm": FFBA_TSDF_INITIALIZATION_ALGORITHM,
+            "ply_path": str(ply_path), "ply_sha256": manifest["initialization_ply"]["sha256"],
+            "point_count": len(pcd.points), "cache_fingerprint": calibration_fingerprint(identity),
+            "proof_path": str(Path(initialization_manifest).resolve()), "proof_sha256": manifest_sha256,
+            "initialization_scope": "full_capture", "evaluation_scope": FFBA_TSDF_EVALUATION_SCOPE,
+            "geometry_selection": "vertices_only",
+            "source_dataset_root": manifest["dataset_root"], "identity": identity,
+        }
+        if validate_ffba_tsdf_manifest(
+            initialization_ply, initialization_manifest, str(Path(path).resolve()),
+            [camera.colmap_image_name for camera in train],
+            [camera.colmap_image_name for camera in infos],
+        )[1] != manifest_sha256:
+            raise RuntimeError("FFBA TSDF initialization source changed while loading")
+    elif initialization_kind == "mesh_surface":
         manifest, manifest_sha256 = validate_mesh_manifest(
             initialization_ply, initialization_manifest, str(Path(path).resolve()),
             [camera.colmap_image_name for camera in train],
@@ -384,6 +419,10 @@ def readColmapSceneInfo(path, images, eval, llffhold=8, use_rgbd_init_ply=True,
         "pixel_center_convention": "colmap_half_integer",
         "scope": "All input cameras are training views" if not test else "Initialization and supervision membership are explicit; neighbors exclude validation cameras",
     }
+    if initialization_kind == "ffba_tsdf":
+        split_record["evaluation_scope"] = FFBA_TSDF_EVALUATION_SCOPE
+        split_record["scope"] = ("Unchanged FFBA full-capture TSDF initialization; source capture may include "
+                                 "evaluation images. Metrics are fitting diagnostics, not independent heldout accuracy.")
     _write_record(cache / "camera_split.json", split_record)
     return SceneInfo(point_cloud=pcd, train_cameras=train, test_cameras=test,
                      nerf_normalization=getNerfppNorm(train), ply_path=str(ply_path))

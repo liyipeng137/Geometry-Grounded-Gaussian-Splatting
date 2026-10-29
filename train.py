@@ -42,6 +42,7 @@ from scene.train_split import CHECKPOINT_STATE_KEY, checkpoint_training_state, r
 from scene.training_sampling import CameraSamplingSchedule
 from scene.real_depth_completion import RealDepthCompletion
 from scene.fixed_real_depth_priors import FixedRealDepthPriors, validate_fixed_prior_options
+from scene.virtual_geometry_priors import VirtualGeometryPriors, virtual_depth_loss
 from utils.general_utils import safe_state
 from utils.graphics_utils import depth_to_normal
 from utils.image_utils import psnr
@@ -77,13 +78,44 @@ def record_source_losses(training_stats, source, rgb_loss, depth_loss, rgb_weigh
         record[field + "_mean"] = record[field + "_sum"] / record["samples"]
 
 
+def normal_prior_image_names(cameras):
+    """Inspect resident or lazy CPU masks without promoting the full dataset."""
+    names = []
+    for camera in cameras:
+        if not camera.has_normal_prior:
+            continue
+        mask = camera.normal_prior_mask
+        if mask is None:
+            mask = getattr(camera, "normal_prior_mask_cpu", None)
+        if mask is not None and mask.any().item():
+            names.append(camera.source_image_name)
+    return sorted(names)
+
+
+def record_normal_prior_update(record, image_name, loss, weight, valid_pixels, has_depth_prior):
+    """Account for effective normal supervision on actual optimizer updates."""
+    value = float(loss.detach().item())
+    by_image = record["by_image"].setdefault(image_name, {
+        "loss_updates": 0, "loss_sum": 0.0, "weighted_loss_sum": 0.0,
+        "valid_pixels_sum": 0, "without_depth_updates": 0,
+    })
+    for current in (record, by_image):
+        current["loss_updates"] += 1
+        current["loss_sum"] += value
+        current["weighted_loss_sum"] += value * weight
+        current["valid_pixels_sum"] += valid_pixels
+        current["without_depth_updates"] += int(not has_depth_prior)
+        current["loss_mean"] = current["loss_sum"] / current["loss_updates"]
+        current["weighted_loss_mean"] = current["weighted_loss_sum"] / current["loss_updates"]
+
+
 def require_r2c_checkpoint_state(state, iteration, expected_recipe=None):
     if not isinstance(state, dict) or state.get("schema_version") != 1 or state.get("recipe") not in ("r2c", "real_only") or state.get("iteration") != iteration:
         raise ValueError("Resume requires an embedded formal recipe checkpoint at its recorded iteration")
     if expected_recipe is not None and state["recipe"] != expected_recipe:
         raise ValueError("Checkpoint recipe differs from the requested training recipe")
     split = state.get("camera_split")
-    accepted = ("train_only_rgbd",) if state["recipe"] == "r2c" else ("train_only_rgbd", "mesh_surface")
+    accepted = ("train_only_rgbd",) if state["recipe"] == "r2c" else ("train_only_rgbd", "mesh_surface", "ffba_tsdf")
     if not isinstance(split, dict) or split.get("initialization", {}).get("kind") not in accepted:
         raise ValueError("Formal checkpoint initialization must match its recipe")
     return state
@@ -258,11 +290,20 @@ def training(
         raise ValueError("reconstruction_recipe must be r2c or real_only")
     fixed_prior_config = getattr(execution_args, "real_depth_prior_config", "")
     completion_config = getattr(execution_args, "real_depth_completion_config", "")
+    virtual_geometry_config = getattr(execution_args, "virtual_geometry_config", "")
+    if virtual_geometry_config and not opt.dense_optimizer_updates:
+        raise ValueError("Virtual geometry currently requires dense_optimizer_updates so its schedule counts real optimizer updates")
     validate_fixed_prior_options(fixed_prior_config, completion_config, reconstruction_recipe, checkpoint)
     if reconstruction_recipe == "real_only" and dataset.pseudo_manifest:
         raise ValueError("real_only training does not accept a pseudo manifest")
     if reconstruction_recipe != "real_only" and getattr(dataset, "initialization_kind", "rgbd") != "rgbd":
-        raise ValueError("Alternate mesh initialization requires the explicit real_only recipe")
+        raise ValueError("Alternate initialization requires the explicit real_only recipe")
+    if not math.isfinite(opt.lambda_normal_prior) or opt.lambda_normal_prior < 0:
+        raise ValueError("lambda_normal_prior must be finite and nonnegative")
+    if opt.normal_prior_from_iter < 0:
+        raise ValueError("normal_prior_from_iter must be nonnegative")
+    if opt.lambda_normal_prior > 0 and opt.normal_prior_from_iter >= opt.iterations:
+        raise ValueError("normal prior must activate before the final training iteration")
     if opt.opacity_reset_min_remaining < 0:
         raise ValueError("opacity_reset_min_remaining must be nonnegative")
     if opt.real_depth_loss_mode not in ("absolute", "relative_charbonnier"):
@@ -291,6 +332,8 @@ def training(
     if checkpoint:
         require_r2c_checkpoint_state(embedded_checkpoint_state, first_iter, expected_recipe=reconstruction_recipe)
         checkpoint_split_record = read_checkpoint_split(checkpoint, embedded_state=embedded_checkpoint_state)
+        if bool(virtual_geometry_config) != bool(embedded_checkpoint_state.get("virtual_geometry")):
+            raise ValueError("Checkpoint virtual geometry supervision must be resumed with its original config")
     tb_writer = prepare_output_and_logger(dataset, opt, pipe, execution_args)
     gaussians = GaussianModel(dataset.sh_degree, dataset.sg_degree)
     scene = Scene(dataset, gaussians)
@@ -325,6 +368,24 @@ def training(
     ) if fixed_prior_config else None
     if fixed_depth_priors is not None and fixed_depth_priors.config["from_iter"] >= opt.iterations:
         raise ValueError("fixed real depth priors must activate before the final training iteration")
+    virtual_geometry = VirtualGeometryPriors(
+        virtual_geometry_config, recipe=reconstruction_recipe,
+        checkpoint_state=embedded_checkpoint_state.get("virtual_geometry") if embedded_checkpoint_state else None,
+        real_camera_count=len(trainCameras),
+    ) if virtual_geometry_config else None
+    if virtual_geometry is not None:
+        if virtual_geometry.config["from_iter"] >= opt.iterations:
+            raise ValueError("Virtual geometry must activate before the final training iteration")
+        virtual_geometry.write_snapshot(dataset.model_path)
+        print(f"[VirtualGeometry] Loaded {len(virtual_geometry.views)} depth-only cameras in {len(virtual_geometry.groups)} target groups")
+
+        def probe_virtual_geometry(view):
+            # Probes rank offline-approved candidates; they are not loss updates
+            # and never change fixed masks or their offline confidence weights.
+            with torch.no_grad():
+                camera, target, mask = virtual_geometry.payload(view)
+                package = render(camera, gaussians, pipe, background, kernel_size, require_depth=True)
+                return virtual_geometry.probe_feedback(view, package["median_depth"], target, mask)
     pseudo_cameras = []
     if dataset.pseudo_manifest:
         if opt.pseudo_real_updates < 1 or opt.pseudo_from_iter < 0 or opt.pseudo_ramp_iters < 0:
@@ -375,7 +436,10 @@ def training(
     else:
         normal_root = os.path.join(dataset.source_path, dataset.normal_prior_dir)
     has_normal_dir = os.path.isdir(normal_root)
-    has_loaded_normal_prior = any(cam.has_normal_prior for cam in scene.getTrainCameras())
+    normal_prior_names = normal_prior_image_names(trainCameras)
+    has_loaded_normal_prior = bool(normal_prior_names)
+    if opt.lambda_normal_prior > 0 and not has_loaded_normal_prior:
+        raise ValueError("Enabled normal prior requires at least one training camera with valid normal pixels")
     if has_normal_dir and not has_loaded_normal_prior:
         print("[Pipeline][Warn] normals directory exists but no valid normal priors were loaded.")
     print(f"[Pipeline] has_normal_dir={has_normal_dir} (normal_dir={normal_root}, loaded_priors={has_loaded_normal_prior})")
@@ -415,6 +479,14 @@ def training(
         "opacity_reset_skipped_iterations": [],
         "opacity_restore": getattr(gaussians, "opacity_restore_report", None),
         "loss_by_source": {},
+        "normal_prior": {
+            "weight": opt.lambda_normal_prior, "from_iter": opt.normal_prior_from_iter,
+            "camera_count": len(normal_prior_names), "image_names": normal_prior_names,
+            "loss_updates": 0, "loss_sum": 0.0, "weighted_loss_sum": 0.0,
+            "valid_pixels_sum": 0, "without_depth_updates": 0, "by_image": {},
+            "loss_definition": "Mean of (1-clamp(cos(render_normal,prior),-1,1)) + (1-clamp(cos(depth_normal,prior),-1,1)) over valid prior/depth-normal pixels; signed camera-facing normals",
+            "scope": "Actual optimizer-update iterations only; missing depth priors do not disable normal supervision",
+        },
         "real_depth_loss_mode": opt.real_depth_loss_mode,
         "real_depth_relative_epsilon": opt.real_depth_relative_epsilon,
         "real_depth_relative_floor": opt.real_depth_relative_floor,
@@ -437,9 +509,13 @@ def training(
         training_stats["real_depth_completion"] = depth_completion.record
     if fixed_depth_priors is not None:
         training_stats["real_depth_prior"] = fixed_depth_priors.record
+    if virtual_geometry is not None:
+        training_stats["virtual_geometry"] = virtual_geometry.record
 
     def count_main_step(optimizer, step_args, step_kwargs):
         training_stats["actual_main_optimizer_steps"] += 1
+        if virtual_geometry is not None:
+            virtual_geometry.record_optimizer_step()
 
     def count_sh_step(optimizer, step_args, step_kwargs):
         training_stats["actual_sh_optimizer_steps"] += 1
@@ -524,13 +600,11 @@ def training(
 
         
         lambda_multi_view_ncc_cur = 0.02
-        lambda_normal_prior_cur = 0.0
+        lambda_normal_prior_cur = opt.lambda_normal_prior if iteration >= opt.normal_prior_from_iter else 0.0
 
         reg_kick_on = not is_pseudo and iteration >= opt.regularization_from_iter
         normal_prior_kick_on = (
-            not is_pseudo and (reflective_case or scene_case)
-            and
-            lambda_normal_prior_cur > 0
+            not is_pseudo and lambda_normal_prior_cur > 0
             and viewpoint_cam.normal_prior is not None
         )
         real_depth_weight = opt.lambda_depth_prior * ramp_weight(iteration, opt.depth_prior_from_iter, opt.depth_prior_ramp_iters)
@@ -606,7 +680,8 @@ def training(
             valid_points = None
             depth_normal_loss = torch.tensor([0], dtype=torch.float32, device="cuda")
 
-        # normal prior loss
+        # Normal supervision depends on its own prior, independently of depth-prior availability.
+        normal_prior_valid_pixels = 0
         if normal_prior_kick_on:
             rend_alpha = render_pkg["mask"]
             rendered_normal_prior = render_pkg["normal"]
@@ -617,12 +692,13 @@ def training(
                 prior_mask = prior_mask & valid_points.squeeze()
 
             if prior_mask.any().item():
+                normal_prior_valid_pixels = int(prior_mask.sum().item())
                 prior_cos = F.cosine_similarity(rendered_normal_prior, prior_normal_eff, dim=0)
-                prior_error_render = 1.0 - torch.abs(prior_cos)
+                prior_error_render = 1.0 - prior_cos.clamp(-1.0, 1.0)
 
                 if depth_normal is not None:
                     prior_cos_depth = F.cosine_similarity(depth_normal, prior_normal_eff, dim=0)
-                    prior_error_depth = 1.0 - torch.abs(prior_cos_depth)
+                    prior_error_depth = 1.0 - prior_cos_depth.clamp(-1.0, 1.0)
                 else:
                     prior_error_depth = torch.zeros_like(prior_error_render)
 
@@ -711,11 +787,33 @@ def training(
                 )
                 loss = loss + pseudo_depth_weight * pseudo_depth_loss
             training_stats["pseudo_samples"] += 1
+        # An additive geometry-only render shares this optimizer update with the
+        # original real-camera objective. It never replaces a real RGB sample or
+        # enters NCC/normal matching or virtual screen-gradient densification.
+        virtual_render_pkg = None
+        if virtual_geometry is not None and iteration < opt.iterations and not is_pseudo:
+            virtual_geometry.maybe_update_schedule(iteration, probe_virtual_geometry)
+        if virtual_geometry is not None and iteration < opt.iterations and not is_pseudo and virtual_geometry.due(iteration, training_stats["real_samples"]):
+            virtual_view, virtual_camera, virtual_target, virtual_mask = virtual_geometry.draw()
+            virtual_render_pkg = render(virtual_camera, gaussians, pipe, background, kernel_size, require_depth=True)
+            virtual_loss = virtual_geometry.depth_loss_for(virtual_view, virtual_render_pkg["median_depth"], virtual_target, virtual_mask)
+            virtual_weight = virtual_geometry.weight_for(virtual_view, iteration)
+            weighted_virtual_loss = virtual_weight * virtual_loss
+            virtual_geometry.diagnose_gradients(weighted_virtual_loss, gaussians, iteration)
+            loss = loss + weighted_virtual_loss
         loss.backward()
 
         iter_end.record()
 
         with torch.no_grad():
+            if virtual_render_pkg is not None:
+                virtual_geometry.record_loss(
+                    virtual_view, virtual_render_pkg["median_depth"], virtual_mask,
+                    virtual_loss, virtual_weight, iteration, will_update=iteration < opt.iterations,
+                )
+                if tb_writer:
+                    tb_writer.add_scalar("virtual_geometry/depth_loss", virtual_loss.item(), iteration)
+                    tb_writer.add_scalar("virtual_geometry/weight", virtual_weight, iteration)
             if opt.pseudo_gradient_diagnostics_interval and (
                 iteration % opt.pseudo_gradient_diagnostics_interval == 0
                 or (pseudo_render_pkg is not None and training_stats["pseudo_samples"] % opt.pseudo_gradient_diagnostics_interval == 1)
@@ -732,6 +830,12 @@ def training(
                 diagnostic["scope"] = "Screen-space gradients are separate render branches; parameter gradients are merged real+pseudo, not causal source attribution."
                 training_stats["gradient_diagnostics"].append(diagnostic)
             if real_loss is not None:
+                if normal_prior_valid_pixels and iteration < opt.iterations:
+                    record_normal_prior_update(
+                        training_stats["normal_prior"], viewpoint_cam.source_image_name,
+                        normal_prior_loss, lambda_normal_prior_cur, normal_prior_valid_pixels,
+                        has_depth_prior=viewpoint_cam.depth_prior is not None,
+                    )
                 record_source_losses(
                     training_stats, "real", rgb_loss, depth_prior_loss, 1.0,
                     real_depth_weight,
@@ -793,10 +897,6 @@ def training(
                 (pipe, background, kernel_size),
                 frame_cache,
             )
-            if iteration in saving_iterations:
-                print("\n[ITER {}] Saving Gaussians".format(iteration))
-                scene.save(iteration)
-
             # Densification
             if iteration < opt.densify_until_iter:
                 # Keep track of max radii in image-space for pruning
@@ -925,6 +1025,11 @@ def training(
             if iteration < opt.iterations:
                 gaussians.optimizer_step(iteration)
 
+            # PLY and same-iteration checkpoint describe the same updated model.
+            if iteration in saving_iterations:
+                print("\n[ITER {}] Saving Gaussians".format(iteration))
+                scene.save(iteration)
+
             if depth_completion is not None:
                 depth_completion.maybe_run(
                     iteration, training_stats["actual_main_optimizer_steps"], gaussians,
@@ -965,6 +1070,8 @@ def training(
                     checkpoint_state["real_depth_completion"] = depth_completion.record
                 if fixed_depth_priors is not None:
                     checkpoint_state["real_depth_prior"] = fixed_depth_priors.record
+                if virtual_geometry is not None:
+                    checkpoint_state["virtual_geometry"] = virtual_geometry.checkpoint_state()
                 require_r2c_checkpoint_state(checkpoint_state, iteration, expected_recipe=reconstruction_recipe)
                 validate_initialization_proof(checkpoint_state["camera_split"])
                 captured = gaussians.capture()
@@ -1011,7 +1118,7 @@ def prepare_output_and_logger(args, opt=None, pipe=None, execution_args=None):
         "lambda_dssim": opt.lambda_dssim,
         "lambda_mask": opt.lambda_mask,
         "lambda_depth_normal": opt.lambda_depth_normal,
-        "lambda_normal_prior": 0.0,
+        "lambda_normal_prior": opt.lambda_normal_prior,
         "lambda_depth_prior_max": opt.lambda_depth_prior,
         "lambda_multi_view_ncc": 0.02,
         "lambda_multi_view_geo": opt.lambda_multi_view_geo,
@@ -1022,6 +1129,13 @@ def prepare_output_and_logger(args, opt=None, pipe=None, execution_args=None):
     with open(os.path.join(args.model_path, "training_config.json"), "w") as config_file:
         json.dump({
             **config_groups, "resolved_args": resolved_args, "effective_loss_weights": effective_loss_weights,
+            "effective_normal_prior": {
+                "weight": opt.lambda_normal_prior,
+                "from_iter": opt.normal_prior_from_iter,
+                "loss": "signed 1-clamp(cos,-1,1), summed render-normal and depth-derived-normal branches",
+                "decoding": "unit(-decoded RGB normal); loader applies the global sign conversion once",
+                "missing_depth_prior": "normal supervision remains active on valid rendered-depth/normal pixels",
+            } if opt is not None else {},
             "effective_real_depth_loss": {
                 "mode": opt.real_depth_loss_mode,
                 "relative_epsilon": opt.real_depth_relative_epsilon,
@@ -1154,6 +1268,7 @@ if __name__ == "__main__":
     parser.add_argument("--reconstruction_recipe", choices=("r2c", "real_only"), default="r2c")
     parser.add_argument("--real_depth_completion_config", type=str, default="")
     parser.add_argument("--real_depth_prior_config", type=str, default="")
+    parser.add_argument("--virtual_geometry_config", type=str, default="")
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[30000])
     parser.add_argument("--start_checkpoint", type=str, default=None)
     args = parser.parse_args(sys.argv[1:])

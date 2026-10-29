@@ -90,8 +90,8 @@ def validate_initialization_proof(record):
     _validate_calibration_proof(record)
     initialization = record.get("initialization", {})
     kind = initialization.get("kind")
-    if kind not in ("train_only_rgbd", "mesh_surface"):
-        raise ValueError("Checkpoint initialization must use explicit RGBD or mesh_surface provenance")
+    if kind not in ("train_only_rgbd", "mesh_surface", "ffba_tsdf"):
+        raise ValueError("Checkpoint initialization must use explicit RGBD, mesh_surface or ffba_tsdf provenance")
     if kind == "train_only_rgbd" and initialization.get("algorithm") != RGBD_INITIALIZATION_ALGORITHM:
         raise ValueError("Checkpoint initialization must use current-split float32 RGBD v3")
     path = initialization.get("ply_path")
@@ -102,6 +102,34 @@ def validate_initialization_proof(record):
     count = initialization.get("point_count")
     if isinstance(count, bool) or not isinstance(count, int) or count < 1:
         raise ValueError("Checkpoint initialization must contain a positive point count")
+    if kind == "ffba_tsdf":
+        from scene.ffba_tsdf_initialization import (
+            FFBA_TSDF_INITIALIZATION_ALGORITHM, FFBA_TSDF_EVALUATION_SCOPE, validate_ffba_tsdf_manifest,
+        )
+        if initialization.get("algorithm") != FFBA_TSDF_INITIALIZATION_ALGORITHM:
+            raise ValueError("Checkpoint FFBA TSDF initialization algorithm changed")
+        if (initialization.get("initialization_scope") != "full_capture" or
+                initialization.get("geometry_selection") != "vertices_only" or
+                initialization.get("evaluation_scope") != FFBA_TSDF_EVALUATION_SCOPE or
+                record.get("evaluation_scope") != FFBA_TSDF_EVALUATION_SCOPE):
+            raise ValueError("Checkpoint must preserve FFBA full-capture evaluation scope")
+        manifest, proof_sha256 = validate_ffba_tsdf_manifest(
+            initialization["ply_path"], initialization.get("proof_path"), record["dataset_root"],
+            record["train_image_names"], record["train_image_names"] + record["test_image_names"],
+        )
+        if (initialization.get("proof_sha256") != proof_sha256 or
+                manifest["initialization_ply"]["sha256"] != initialization["ply_sha256"] or
+                manifest["initialization_ply"]["point_count"] != count or
+                initialization.get("source_dataset_root") != manifest["dataset_root"]):
+            raise ValueError("Checkpoint FFBA TSDF initialization source identity changed")
+        identity = {
+            "algorithm": FFBA_TSDF_INITIALIZATION_ALGORITHM, "manifest_sha256": proof_sha256,
+            "train_camera_fingerprint": record["train_camera_fingerprint"],
+            "calibration_fingerprint": record["calibration_fingerprint"],
+            "dataset_content_fingerprint": record["dataset_content_fingerprint"],
+        }
+        if initialization.get("identity") != identity or calibration_fingerprint(identity) != initialization["cache_fingerprint"]:
+            raise ValueError("Checkpoint FFBA TSDF initialization is not bound to its dataset/calibration")
     if kind == "mesh_surface":
         from scene.mesh_initialization import MESH_INITIALIZATION_ALGORITHM, validate_mesh_manifest
         if initialization.get("algorithm") != MESH_INITIALIZATION_ALGORITHM:

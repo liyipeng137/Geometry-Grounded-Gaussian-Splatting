@@ -81,7 +81,7 @@ def smooth_mesh(mesh, iterations=0, lambda_filter=0.5, mu=-0.53):
 
 
 class MinimalMeshCamera:
-    def __init__(self, colmap_id, R, T, FoVx, FoVy, image_name, uid, image_width, image_height, gt_mask=None):
+    def __init__(self, colmap_id, R, T, FoVx, FoVy, image_name, uid, image_width, image_height, gt_mask=None, K=None, device="cuda"):
         self.uid = uid
         self.colmap_id = colmap_id
         self.image_name = image_name
@@ -90,12 +90,25 @@ class MinimalMeshCamera:
         self.image_width = int(image_width)
         self.image_height = int(image_height)
 
-        self.R = torch.tensor(R, dtype=torch.float32, device="cuda")
-        self.T = torch.tensor(T, dtype=torch.float32, device="cuda")
-        self.Fx = self.image_width / (2 * math.tan(self.FoVx / 2.0))
-        self.Fy = self.image_height / (2 * math.tan(self.FoVy / 2.0))
-        self.Cx = float(self.image_width - 1) / 2.0
-        self.Cy = float(self.image_height - 1) / 2.0
+        self.R = torch.tensor(R, dtype=torch.float32, device=device)
+        self.T = torch.tensor(T, dtype=torch.float32, device=device)
+        if K is None:
+            K = np.array([
+                [self.image_width / (2 * math.tan(self.FoVx / 2.0)), 0, self.image_width / 2.0],
+                [0, self.image_height / (2 * math.tan(self.FoVy / 2.0)), self.image_height / 2.0],
+                [0, 0, 1],
+            ])
+        K = np.asarray(K, dtype=np.float64)
+        if K.shape != (3, 3) or not np.isfinite(K).all() or min(K[0, 0], K[1, 1]) <= 0:
+            raise ValueError("Mesh camera K must be finite with positive focal lengths")
+        if not np.allclose(K[2], [0, 0, 1]) or K[0, 1] != 0 or K[1, 0] != 0:
+            raise ValueError("Mesh camera K must be an undistorted pinhole camera without skew")
+        self.source_K_colmap = K.copy()
+        self.pixel_center_convention = "colmap_half_integer"
+        self.Fx, self.Fy = float(K[0, 0]), float(K[1, 1])
+        self.Cx, self.Cy = float(K[0, 2]) - 0.5, float(K[1, 2]) - 0.5
+        self.FoVx = 2 * math.atan(self.image_width / (2 * self.Fx))
+        self.FoVy = 2 * math.atan(self.image_height / (2 * self.Fy))
 
         self.gt_mask = gt_mask
         self._gt_mask_cuda = None
@@ -103,10 +116,14 @@ class MinimalMeshCamera:
         self.zfar = 100.0
         self.znear = 0.01
         w2c = getWorld2View2(R, T, np.array([0.0, 0.0, 0.0]), 1.0)
-        self.world_view_transform = torch.tensor(w2c, dtype=torch.float32, device="cuda").transpose(0, 1)
-        self.projection_matrix = getProjectionMatrix(
+        self.world_view_transform = torch.tensor(w2c, dtype=torch.float32, device=device).transpose(0, 1)
+        projection = getProjectionMatrix(
             znear=self.znear, zfar=self.zfar, fovX=self.FoVx, fovY=self.FoVy
-        ).transpose(0, 1).to("cuda")
+        )
+        # COLMAP principal points refer to half-integer pixel centers, as in training.
+        projection[0, 2] = 2 * K[0, 2] / self.image_width - 1
+        projection[1, 2] = 2 * K[1, 2] / self.image_height - 1
+        self.projection_matrix = projection.transpose(0, 1).to(device)
         self.full_proj_transform = (
             self.world_view_transform.unsqueeze(0).bmm(self.projection_matrix.unsqueeze(0))
         ).squeeze(0)
@@ -182,6 +199,12 @@ def load_mesh_cameras_from_colmap(dataset: ModelParams, load_gt_mask=True, llffh
                 f"Unsupported COLMAP camera model: {intr.model}. Only PINHOLE/SIMPLE_PINHOLE are supported."
             )
 
+        if intr.model == "SIMPLE_PINHOLE":
+            cx, cy = intr.params[1:3]
+        else:
+            cx, cy = intr.params[2:4]
+        K = np.array([[focal_length_x, 0, cx], [0, focal_length_y, cy], [0, 0, 1]])
+
         image_path = os.path.join(images_folder, os.path.basename(extr.name))
         image_name = os.path.basename(image_path).split(".")[0]
 
@@ -195,6 +218,7 @@ def load_mesh_cameras_from_colmap(dataset: ModelParams, load_gt_mask=True, llffh
                 "image_name": image_name,
                 "width": width,
                 "height": height,
+                "K": K,
             }
         )
 
@@ -220,6 +244,7 @@ def load_mesh_cameras_from_colmap(dataset: ModelParams, load_gt_mask=True, llffh
                 image_width=resolution[0],
                 image_height=resolution[1],
                 gt_mask=gt_mask,
+                K=np.diag([resolution[0] / cam["width"], resolution[1] / cam["height"], 1]) @ cam["K"],
             )
         )
     print(f"Loaded {len(cameras)} mesh cameras from COLMAP (minimal mode)")
@@ -493,33 +518,25 @@ def marching_tetrahedra_with_binary_search_bounded(
         print(f"  Points within boundary: {boundary_mask.sum().item()}")
         print(f"  Filtered out: {(~boundary_mask).sum().item()}")
         
-        # Keep original indices for later cell filtering
-        original_indices = torch.arange(points.shape[0], device=points.device)
-        valid_indices = original_indices[boundary_mask]
-        
-        # Filter points and scales
+        # Triangulation uses the filtered vertex array directly. No original-index
+        # mapping is needed; retaining it and the unfiltered seeds wastes GPU RAM.
         points_filtered = points[boundary_mask]
         points_scale_filtered = points_scale[boundary_mask]
-        
-        # Create index mapping for cell filtering
-        index_map = torch.full((points.shape[0],), -1, dtype=torch.long, device=points.device)
-        index_map[valid_indices] = torch.arange(valid_indices.shape[0], device=points.device)
+        del boundary_mask, distances, center_torch
     else:
         points_filtered = points
         points_scale_filtered = points_scale
-        index_map = None
         print("No boundary constraint applied")
+    del points, points_scale
 
     print("construct cell")
-    cells = cpp.triangulate(points_filtered)
-    
-    # # Filter cells if boundary was applied
-    # if index_map is not None:
-    #     # Remove cells that reference filtered-out vertices
-    #     valid_cells_mask = torch.all(cells >= 0, dim=1)
-    #     cells = cells[valid_cells_mask]
-    #     print(f"Cells after boundary filtering: {cells.shape[0]}")
-    
+    # The extension triangulates on CPU and returns connectivity on its input
+    # device. Keep connectivity on CPU when marching there to avoid a large,
+    # unnecessary GPU allocation.
+    triangulation_points = points_filtered.cpu().contiguous() if move_cpu else points_filtered
+    cells = cpp.triangulate(triangulation_points)
+    del triangulation_points
+
     torch.save(cells, os.path.join(model_path, "cells_bounded.pt"))
 
     sdf, valid = evaluage_alpha_cull(
@@ -529,28 +546,32 @@ def marching_tetrahedra_with_binary_search_bounded(
         depth_fade_ratio=depth_fade_ratio,
     )
 
-    torch.cuda.empty_cache()
-    # Marching tetrahedra
+    # Move the retained tensors before marching, then release their GPU storage.
+    # empty_cache alone cannot release tensors still referenced in this frame.
     if move_cpu:
-        verts_list, scale_list, faces_list, _ = marching_tetrahedra(
-            points_filtered.cpu()[None], cells.cpu().long(), sdf[None].cpu(), 
-            points_scale_filtered[None].cpu(), valid[None].cpu()
-        )
-    else:
-        verts_list, scale_list, faces_list, _ = marching_tetrahedra(
-            points_filtered[None], cells.long(), sdf[None], 
-            points_scale_filtered[None], valid[None]
-        )
-    
+        points_filtered = points_filtered.cpu()
+        points_scale_filtered = points_scale_filtered.cpu()
+        cells = cells.cpu()
+        sdf, valid = sdf.cpu(), valid.cpu()
+    torch.cuda.empty_cache()
+    verts_list, scale_list, faces_list, edge_ids = marching_tetrahedra(
+        points_filtered[None], cells.long(), sdf[None],
+        points_scale_filtered[None], valid[None]
+    )
+    del points_filtered, points_scale_filtered, cells, sdf, valid, edge_ids
+
     end_points, end_sdf = verts_list[0]
     end_scales = scale_list[0]
     end_points, end_sdf, end_scales = end_points.cuda(), end_sdf.cuda(), end_scales.cuda()
 
     faces = faces_list[0].cpu().numpy()
+    del verts_list, scale_list, faces_list
+    torch.cuda.empty_cache()
     points_mid = (end_points[:, 0, :] + end_points[:, 1, :]) * 0.5
 
     mesh = trimesh.Trimesh(vertices=points_mid.cpu().numpy(), faces=faces, process=False)
     mesh.export(os.path.join(model_path, "recon_init_bounded.ply"))
+    del mesh, points_mid
 
     # Binary search refinement
     left_points = end_points[:, 0, :]

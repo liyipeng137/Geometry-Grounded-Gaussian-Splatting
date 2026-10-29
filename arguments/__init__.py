@@ -94,15 +94,15 @@ class ModelParams(ParamGroup):
         g.initialization_kind = getattr(g, "initialization_kind", None) or "rgbd"
         g.initialization_ply = getattr(g, "initialization_ply", None) or ""
         g.initialization_manifest = getattr(g, "initialization_manifest", None) or ""
-        if g.initialization_kind not in ("rgbd", "mesh_surface"):
-            raise ValueError("initialization_kind must be rgbd or mesh_surface")
+        if g.initialization_kind not in ("rgbd", "mesh_surface", "ffba_tsdf"):
+            raise ValueError("initialization_kind must be rgbd, mesh_surface or ffba_tsdf")
         if g.initialization_kind == "rgbd" and (g.initialization_ply or g.initialization_manifest):
             raise ValueError("RGBD initialization does not accept an alternate PLY or manifest")
-        if g.initialization_kind == "mesh_surface":
+        if g.initialization_kind in ("mesh_surface", "ffba_tsdf"):
             for field in ("initialization_ply", "initialization_manifest"):
                 value = getattr(g, field)
                 if not value or not os.path.isabs(value):
-                    raise ValueError(field + " must be an explicit absolute path for mesh_surface")
+                    raise ValueError(field + " must be an explicit absolute path for " + g.initialization_kind)
                 setattr(g, field, os.path.realpath(value))
         return g
 
@@ -157,7 +157,8 @@ class OptimizationParams(ParamGroup):
         self.lambda_multi_view_geo = 0.02
         self.lambda_multi_view_ncc = 0.6
 
-        self.lambda_normal_prior = 0.1
+        # Preserve the previous effective default: normal supervision is opt-in.
+        self.lambda_normal_prior = 0.0
         self.normal_prior_from_iter = 7000
         self.lambda_depth_prior = 0.4
         self.real_depth_loss_mode = "absolute"
