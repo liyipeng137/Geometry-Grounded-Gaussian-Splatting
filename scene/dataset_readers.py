@@ -15,15 +15,12 @@ import tempfile
 import json
 import os
 import re
-import sys
 from pathlib import Path
 from typing import NamedTuple
 
 import numpy as np
 import open3d as o3d
-import trimesh
 from plyfile import PlyData, PlyElement
-from scipy.spatial.transform import Rotation
 
 from scene.colmap_loader import (
     qvec2rotmat,
@@ -31,14 +28,11 @@ from scene.colmap_loader import (
     read_extrinsics_text,
     read_intrinsics_binary,
     read_intrinsics_text,
-    read_points3D_binary,
-    read_points3D_text,
 )
 from scene.gaussian_model import BasicPointCloud
 from scene.train_split import calibration_fingerprint, load_excluded_image_names, partition_cameras, training_camera_fingerprint
-from utils.graphics_utils import focal2fov, fov2focal, getWorld2View2
-from utils.pd_utils import generate_ply_from_rgbd
-from utils.sh_utils import SH2RGB
+from utils.graphics_utils import focal2fov, getWorld2View2
+from utils.pd_utils import generate_ply_from_rgbd, resolve_rgbd_depth_directory
 
 class CameraInfo(NamedTuple):
     uid: int
@@ -227,14 +221,19 @@ def _write_record(path, value):
 
 
 def readColmapSceneInfo(path, images, eval, llffhold=8, use_rgbd_init_ply=True,
-                       train_exclude_images="", init_cache_dir=None):
-    """Always use current-split RGBD and half-integer calibration; no fallback."""
+                       train_exclude_images="", init_cache_dir=None, depth_prior_dir="depth"):
+    """只用当前训练划分的 RGBD 初始化，并保留 COLMAP 半整数像素约定。
+
+    ``depth_prior_dir`` 与训练监督使用同一配置，支持相对数据集或绝对目录。
+    初始化、数据指纹和融合后的重新校验均读取这个目录；不回退到稀疏点云。
+    """
     if not use_rgbd_init_ply:
         raise ValueError("Formal COLMAP input requires training-camera RGBD initialization")
     if init_cache_dir is None:
         raise ValueError("COLMAP RGBD initialization requires an owned output cache directory")
     if (Path(path) / "mixed_dataset.json").exists():
         raise ValueError("Mixed/generated ordinary-camera datasets are outside the formal FFBA input contract")
+    depth_root = resolve_rgbd_depth_directory(path, depth_prior_dir)
     model = Path(path) / "sparse/0"
     if (model / "cameras.bin").is_file() and (model / "images.bin").is_file():
         cam_extrinsics = read_extrinsics_binary(str(model / "images.bin"))
@@ -255,7 +254,7 @@ def readColmapSceneInfo(path, images, eval, llffhold=8, use_rgbd_init_ply=True,
                       "world_to_camera_rotation": camera.R.T.tolist(), "world_to_camera_translation": camera.T.tolist(),
                       "pixel_center_convention": "colmap_half_integer"}
         calibrations[camera.colmap_image_name] = calibration_fingerprint(definition)
-        depth = Path(path) / "depth" / Path(camera.colmap_image_name).with_suffix(".npy")
+        depth = depth_root / Path(camera.colmap_image_name).with_suffix(".npy")
         assets[camera.colmap_image_name] = {"rgb_sha256": _sha256_file(camera.image_path),
                                           "depth_sha256": _sha256_file(depth) if depth.is_file() else None}
     train_assets = {camera.colmap_image_name: assets[camera.colmap_image_name] for camera in train}
@@ -264,6 +263,8 @@ def readColmapSceneInfo(path, images, eval, llffhold=8, use_rgbd_init_ply=True,
     algorithm = "rgbd_colmap_half_integer_float32_v3"
     operator_sha256 = _sha256_file(generate_ply_from_rgbd.__code__.co_filename)
     identity = {"algorithm": algorithm, "operator_sha256": operator_sha256,
+                # 即使两个目录碰巧含有相同文件，也不复用不同来源的初始化缓存。
+                "depth_directory": str(depth_root),
                 "train_assets": train_assets,
                 "calibrations": {name: calibrations[name] for name in train_assets},
                 "parameters": {"num_points": 200000, "voxel_length": 0.02, "sdf_trunc": 0.06, "depth_min": 0.05, "depth_max": 50.0}}
@@ -282,12 +283,13 @@ def readColmapSceneInfo(path, images, eval, llffhold=8, use_rgbd_init_ply=True,
                 with tempfile.NamedTemporaryFile(dir=cache, suffix=".ply", delete=False) as stream:
                     temporary = Path(stream.name)
                 generate_ply_from_rgbd(train, num_points=200000, ply_path=str(temporary), cam_intrinsics=cam_intrinsics,
-                                      source_path=path, pixel_center_convention="colmap_half_integer")
+                                      source_path=path, pixel_center_convention="colmap_half_integer",
+                                      depth_prior_dir=str(depth_root))
                 pcd = fetchOpen3DPly(str(temporary))
                 if not len(pcd.points) or not np.isfinite(pcd.points).all() or not np.isfinite(pcd.colors).all():
                     raise ValueError("RGBD initialization produced no finite colored points")
                 for camera in infos:
-                    depth = Path(path) / "depth" / Path(camera.colmap_image_name).with_suffix(".npy")
+                    depth = depth_root / Path(camera.colmap_image_name).with_suffix(".npy")
                     current = {"rgb_sha256": _sha256_file(camera.image_path), "depth_sha256": _sha256_file(depth) if depth.is_file() else None}
                     if current != assets[camera.colmap_image_name]:
                         raise RuntimeError("RGB/depth source changed during RGBD fusion")
@@ -308,7 +310,7 @@ def readColmapSceneInfo(path, images, eval, llffhold=8, use_rgbd_init_ply=True,
             raise ValueError("RGBD proof point count disagrees with its PLY")
     # Recheck content after fusion: mutable source files cannot earn a proof.
     for camera in infos:
-        depth = Path(path) / "depth" / Path(camera.colmap_image_name).with_suffix(".npy")
+        depth = depth_root / Path(camera.colmap_image_name).with_suffix(".npy")
         current = {"rgb_sha256": _sha256_file(camera.image_path), "depth_sha256": _sha256_file(depth) if depth.is_file() else None}
         if current != assets[camera.colmap_image_name]:
             raise RuntimeError("RGB/depth source changed during initialization")

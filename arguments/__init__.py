@@ -3,7 +3,7 @@
 # GRAPHDECO research group, https://team.inria.fr/graphdeco
 # All rights reserved.
 #
-# This software is free for non-commercial, research and evaluation use 
+# This software is free for non-commercial, research and evaluation use
 # under the terms of the LICENSE.md file.
 #
 # For inquiries contact  george.drettakis@inria.fr
@@ -13,11 +13,13 @@ from argparse import ArgumentParser, Namespace
 import sys
 import os
 
+
 class GroupParams:
     pass
 
+
 class ParamGroup:
-    def __init__(self, parser: ArgumentParser, name : str, fill_none = False):
+    def __init__(self, parser: ArgumentParser, name: str, fill_none=False):
         group = parser.add_argument_group(name)
         for key, value in vars(self).items():
             shorthand = False
@@ -25,14 +27,18 @@ class ParamGroup:
                 shorthand = True
                 key = key[1:]
             t = type(value)
-            value = value if not fill_none else None 
+            value = value if not fill_none else None
             if shorthand:
-                if t == bool:
-                    group.add_argument("--" + key, ("-" + key[0:1]), default=value, action="store_true")
+                if t is bool:
+                    group.add_argument(
+                        "--" + key, ("-" + key[0:1]), default=value, action="store_true"
+                    )
                 else:
-                    group.add_argument("--" + key, ("-" + key[0:1]), default=value, type=t)
+                    group.add_argument(
+                        "--" + key, ("-" + key[0:1]), default=value, type=t
+                    )
             else:
-                if t == bool:
+                if t is bool:
                     group.add_argument("--" + key, default=value, action="store_true")
                 else:
                     group.add_argument("--" + key, default=value, type=t)
@@ -44,7 +50,8 @@ class ParamGroup:
                 setattr(group, arg[0], arg[1])
         return group
 
-class ModelParams(ParamGroup): 
+
+class ModelParams(ParamGroup):
     def __init__(self, parser, sentinel=False):
         self.sh_degree = 3
         self.sg_degree = 0
@@ -58,10 +65,10 @@ class ModelParams(ParamGroup):
         self.data_device = "cuda"
         self.frame_gpu_budget = -1
         self.eval = False
-        self.use_decoupled_appearance = 0 # 0: NO, 1: GS, 2: GOF, 3: PGSR
+        self.use_decoupled_appearance = 0  # 0: NO, 1: GS, 2: GOF, 3: PGSR
         self.disable_filter3D = False
-        self.kernel_size = 0.0 # Size of 2D filter in mip-splatting
-        
+        self.kernel_size = 0.0  # Size of 2D filter in mip-splatting
+
         self.multi_view_num = 8
         self.multi_view_max_angle = 30
         self.multi_view_min_dis = 0.01
@@ -75,8 +82,6 @@ class ModelParams(ParamGroup):
         self.depth_prior_scale = 1000.0
         self.depth_confidence_dir = "confidence"
         self.depth_confidence_format = "png"
-        self.disable_rgbd_init_ply = False
-        self.pseudo_manifest = ""
         self.train_exclude_images = ""
         super().__init__(parser, "Loading Parameters", sentinel)
 
@@ -86,9 +91,13 @@ class ModelParams(ParamGroup):
         g.max_image_width = getattr(g, "max_image_width", 0) or 0
         if g.max_image_width < 0:
             raise ValueError("max_image_width must be nonnegative")
-        g.pseudo_manifest = os.path.abspath(g.pseudo_manifest) if getattr(g, "pseudo_manifest", "") else ""
-        g.train_exclude_images = os.path.abspath(g.train_exclude_images) if getattr(g, "train_exclude_images", "") else ""
+        g.train_exclude_images = (
+            os.path.abspath(g.train_exclude_images)
+            if getattr(g, "train_exclude_images", "")
+            else ""
+        )
         return g
+
 
 class PipelineParams(ParamGroup):
     def __init__(self, parser):
@@ -96,6 +105,7 @@ class PipelineParams(ParamGroup):
         self.compute_cov3D_python = False
         self.debug = False
         super().__init__(parser, "Pipeline Parameters")
+
 
 class OptimizationParams(ParamGroup):
     def __init__(self, parser):
@@ -130,18 +140,16 @@ class OptimizationParams(ParamGroup):
         self.opacity_reset_min_remaining = 0
         self.densify_from_iter = 500
         self.densify_until_iter = 15_000
-        self.contribution_prune_from_iter = 500
-        self.contribution_prune_interval = 100
-        self.contribution_prune_ratio = 0.1
 
-
-        self.regularization_from_iter = 7000 # if scene case change to 3000
+        self.regularization_from_iter = 7000  # if scene case change to 3000
         self.densify_grad_threshold = 0.0002
 
         self.lambda_multi_view_geo = 0.02
-        self.lambda_multi_view_ncc = 0.6
+        # 与旧 train.py 的实际有效值一致；现在命令行参数直接控制损失。
+        self.lambda_multi_view_ncc = 0.02
 
-        self.lambda_normal_prior = 0.1
+        # 旧训练循环强制关闭外部 normal。基线保持关闭，可显式启用。
+        self.lambda_normal_prior = 0.0
         self.normal_prior_from_iter = 7000
         self.lambda_depth_prior = 0.4
         self.real_depth_loss_mode = "absolute"
@@ -149,19 +157,9 @@ class OptimizationParams(ParamGroup):
         self.real_depth_relative_floor = 0.05
         self.depth_prior_from_iter = 3000
         self.depth_prior_ramp_iters = 0
-        self.pseudo_from_iter = 3000
-        self.pseudo_real_updates = 4
-        self.pseudo_rgb_weight = 0.15
-        self.pseudo_depth_weight = 0.0
-        self.pseudo_densification_weight = 0.0
-        self.pseudo_densification_depth_tolerance = 0.08
-        self.pseudo_densification_min_confidence = 0.05
-        self.pseudo_gradient_diagnostics_interval = 0
-        self.pseudo_ramp_iters = 500
-        self.pseudo_additive = False
         self.vcd_enable = True
         self.vcd_from_iter = 500
-        self.vcd_num_cams = 10 # if scene case change to 15
+        self.vcd_num_cams = 10  # if scene case change to 15
         self.vcd_loss_thresh = 0.1
         self.vcd_importance_thresh = 5
         self.vcp_enable = True
@@ -169,11 +167,11 @@ class OptimizationParams(ParamGroup):
         self.vcp_remove_ratio = 0.9
         self.multi_view_patch_size = 3
         self.multi_view_pixel_noise_th = 1.0
-        self.use_geo_occ_aware = True
 
         super().__init__(parser, "Optimization Parameters")
 
-def get_combined_args(parser : ArgumentParser):
+
+def get_combined_args(parser: ArgumentParser):
     cmdlne_string = sys.argv[1:]
     cfgfile_string = "Namespace()"
     args_cmdline = parser.parse_args(cmdlne_string)
@@ -190,7 +188,7 @@ def get_combined_args(parser : ArgumentParser):
     args_cfgfile = eval(cfgfile_string)
 
     merged_dict = vars(args_cfgfile).copy()
-    for k,v in vars(args_cmdline).items():
-        if v != None:
+    for k, v in vars(args_cmdline).items():
+        if v is not None:
             merged_dict[k] = v
     return Namespace(**merged_dict)

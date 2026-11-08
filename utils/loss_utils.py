@@ -15,13 +15,13 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.autograd import Variable
-from fused_ssim import fused_ssim, photometric_loss
+from fused_ssim import fused_ssim
+from utils.photometric import photometric_loss
 from scene import GaussianModel, Camera
 from utils.graphics_utils import (
     patch_offsets,
-    patch_warp,
 )
-from gaussian_renderer import sample_depth, render
+from gaussian_renderer import sample_depth
 import warp_patch_ncc
 
 

@@ -1,5 +1,9 @@
 # Geometry-Grounded Gaussian Splatting
 
+当前真实相机基线入口及逐阶段说明见 [训练管道说明](docs/training_baseline.md)。
+`train.py` 已移除伪视角/R2C 临时分支；UKD-4090 的 245 帧启动脚本为
+`scripts/run_245_baseline.sh`。默认有效训练配方保持原真实相机分支。
+
 **Baowen Zhang, Chenxing Jiang, Heng Li, Shaojie Shen, Ping Tan**
 
 [Project Page](https://baowenz.github.io/geometry_grounded_gaussian_splatting/)  

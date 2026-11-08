@@ -1,6 +1,7 @@
-open3d
+open3d==0.19.0
 trimesh
 scikit-image
-opencv-python
+opencv-python-headless
 plyfile
 tqdm
+scipy

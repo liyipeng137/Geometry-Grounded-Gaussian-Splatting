@@ -1,4 +1,6 @@
 import os
+from pathlib import Path
+
 import numpy as np
 import open3d as o3d
 import cv2
@@ -43,9 +45,20 @@ def _frame_intrinsic(cam, cam_intrinsics, color_hw, pixel_center_convention="col
     return o3d.camera.PinholeCameraIntrinsic(image_w, image_h, fx, fy, cx, cy), (fx, fy, cx, cy)
 
 
-def _load_tsdf_depth(source_path, image_name):
-    from pathlib import Path
-    path = Path(source_path) / "depth" / Path(image_name).with_suffix(".npy")
+def resolve_rgbd_depth_directory(source_path, depth_prior_dir="depth"):
+    """解析初始化深度目录；相对路径以数据集为根，绝对路径直接使用。"""
+    if not depth_prior_dir or not str(depth_prior_dir).strip():
+        raise ValueError("RGBD initialization requires a nonempty depth_prior_dir")
+    directory = Path(depth_prior_dir)
+    if not directory.is_absolute():
+        directory = Path(source_path) / directory
+    return directory.resolve()
+
+
+def _load_tsdf_depth(source_path, image_name, depth_prior_dir="depth"):
+    # 保留完整 COLMAP image.name 的子目录，只替换扩展名；不按 basename 配对。
+    directory = resolve_rgbd_depth_directory(source_path, depth_prior_dir)
+    path = directory / Path(image_name).with_suffix(".npy")
     if not path.is_file():
         return None
     depth = np.load(path, allow_pickle=False)
@@ -66,7 +79,13 @@ def generate_ply_from_rgbd(
     conf_threshold=200.0 / 255.0,
     source_path=None,
     pixel_center_convention="array_integer",
+    depth_prior_dir="depth",
 ):
+    """从真实 RGB-D 融合初始化点云，使用与训练监督相同的深度目录。
+
+    ``depth_prior_dir`` 支持数据集内相对目录或绝对目录；默认 ``depth``
+    保持原有入口。该参数只选择数据源，不改变 TSDF 融合及抽点算法。
+    """
     print("Generating dense init ply from RGBD ...")
     if len(train_cam_infos) == 0:
         raise ValueError("No cameras provided for RGBD point cloud generation.")
@@ -89,7 +108,7 @@ def generate_ply_from_rgbd(
         image_name = train_cam.colmap_image_name or train_cam.image_name
         # confidence_path = os.path.join(source_path, "confidence", f"{image_name}.png")
 
-        depth_m = _load_tsdf_depth(source_path, image_name)
+        depth_m = _load_tsdf_depth(source_path, image_name, depth_prior_dir)
         if depth_m is None:
             dropped_cameras += 1
             continue
