@@ -125,7 +125,7 @@ class PhotometricTests(unittest.TestCase):
             for node in module_ast.body
             if isinstance(node, ast.FunctionDef) and node.name == "photometric_rgb_loss"
         )
-        models = Enum("Appearance", ["NO", "GS", "GOF", "PGSR"])
+        models = Enum("Appearance", ["NO", "GS", "GOF", "PGSR", "PPISP"])
         namespace = {
             "torch": torch,
             "photometric_loss": photometric_loss,

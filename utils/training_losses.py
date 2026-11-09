@@ -47,6 +47,7 @@ class LossTerms:
     ncc: torch.Tensor
     geo: torch.Tensor
     mask: torch.Tensor
+    appearance_regularization: torch.Tensor
 
     def raw_terms(self):
         """返回逐项原始值；不 detach，调用者可自行决定记录或反传。"""
@@ -61,6 +62,7 @@ class LossTerms:
                 "ncc",
                 "geo",
                 "mask",
+                "appearance_regularization",
             )
         }
 
@@ -74,6 +76,7 @@ class LossTerms:
             "depth_prior": schedule.depth_prior_weight * self.depth_prior,
             "ncc": schedule.multi_view_ncc_weight * self.ncc,
             "geo": opt.lambda_multi_view_geo * self.geo,
+            "appearance_regularization": self.appearance_regularization,
         }
 
 
@@ -206,7 +209,10 @@ def compute_training_losses(
     rgb, l1 = _photometric_rgb_loss(
         image, target_image, gaussians, camera.uid, opt.lambda_dssim
     )
-    terms = LossTerms(zero, rgb, l1, zero, zero, zero, zero, zero, zero)
+    terms = LossTerms(zero, rgb, l1, zero, zero, zero, zero, zero, zero, zero)
+    if getattr(gaussians, "ppisp", None) is not None:
+        # 官方正则包含其自身权重，防止场景颜色与 ISP 参数任意相互补偿。
+        terms.appearance_regularization = gaussians.ppisp.regularization_loss()
     depth = render_pkg["median_depth"] if schedule.needs_depth else None
     depth_normal = valid_points = None
 
@@ -265,4 +271,6 @@ def compute_training_losses(
     terms.total = contributions["rgb"]
     for name in ("mask", "depth_normal", "normal_prior", "depth_prior", "ncc", "geo"):
         terms.total = terms.total + contributions[name]
+    if getattr(gaussians, "ppisp", None) is not None:
+        terms.total = terms.total + contributions["appearance_regularization"]
     return terms

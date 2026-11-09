@@ -10,6 +10,7 @@ import os
 import sys
 import uuid
 from argparse import Namespace
+from dataclasses import asdict
 from pathlib import Path
 
 import numpy as np
@@ -99,6 +100,18 @@ def prepare_output(dataset, opt, pipe, args):
         "optimization": vars(opt),
         "pipeline": vars(pipe),
     }
+    ppisp_config = None
+    if dataset.use_decoupled_appearance == 4:
+        from ppisp import PPISPConfig
+        from scene.ppisp_appearance import PPISP_COMMIT
+        ppisp_config = {
+            "dependency_commit": PPISP_COMMIT,
+            "config": asdict(PPISPConfig(use_controller=False, controller_distillation=False)),
+            "rgb_supervision": "L1 and SSIM on PPISP output",
+            "vcd_vcp": "PPISP output compared with captured RGB",
+            "optimizer": "official PPISP optimizer/scheduler, every non-final iteration",
+            "camera_groups": "COLMAP camera IDs; frames are training image identities",
+        }
     write_json(
         output / "training_config.json",
         {
@@ -145,6 +158,7 @@ def prepare_output(dataset, opt, pipe, args):
             if opt.dense_optimizer_updates
             else "legacy_fastgs",
             "photometric_backend": get_photometric_backend(),
+            "ppisp": ppisp_config,
             "iteration_order": "backward -> report/PLY -> topology/filter -> optimizer (except final iteration) -> checkpoint",
             "rng_resume_policy": RESUME_POLICY,
             "argv": sys.argv,
@@ -232,6 +246,15 @@ class TrainingLogger:
                     self.stats[counter] += 1
 
                 self.hooks.append(optimizer.register_step_post_hook(count_step))
+        if scene.gaussians.ppisp is not None:
+            self.stats["actual_ppisp_optimizer_steps"] = 0
+            self.stats["ppisp_camera_count"] = len(scene.gaussians.ppisp.camera_ids)
+            self.stats["ppisp_frame_count"] = len(scene.gaussians.ppisp.frame_keys)
+
+            def count_ppisp_step(optimizer, step_args, step_kwargs):
+                self.stats["actual_ppisp_optimizer_steps"] += 1
+
+            self.hooks.append(scene.gaussians.ppisp.optimizers[0].register_step_post_hook(count_ppisp_step))
 
     def record_loss(
         self, iteration, camera, losses, opt, schedule, elapsed_ms, gaussians
@@ -306,6 +329,7 @@ def evaluate_views(
     from gaussian_renderer import render
     from utils.image_utils import psnr
     from utils.loss_utils import l1_loss
+    from utils.vcd_utils import apply_appearance_correction
 
     torch.cuda.empty_cache()
     train_cameras = scene.getTrainCameras()
@@ -320,6 +344,7 @@ def evaluate_views(
         if not cameras:
             continue
         l1_sum, psnr_sum = 0.0, 0.0
+        appearance_results = {}
         for index, camera in enumerate(cameras):
             if frame_cache is not None:
                 camera = frame_cache.ensure(camera)
@@ -328,6 +353,23 @@ def evaluate_views(
             target = camera.original_image_float()
             l1_sum += l1_loss(image, target).mean().double().item()
             psnr_sum += psnr(image, target).mean().double().item()
+            # 保留原 raw 指标；曝光拟合指标另列，不能与 raw PSNR 混比。
+            corrected = None
+            model = scene.gaussians
+            if model.ppisp is not None:
+                frame_key = getattr(camera, "source_image_name", None) or camera.image_name
+                frame_idx = model.ppisp.frame_index_by_name.get(frame_key, -1)
+                corrected = model.ppisp.apply(buffers["render"], frame_idx, camera.colmap_id)
+                appearance_kind = "ppisp_training_frame_fit" if frame_idx >= 0 else "ppisp_camera_only"
+            elif model.app_model == model.App_model.PGSR and name == "train":
+                corrected = apply_appearance_correction(buffers["render"], model, camera.uid)
+                appearance_kind = "pgsr_training_frame_fit"
+            if corrected is not None:
+                corrected = corrected.clamp(0, 1)
+                entry = appearance_results.setdefault(appearance_kind, {"camera_count": 0, "l1": 0.0, "psnr": 0.0})
+                entry["camera_count"] += 1
+                entry["l1"] += l1_loss(corrected, target).mean().double().item()
+                entry["psnr"] += psnr(corrected, target).mean().double().item()
             if writer and index < 5:
                 prefix = f"{name}_view_{camera.image_name}"
                 writer.add_images(prefix + "/render", image[None], iteration)
@@ -348,6 +390,11 @@ def evaluate_views(
             "l1": l1_sum / len(cameras),
             "psnr": psnr_sum / len(cameras),
         }
+        if appearance_results:
+            for entry in appearance_results.values():
+                entry["l1"] /= entry["camera_count"]
+                entry["psnr"] /= entry["camera_count"]
+            results[name]["appearance_diagnostics"] = appearance_results
         print(f"[ITER {iteration}] Evaluating {name}: {results[name]}")
         if writer:
             for metric in ("l1", "psnr"):

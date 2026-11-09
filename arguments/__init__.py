@@ -65,7 +65,7 @@ class ModelParams(ParamGroup):
         self.data_device = "cuda"
         self.frame_gpu_budget = -1
         self.eval = False
-        self.use_decoupled_appearance = 3  # 0: NO, 1: GS, 2: GOF, 3: PGSR
+        self.use_decoupled_appearance = 3  # 0: NO, 1: GS, 2: GOF, 3: PGSR, 4: PPISP
         self.disable_filter3D = False
         self.kernel_size = 0.0  # Size of 2D filter in mip-splatting
 

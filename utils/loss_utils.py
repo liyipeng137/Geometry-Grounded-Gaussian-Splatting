@@ -100,6 +100,11 @@ def photometric_rgb_loss(image, gt_image, gaussians, view_idx, lambda_dssim):
     if app_model is GaussianModel.App_model.NO:
         rgb_loss, l1, _ = photometric_loss(image.contiguous(), gt_image, lambda_dssim)
         return rgb_loss, l1
+    if app_model is GaussianModel.App_model.PPISP:
+        # PPISP 原生监督：L1 和 SSIM 均比较 ISP 后的 RGB，不叠加其他曝光模型。
+        pred = gaussians.ppisp.apply(image, view_idx)
+        rgb_loss, l1, _ = photometric_loss(pred.contiguous(), gt_image, lambda_dssim)
+        return rgb_loss, l1
 
     appearance_embedding = gaussians.get_apperance_embedding(view_idx)
     pred = image

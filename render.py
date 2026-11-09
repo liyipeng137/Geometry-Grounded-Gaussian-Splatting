@@ -10,6 +10,7 @@
 #
 
 import os
+import json
 from argparse import ArgumentParser
 
 import torch
@@ -28,6 +29,11 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
 
     os.makedirs(render_path, exist_ok=True)
     os.makedirs(gts_path, exist_ok=True)
+    use_ppisp = gaussians.app_model is GaussianModel.App_model.PPISP
+    appearance_records = []
+    if use_ppisp:
+        ppisp_path = os.path.join(model_path, name, "ours_{}".format(iteration), "renders_ppisp")
+        os.makedirs(ppisp_path, exist_ok=True)
 
     for idx, view in enumerate(tqdm(views, desc="Rendering progress")):
         if frame_cache is not None:
@@ -36,6 +42,28 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
         gt = view.original_image_float()[0:3, :, :]
         torchvision.utils.save_image(rendering, os.path.join(render_path, '{0:05d}'.format(idx) + ".png"))
         torchvision.utils.save_image(gt, os.path.join(gts_path, '{0:05d}'.format(idx) + ".png"))
+        if use_ppisp:
+            # train/test 的 uid 各自编号；必须按完整帧名查表，未知帧不用训练曝光。
+            frame_name = getattr(view, "source_image_name", None) or view.image_name
+            frame_idx = gaussians.ppisp.frame_index_by_name.get(frame_name, -1)
+            corrected = gaussians.ppisp.apply(rendering, frame_idx, camera_id=view.colmap_id)
+            torchvision.utils.save_image(corrected, os.path.join(ppisp_path, '{0:05d}'.format(idx) + ".png"))
+            appearance_records.append({
+                "image_name": frame_name,
+                "file": '{0:05d}.png'.format(idx),
+                "frame_idx": frame_idx,
+                "camera_id": int(view.colmap_id),
+                "appearance": "learned-frame" if frame_idx >= 0 else "camera-only",
+            })
+    if use_ppisp:
+        with open(os.path.join(model_path, name, "ours_{}".format(iteration), "appearance_rendering.json"), "w") as stream:
+            json.dump({
+                "raw_directory": "renders",
+                "processed_directory": "renders_ppisp",
+                "controller": False,
+                "camera_only_policy": "Known camera vignetting/CRF, neutral exposure/color; no target-image fitting",
+                "views": appearance_records,
+            }, stream, indent=2)
 
 def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParams, skip_train : bool, skip_test : bool):
     with torch.no_grad():

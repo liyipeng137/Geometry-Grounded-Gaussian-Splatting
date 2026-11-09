@@ -4,6 +4,9 @@
 `train.py` 已移除伪视角/R2C 临时分支；UKD-4090 的 245 帧启动脚本为
 `scripts/run_245_baseline.sh`。normal prior 和 NCC 默认采用 `train_demo.py` 的动态权重；所有训练帧必须同时提供 normal/depth prior。
 
+外观模式 4 已接入用户 fork 的 PPISP；安装、配对保存及与模式 3 的对照口径见
+[PPISP 模式说明](docs/ppisp_mode4.md)。默认模式仍为 3。
+
 **Baowen Zhang, Chenxing Jiang, Heng Li, Shaojie Shen, Ping Tan**
 
 [Project Page](https://baowenz.github.io/geometry_grounded_gaussian_splatting/)  

@@ -104,6 +104,7 @@ class GaussianModel:
         GS = 1
         GOF = 2
         PGSR = 3
+        PPISP = 4
 
     # use mip-splatting filters
     def setup_functions(self):
@@ -149,10 +150,13 @@ class GaussianModel:
         self.setup_functions()
         self.appearance_network: Optional[AppearanceNetwork] = None
         self._appearance_embeddings: Optional[torch.nn.Parameter] = None
+        self.ppisp = None
 
     def capture(self):
         if self.app_model == self.App_model.GOF:
             app_model_param = self.appearance_network.state_dict()
+        elif self.app_model == self.App_model.PPISP:
+            app_model_param = self.ppisp.capture()
         else:
             app_model_param = None
         return (
@@ -179,6 +183,9 @@ class GaussianModel:
         )
 
     def restore(self, model_args, training_args):
+        saved_mode = model_args[16 if len(model_args) == 19 else 17]
+        if self.App_model.PPISP in (self.app_model, saved_mode) and self.app_model != saved_mode:
+            raise ValueError("PPISP checkpoint appearance mode must match the requested mode")
         if len(model_args) == 19:
             (
                 self.active_sh_degree,
@@ -241,6 +248,8 @@ class GaussianModel:
             self.appearance_network = AppearanceNetwork(3 + 64, 3).cuda()
             self.appearance_network.load_state_dict(app_dict)
         self._appearance_embeddings = _appearance_embeddings
+        if self.app_model == self.App_model.PPISP:
+            self.ppisp.restore(app_dict)
 
     @property
     def get_scaling(self):
@@ -387,8 +396,15 @@ class GaussianModel:
     def unlockSGdegree(self, N):
         self.active_sg_degree = min(self.active_sg_degree + N, self.max_sg_degree)
 
-    def create_app_model(self, num_cameras: int, app_model: App_model) -> None:
+    def create_app_model(self, num_cameras: int, app_model: App_model, train_cameras=None) -> None:
         self.app_model = self.App_model(app_model)
+        if self.app_model == self.App_model.PPISP:
+            if train_cameras is None:
+                raise ValueError("PPISP requires training camera/frame identities")
+            from scene.ppisp_appearance import PPISPAppearance
+            self.ppisp = PPISPAppearance(train_cameras)
+            self._appearance_embeddings = None
+            return
 
         init_dispatch = {
             self.App_model.GS: self._init_gs_embeddings,
@@ -481,6 +497,8 @@ class GaussianModel:
             lr=0.0,
             eps=1e-15,
         )
+        if self.ppisp is not None:
+            self.ppisp.setup_optimizers(training_args.iterations)
 
     # --- helpers -------------------------------------------------------------
 
@@ -516,6 +534,7 @@ class GaussianModel:
             self.App_model.GS: self._gs_param_groups,
             self.App_model.GOF: self._gof_param_groups,
             self.App_model.PGSR: self._pgsr_param_groups,
+            self.App_model.PPISP: self._noop_param_groups,
             self.App_model.NO: self._noop_param_groups,
         }
         try:
@@ -582,6 +601,10 @@ class GaussianModel:
         """FastGS-style optimizer schedule (default optimizer path)."""
         if self.optimizer is None:
             return
+        # ISP is updated every iteration; never put frame/camera parameters in
+        # Gaussian optimizers, whose tensors are sliced during densify/prune.
+        if self.ppisp is not None:
+            self.ppisp.step()
         if getattr(self, "dense_optimizer_updates", False):
             self.optimizer.step()
             self.optimizer.zero_grad(set_to_none=True)

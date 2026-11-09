@@ -60,6 +60,7 @@ def make_harness(start=0, stop=3, multiview=False, failure_at=None):
         def __init__(self, *args):
             self.optimizer = Optimizer("main")
             self.shoptimizer = Optimizer("sh")
+            self.ppisp = None
             self.get_xyz = [0, 1]
             self.dense_optimizer_updates = False
             self.optimizer_step = MethodType(schedule_namespace["optimizer_step"], self)

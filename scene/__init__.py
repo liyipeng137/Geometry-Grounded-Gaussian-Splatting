@@ -131,10 +131,16 @@ class Scene:
                         file.write(json_str)
                         file.write("\n")
 
-        self.gaussians.create_app_model(len(scene_info.train_cameras), args.use_decoupled_appearance)
+        self.gaussians.create_app_model(
+            len(scene_info.train_cameras), args.use_decoupled_appearance,
+            train_cameras=self.train_cameras[resolution_scales[0]],
+        )
 
         if self.loaded_iter:
             self.gaussians.load_ply(os.path.join(self.model_path, "point_cloud", "iteration_" + str(self.loaded_iter), "point_cloud.ply"))
+            if self.gaussians.ppisp is not None:
+                state_path = os.path.join(self.model_path, "point_cloud", "iteration_" + str(self.loaded_iter), "ppisp.pth")
+                self.gaussians.ppisp.load_export_state(torch.load(state_path, weights_only=False))
         else:
             self.gaussians.create_from_pcd(scene_info.point_cloud, self.cameras_extent)
             with torch.no_grad():
@@ -149,6 +155,12 @@ class Scene:
         self.gaussians.save_ply(os.path.join(point_cloud_path, "point_cloud.ply"))
         if self.gaussians.app_model == GaussianModel.App_model.PGSR:
             self.gaussians.save_3dgsviewer_ply(os.path.join(point_cloud_path, "point_cloud_3dgsviewer.ply"))
+        elif self.gaussians.app_model == GaussianModel.App_model.PPISP:
+            # PLY contains canonical colors; view-dependent ISP cannot be baked into it.
+            self.gaussians.save_3dgsviewer_ply(os.path.join(point_cloud_path, "point_cloud_canonical_3dgsviewer.ply"))
+            state_path = os.path.join(point_cloud_path, "ppisp.pth")
+            torch.save(self.gaussians.ppisp.export_state(), state_path + ".tmp")
+            os.replace(state_path + ".tmp", state_path)
 
     def getTrainCameras(self, scale=1.0) -> Sequence[Camera]:
         return self.train_cameras[scale]

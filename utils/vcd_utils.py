@@ -16,6 +16,8 @@ def apply_appearance_correction(image, gaussians, view_uid):
     app_model = gaussians.app_model
     if app_model is gaussians.App_model.NO:
         return image
+    if app_model is gaussians.App_model.PPISP:
+        return gaussians.ppisp.apply(image, view_uid)
 
     appearance_embedding = gaussians.get_apperance_embedding(view_uid)
 
