@@ -195,6 +195,9 @@ def test_reader_hashes_configured_depth_and_ignores_shadow_default(reader_fixtur
         "sdf_trunc": 0.06,
         "depth_min": 0.05,
         "depth_max": 50.0,
+        "largest_mesh_components": 3,
+        "component_rank": "triangle_count",
+        "point_sampling": "final_filtered_mesh_vertices",
     }
 
     legacy.write_bytes(b"changing the unused default must not invalidate this cache")

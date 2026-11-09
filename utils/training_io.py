@@ -111,9 +111,9 @@ def prepare_output(dataset, opt, pipe, args):
                 "lambda_dssim": opt.lambda_dssim,
                 "lambda_mask": opt.lambda_mask,
                 "lambda_depth_normal": opt.lambda_depth_normal,
-                "lambda_normal_prior": opt.lambda_normal_prior,
+                "lambda_normal_prior_base": opt.lambda_normal_prior,
                 "lambda_depth_prior_max": opt.lambda_depth_prior,
-                "lambda_multi_view_ncc": opt.lambda_multi_view_ncc,
+                "lambda_multi_view_ncc_base": opt.lambda_multi_view_ncc,
                 "lambda_multi_view_geo": opt.lambda_multi_view_geo,
             },
             "effective_real_depth_loss": {
@@ -124,6 +124,23 @@ def prepare_output(dataset, opt, pipe, args):
                 if opt.real_depth_loss_mode == "absolute"
                 else "dimensionless_relative",
             },
+            "normal_prior_schedule": {
+                "source": "train_demo.py normal prior",
+                "from_iter": opt.normal_prior_from_iter,
+                "init_end_iter": min(7000, opt.iterations),
+                "geometry_end_iter": min(15000, opt.iterations),
+                "base_weight": opt.lambda_normal_prior,
+                "after_geometry": "hold_base_weight",
+                "loss": "signed cosine, prior_mask & alpha>0.5 & valid_points",
+            },
+            "multi_view_ncc_schedule": {
+                "source": "train_demo.py with required normal/depth priors",
+                "from_iter": max(7001, opt.regularization_from_iter),
+                "geometry_end_iter": min(15000, opt.iterations),
+                "base_weight": opt.lambda_multi_view_ncc,
+                "after_geometry": "hold_quarter_base_weight",
+            },
+            "required_training_priors": ["normal", "depth"],
             "effective_optimizer_schedule": "dense_main_sh_every_16"
             if opt.dense_optimizer_updates
             else "legacy_fastgs",
@@ -244,6 +261,8 @@ class TrainingLogger:
                 "gaussians": len(gaussians.get_xyz),
                 "raw": raw,
                 "weighted": weighted,
+                "normal_prior_weight": schedule.normal_prior_weight,
+                "multi_view_ncc_weight": schedule.multi_view_ncc_weight,
                 "total": total,
                 "forward_backward_ms": elapsed_ms,
             }

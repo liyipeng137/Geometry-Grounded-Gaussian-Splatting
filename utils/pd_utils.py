@@ -67,6 +67,26 @@ def _load_tsdf_depth(source_path, image_name, depth_prior_dir="depth"):
     return np.where(np.isfinite(depth) & (depth > 0), depth, 0).astype(np.float32)
 
 
+def _keep_largest_three_components(mesh):
+    """按共享边连通的三角面数量保留前三个分量，原地清理其余面和孤立顶点。"""
+    if not mesh.has_triangles():
+        raise RuntimeError("RGBD initialization produced no TSDF surface triangles")
+    labels, counts, _ = mesh.cluster_connected_triangles()
+    counts = np.asarray(counts)
+    # 同面数时保留原组件顺序，避免初始化因排序不稳定而变化。
+    keep = np.argsort(-counts, kind="stable")[:3]
+    before_vertices = len(mesh.vertices)
+    mesh.remove_triangles_by_mask(~np.isin(np.asarray(labels), keep))
+    mesh.remove_unreferenced_vertices()
+    print(
+        f"RGBD components: {len(counts)} -> {len(keep)}, "
+        f"triangles: {int(counts.sum())} -> {len(mesh.triangles)}, "
+        f"vertices: {before_vertices} -> {len(mesh.vertices)}, "
+        f"kept triangle counts: {counts[keep].tolist()}"
+    )
+    return mesh
+
+
 def generate_ply_from_rgbd(
     train_cam_infos,
     num_points,
@@ -84,12 +104,11 @@ def generate_ply_from_rgbd(
     """从真实 RGB-D 融合初始化点云，使用与训练监督相同的深度目录。
 
     ``depth_prior_dir`` 支持数据集内相对目录或绝对目录；默认 ``depth``
-    保持原有入口。该参数只选择数据源，不改变 TSDF 融合及抽点算法。
+    保持原有入口。全部融合后先保留最大三个 mesh 连通分量，再抽取初始化点。
     """
     print("Generating dense init ply from RGBD ...")
     if len(train_cam_infos) == 0:
         raise ValueError("No cameras provided for RGBD point cloud generation.")
-    samples_per_frame = max((num_points + len(train_cam_infos) - 1) // len(train_cam_infos), 1)
 
     volume = o3d.pipelines.integration.ScalableTSDFVolume(
         voxel_length=float(voxel_length),
@@ -97,8 +116,6 @@ def generate_ply_from_rgbd(
         color_type=o3d.pipelines.integration.TSDFVolumeColorType.RGB8,
     )
 
-    points_list = []
-    colors_list = []
     printed_cameras = set()
     dropped_cameras = 0
 
@@ -158,20 +175,12 @@ def generate_ply_from_rgbd(
         c2w = np.linalg.inv(w2c)
         volume.integrate(rgbd, camera_intrinsics, np.linalg.inv(c2w))
 
-        pcd = volume.extract_point_cloud()
-        if len(pcd.points) == 0:
-            continue
-
-        pick_num = min(samples_per_frame, len(pcd.points))
-        idx = np.random.choice(len(pcd.points), size=pick_num, replace=False)
-        points_list.append(np.asarray(pcd.points)[idx])
-        colors_list.append(np.asarray(pcd.colors)[idx])
-
-    if not points_list:
-        raise RuntimeError("Failed to generate RGBD init ply: no valid RGBD samples were integrated.")
-
-    points = np.concatenate(points_list, axis=0)
-    colors = np.concatenate(colors_list, axis=0)
+    # 连通性必须依据最终融合结果；不再累积各中间 TSDF 快照中的浮点。
+    mesh = _keep_largest_three_components(volume.extract_triangle_mesh())
+    pick_num = min(num_points, len(mesh.vertices))
+    idx = np.random.choice(len(mesh.vertices), size=pick_num, replace=False)
+    points = np.asarray(mesh.vertices)[idx]
+    colors = np.asarray(mesh.vertex_colors)[idx]
 
     out_pcd = o3d.geometry.PointCloud()
     out_pcd.points = o3d.utility.Vector3dVector(points)

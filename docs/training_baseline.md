@@ -36,15 +36,49 @@ FastGS 的梯度累积。默认前 15k 主参数每步更新，15k～20k 每 32 
 | RGB | 1 | `(1−lambda_dssim)×L1 + lambda_dssim×(1−SSIM)`，`lambda_dssim=.2` |
 | Depth prior | .4 | 从 3000 步开启，默认绝对 camera-Z L1；支持原有 relative Charbonnier |
 | Depth–normal 自一致性 | .05 | 从 7000 步开启；无效像素置零后按全图平均 |
-| 外部 normal prior | **0** | 默认关闭，与清理前实际行为一致；显式设置非零时从 `normal_prior_from_iter` 开启 |
-| 多视角 NCC | **.02** | 从 7000 步开启 |
+| 外部 normal prior | **.1 → .15 → .2 → .1** | 默认从第 1 步开启，采用 `train_demo.py` 的有向 cosine 和下述日程 |
+| 多视角 NCC | **.2 → .1 → .05** | 从 7001 步按 demo 日程启用，15k 后保持 .05 |
 | 多视角几何 | .02 | 从 7000 步开启 |
 | Mask | 0 | 现有背景约束；不把 depth-valid mask 解释为物体轮廓 |
 
-旧参数文件将 normal/NCC 写成 `.1/.6`，但循环强制使用 `0/.02`。现在默认值改成
-原来**实际生效**的 `0/.02`，命令行参数会真正生效。旧命令若显式传 `.1/.6`，
-需要删除或改回 `0/.02` 才能重现原有效配方。normal prior 仍使用无向 cosine，
-没有在清理中改为有向法线监督。相对 depth 不拟合新的 scale/shift。
+normal prior 现完整采用用户提供的生产 `GGGS/train_demo.py` 逻辑，默认 20k 日程为：
+
+| iteration | 当前权重 |
+|---|---:|
+| 1–3000 | .1 |
+| 3001–5000 | .15 |
+| 5001–11000 | .2 |
+| 11001–15000 | 按 geometry 阶段后半程线性降至 .1 |
+| 15001–20000 | 保持 .1，避免源 demo 的越界负权重 |
+
+geometry 进度为 `(iteration−7001)/(15000−7001)`，前半程保持 .2。
+少于 15k 的短训沿用 demo：geometry 终点截为总 iterations，init 仍使用 3000/5000
+的绝对阈值。`lambda_normal_prior` 是初始/尾段基准权重（默认 .1），其余阶段使用
+1.5 倍、2 倍和线性回落；传 0 可以关闭。`normal_prior_from_iter` 默认 1，仍可显式延迟。
+
+损失为 `1−cos(render_normal, prior) + 1−cos(depth_normal, prior)`，不再取 `abs(cos)`。
+有效域为 prior mask、`alpha > .5` 和 depth-derived normal 有效像素的交集；不将
+prior 乘以 alpha。法线加载、坐标转换与归一化维持当前实现。
+
+NCC 使用同一 geometry 进度，默认日程为：
+
+| iteration | NCC 权重 |
+|---|---:|
+| 1–7000 | 0 |
+| geometry 前半程（7001–11000） | 从 .2 线性降至约 .1 |
+| geometry 后半程（11001–15000） | 从约 .1 线性降至 .05 |
+| 15001–20000 | 保持 .05 |
+
+`lambda_multi_view_ncc` 是起始基准权重（默认 .2），后两个端点为其一半和四分之一；
+传 0 可关闭 NCC 损失。短训仍将 geometry 终点截到总 iterations，并保留已有
+`regularization_from_iter` 启用门控。geo 的权重和日程不随本次 NCC 迁移而改变。
+没有加入 demo 的 depth-plane loss、背景或完整阶段式训练器。
+`loss.jsonl` 同时记录当前 normal/NCC 权重及加权贡献。
+
+**每个训练相机必须同时加载 normal prior 和 depth prior。** 缺任意一种即在
+optimizer 初始化和训练循环之前报错，并指出帧名和缺失类型；即使对应 loss 权重
+设为 0，也必须满足数据要求。检查加载标记而非 GPU 常驻属性，以兼容 CPU/GPU
+帧缓存；不使用 demo 的“无 normal prior 时 NCC=.6”替代配方。
 
 ## 数据与初始化
 
@@ -62,9 +96,15 @@ FastGS 的梯度累积。默认前 15k 主参数每步更新，15k～20k 每 32 
 支持绝对目录，文件按完整 COLMAP `image.name` 匹配，并将扩展名换成 `.npy`。
 仍保留已有世界尺度、完整 K 和半整数像素中心。
 
-初始化继续使用训练相机的 RGBD→TSDF 融合点云（约 20 万采样点、voxel `.02`、
-trunc `.06`）；**没有读取 `tsdf_mesh.ply` 的 faces，也没有切换为 mesh warm start**。
-指定 depth 来源进入初始化缓存指纹。改变路径或融合代码会重新生成缓存。
+初始化先融合全部训练相机的 RGBD（voxel `.02`、trunc `.06`），再提取最终 TSDF
+mesh，以共享边定义三角面连通分量，按面数降序只保留最大的 3 个；不足 3 个则全部
+保留，同面数按原组件顺序决定。删除其余三角面后清除无引用顶点，再从保留顶点
+无放回抽取最多 20 万个 XYZ/RGB 初始点，空表面直接报错。
+
+这替代了原先“每融合一帧就抽点、最后拼接中间快照”的方式，避免中间浮点残留。
+因此抽样分布也会改变，不是仅在旧 20 万点上删除一部分。原始 `tsdf_mesh.ply`
+仍不作为输入，也不会被修改。指定 depth 来源、过滤参数及融合实现均进入缓存
+身份；旧初始化缓存会失效，续训仍须通过原有初始化身份校验。
 
 当前 depth 加载器以有限正深度作为有效性，本次没有新增独立 valid_mask 加权。
 给定样例抽查的 depth-valid mask 全有效且与正深度一致；它不能传给 `--mask_dir`
@@ -81,7 +121,7 @@ bash scripts/run_245_baseline.sh /workspace/outputs/gggs_245_base
 ```
 
 脚本使用 `/usr/local/miniconda3/envs/py312/bin/python`、全部 245 个真实相机、
-默认 20k iterations，显式保持 normal=0 / NCC=.02。图像分辨率沿用原 CLI 默认；
+默认 20k iterations，启用上述 normal prior 与 NCC 日程。图像分辨率沿用原 CLI 默认；
 `frame_gpu_budget=4` 只限制图像/prior 的 GPU 驻留数，不减少训练相机。
 可以在输出目录后追加正常训练参数，例如 `--iterations 200 --max_image_width 480`。
 这种短训仅用于运行验证，不是完整基线结果。

@@ -13,8 +13,8 @@
 utils/training_io.py。这里保留训练阶段的先后关系，不隐藏在 Trainer 框架中。
 
 此入口不再包含伪视角 / R2C 实验。初始化仍是当前训练相机的 RGBD→TSDF
-点云，并非直接加载 tsdf_mesh.ply。默认损失和 FastGS 更新日程沿用清理前
-真实相机分支的实际行为；详见 docs/training_baseline.md。
+点云，并非直接加载 tsdf_mesh.ply。normal prior 与 NCC 默认采用 train_demo 日程；
+训练帧必须同时有 normal/depth prior，详见 docs/training_baseline.md。
 """
 
 import math
@@ -81,6 +81,17 @@ def validate_options(opt, args):
         value = getattr(opt, name)
         if not math.isfinite(value) or value <= 0:
             raise ValueError(f"{name} must be finite and positive")
+
+
+def validate_training_priors(cameras):
+    """逐训练帧检查两种 prior；即使损失权重为零，输入契约也不降级。
+
+    检查加载标记，不能检查 GPU 属性：合法的 lazy payload 此时可能仅驻留 CPU。
+    """
+    for camera in cameras:
+        missing = [name for name in ("normal", "depth") if not getattr(camera, f"has_{name}_prior")]
+        if missing:
+            raise ValueError(f"Training frame {camera.image_name} is missing required prior(s): {', '.join(missing)}")
 
 
 def refresh_filter(gaussians, dataset, cameras):
@@ -224,6 +235,7 @@ def training(dataset, opt, pipe, args):
     writer = prepare_output(dataset, opt, pipe, args)
     gaussians = GaussianModel(dataset.sh_degree, dataset.sg_degree)
     scene = Scene(dataset, gaussians)
+    validate_training_priors(scene.getTrainCameras())
     gaussians.training_setup(opt)
     restore_checkpoint(
         gaussians, opt, args.start_checkpoint, parameters, split, scene.model_path
@@ -258,16 +270,8 @@ def training(dataset, opt, pipe, args):
         f"[Baseline] train={len(cameras)}, test={len(scene.getTestCameras())}, loaded priors={prior_counts}"
     )
     print(
-        f"[Baseline] depth={opt.lambda_depth_prior}, normal_prior={opt.lambda_normal_prior}, depth_normal={opt.lambda_depth_normal}, ncc={opt.lambda_multi_view_ncc}, geo={opt.lambda_multi_view_geo}"
+        f"[Baseline] depth={opt.lambda_depth_prior}, normal_prior_base={opt.lambda_normal_prior} (dynamic schedule), depth_normal={opt.lambda_depth_normal}, ncc_base={opt.lambda_multi_view_ncc} (dynamic schedule), geo={opt.lambda_multi_view_geo}"
     )
-    for name, weight in (
-        ("depth", opt.lambda_depth_prior),
-        ("normal", opt.lambda_normal_prior),
-    ):
-        if weight > 0 and prior_counts[name] == 0:
-            raise ValueError(
-                f"Positive {name} prior weight but no corresponding priors were loaded"
-            )
 
     logger = TrainingLogger(scene, opt, args, start_iteration, writer)
     start_event, end_event = (
@@ -306,7 +310,12 @@ def training(dataset, opt, pipe, args):
 
             # 4. 同视角几何 / prior 和相邻视角 PatchMatch，统一计算与加权。
             nearest = None
-            if schedule.reg_enabled and patchmatch is not None and camera.nearest_id:
+            if (
+                schedule.reg_enabled
+                and (schedule.multi_view_ncc_weight > 0 or opt.lambda_multi_view_geo > 0)
+                and patchmatch is not None
+                and camera.nearest_id
+            ):
                 nearest = cameras[sample(camera.nearest_id, 1)[0]]
                 if frame_cache is not None:
                     nearest = frame_cache.ensure(nearest, keep=(camera,))

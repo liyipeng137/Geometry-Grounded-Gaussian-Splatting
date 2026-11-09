@@ -65,7 +65,7 @@ class ModelParams(ParamGroup):
         self.data_device = "cuda"
         self.frame_gpu_budget = -1
         self.eval = False
-        self.use_decoupled_appearance = 0  # 0: NO, 1: GS, 2: GOF, 3: PGSR
+        self.use_decoupled_appearance = 3  # 0: NO, 1: GS, 2: GOF, 3: PGSR
         self.disable_filter3D = False
         self.kernel_size = 0.0  # Size of 2D filter in mip-splatting
 
@@ -145,12 +145,12 @@ class OptimizationParams(ParamGroup):
         self.densify_grad_threshold = 0.0002
 
         self.lambda_multi_view_geo = 0.02
-        # 与旧 train.py 的实际有效值一致；现在命令行参数直接控制损失。
-        self.lambda_multi_view_ncc = 0.02
+        # train_demo NCC 日程的起始权重：.2 → .1 → .05。
+        self.lambda_multi_view_ncc = 0.2
 
-        # 旧训练循环强制关闭外部 normal。基线保持关闭，可显式启用。
-        self.lambda_normal_prior = 0.0
-        self.normal_prior_from_iter = 7000
+        # train_demo 的 normal prior 日程：初始/尾段基准 .1，中段最高 2 倍。
+        self.lambda_normal_prior = 0.1
+        self.normal_prior_from_iter = 1
         self.lambda_depth_prior = 0.4
         self.real_depth_loss_mode = "absolute"
         self.real_depth_relative_epsilon = 0.01

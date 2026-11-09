@@ -90,7 +90,7 @@ def make_harness(start=0, stop=3, multiview=False, failure_at=None):
     cameras = [
         SimpleNamespace(
             image_name=f"frame_{index}.png", nearest_id=[1 - index],
-            has_depth_prior=False, has_normal_prior=False, depth_prior=None, normal_prior=None,
+            has_depth_prior=True, has_normal_prior=True, depth_prior=None, normal_prior=None,
         ) for index in range(2)
     ]
 
@@ -199,11 +199,13 @@ def make_harness(start=0, stop=3, multiview=False, failure_at=None):
     def compute_losses(buffers, camera, model, opt, schedule, *, patchmatch, nearest_camera, iteration):
         if failure_at == iteration:
             raise RuntimeError("synthetic training failure")
-        if multiview:
+        if schedule.reg_enabled and (schedule.multi_view_ncc_weight > 0 or opt.lambda_multi_view_geo > 0):
             assert patchmatch is not None and nearest_camera is not None
             patchmatch(camera, nearest_camera)
         else:
-            assert patchmatch is None and nearest_camera is None
+            assert nearest_camera is None
+            if not multiview:
+                assert patchmatch is None
         event("loss", camera.image_name)
         return SimpleNamespace(total=Loss())
 
@@ -231,8 +233,8 @@ def make_harness(start=0, stop=3, multiview=False, failure_at=None):
         "update_topology": lambda *args: event("topology"),
         "save_checkpoint": checkpoint,
     }
-    execute_definitions("utils/training_losses.py", {"LossSchedule", "loss_schedule", "ramp_weight"}, namespace)
-    execute_definitions("train.py", {"validate_options", "refresh_filter", "training"}, namespace)
+    execute_definitions("utils/training_losses.py", {"LossSchedule", "loss_schedule", "ramp_weight", "normal_prior_weight", "multi_view_ncc_weight"}, namespace)
+    execute_definitions("train.py", {"validate_options", "validate_training_priors", "refresh_filter", "training"}, namespace)
     opt = SimpleNamespace(
         iterations=stop, densification_interval=100, opacity_reset_interval=3000,
         opacity_reset_min_remaining=0, depth_prior_ramp_iters=0, regularization_from_iter=0,
@@ -254,7 +256,7 @@ def make_harness(start=0, stop=3, multiview=False, failure_at=None):
     return SimpleNamespace(
         run=lambda: namespace["training"](dataset, opt, SimpleNamespace(debug=False), args),
         state=state, trace=trace, args=args, patchmatch_calls=patchmatch_calls,
-        checkpoint_states=checkpoint_states,
+        checkpoint_states=checkpoint_states, cameras=cameras,
     )
 
 
@@ -293,13 +295,30 @@ def test_disabled_patchmatch_keeps_single_view_sampling_and_cache_calls():
 
 
 def test_neighbor_payload_load_keeps_current_camera_resident():
-    harness = make_harness(stop=2, multiview=True)
+    harness = make_harness(start=7000, stop=7002, multiview=True)
     harness.run()
     assert harness.patchmatch_calls == [("frame_0.png", "frame_1.png"), ("frame_1.png", "frame_0.png")]
     assert harness.state.caches[0].calls == [
-        (1, "frame_0.png", ()), (1, "frame_1.png", ("frame_0.png",)),
-        (2, "frame_1.png", ()), (2, "frame_0.png", ("frame_1.png",)),
+        (7001, "frame_0.png", ()), (7001, "frame_1.png", ("frame_0.png",)),
+        (7002, "frame_1.png", ()), (7002, "frame_0.png", ("frame_1.png",)),
     ]
+
+
+def test_zero_scheduled_ncc_does_not_sample_a_neighbor():
+    harness = make_harness(multiview=True)
+    harness.run()
+    assert harness.patchmatch_calls == []
+    assert all(not row[2] for row in harness.state.caches[0].calls)
+
+
+@pytest.mark.parametrize("prior", ["normal", "depth"])
+def test_missing_prior_fails_before_optimizer_even_when_weights_are_zero(prior):
+    harness = make_harness()
+    setattr(harness.cameras[1], f"has_{prior}_prior", False)
+    with pytest.raises(ValueError, match="frame_1.png") as error:
+        harness.run()
+    assert prior in str(error.value)
+    assert all(row[1] not in ("training_setup", "loss", "backward") for row in harness.trace)
 
 
 def test_exception_marks_failed_and_closes_progress_and_logger():

@@ -267,7 +267,9 @@ def readColmapSceneInfo(path, images, eval, llffhold=8, use_rgbd_init_ply=True,
                 "depth_directory": str(depth_root),
                 "train_assets": train_assets,
                 "calibrations": {name: calibrations[name] for name in train_assets},
-                "parameters": {"num_points": 200000, "voxel_length": 0.02, "sdf_trunc": 0.06, "depth_min": 0.05, "depth_max": 50.0}}
+                "parameters": {"num_points": 200000, "voxel_length": 0.02, "sdf_trunc": 0.06, "depth_min": 0.05, "depth_max": 50.0,
+                               "largest_mesh_components": 3, "component_rank": "triangle_count",
+                               "point_sampling": "final_filtered_mesh_vertices"}}
     init_fingerprint = calibration_fingerprint(identity)
     cache = Path(init_cache_dir)
     cache.mkdir(parents=True, exist_ok=True)

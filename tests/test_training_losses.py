@@ -12,6 +12,7 @@ from utils import training_losses as losses
 
 def options(**overrides):
     values = dict(
+        iterations=20000,
         regularization_from_iter=10,
         lambda_normal_prior=0.0,
         normal_prior_from_iter=7,
@@ -205,11 +206,11 @@ class TrainingLossTests(unittest.TestCase):
         result.total.backward()
         torch.testing.assert_close(depth.grad, torch.tensor([[[-0.05, 0.05, 0.0]]]))
 
-    def test_normal_prior_remains_unsigned_and_does_not_differentiate_alpha(self):
+    def test_normal_prior_is_signed_and_does_not_differentiate_alpha(self):
         image = torch.zeros(3, 2, 2, requires_grad=True)
         normal = torch.zeros(3, 2, 2)
         normal[2] = 1
-        alpha = torch.full((1, 2, 2), 0.5, requires_grad=True)
+        alpha = torch.full((1, 2, 2), 0.8, requires_grad=True)
         cam = camera(
             normal_prior=-normal,
             normal_prior_mask=torch.ones(1, 2, 2, dtype=torch.bool),
@@ -232,7 +233,7 @@ class TrainingLossTests(unittest.TestCase):
             result = losses.compute_training_losses(
                 pkg, cam, None, opt, losses.loss_schedule(cam, opt, 7)
             )
-        self.assertAlmostEqual(result.normal_prior.item(), 0.0)
+        self.assertAlmostEqual(result.normal_prior.item(), 4.0)
         result.total.backward()
         self.assertIsNone(alpha.grad)
 
@@ -268,7 +269,7 @@ class TrainingLossTests(unittest.TestCase):
         }
         depth_normal = torch.zeros(3, 2, 2)
         valid = torch.ones(1, 2, 2, dtype=torch.bool)
-        schedule = losses.loss_schedule(cam, opt, 10)
+        schedule = losses.loss_schedule(cam, opt, 7001)
         calls = []
 
         def patchmatch(*args):
@@ -284,10 +285,10 @@ class TrainingLossTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "PatchMatch"):
                 losses.compute_training_losses(pkg, cam, None, opt, schedule)
             result = losses.compute_training_losses(
-                pkg, cam, None, opt, schedule, patchmatch=patchmatch, iteration=10
+                pkg, cam, None, opt, schedule, patchmatch=patchmatch, iteration=7001
             )
         self.assertEqual(len(calls), 1)
-        self.assertEqual(calls[0][4], 10)
+        self.assertEqual(calls[0][4], 7001)
         self.assertIs(calls[0][5], depth_normal)
         self.assertAlmostEqual(result.total.item(), 1.3, places=6)
 

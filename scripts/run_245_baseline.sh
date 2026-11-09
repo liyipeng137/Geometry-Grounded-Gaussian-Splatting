@@ -20,6 +20,4 @@ exec "$gggs_python" train.py \
   --depth_prior_dir global_depth/depth_npy \
   --depth_prior_format npy \
   --frame_gpu_budget 4 \
-  --lambda_normal_prior 0 \
-  --lambda_multi_view_ncc 0.02 \
   "$@"

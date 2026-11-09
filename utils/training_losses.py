@@ -11,7 +11,7 @@
 
 """真实相机的训练目标：集中管理启用时机、原始损失与加权贡献。
 
-本模块保留旧 train.py 的真实视角算式，不引入伪视角、额外平滑或新监督。
+normal prior 与 NCC 沿用 train_demo 的权重日程；其他真实视角算式保持不变。
 RGB 的曝光/外观分支继续由 photometric_rgb_loss 负责；这里只组织各目标。
 """
 
@@ -30,6 +30,8 @@ class LossSchedule:
     depth_prior_enabled: bool
     needs_depth: bool
     depth_prior_weight: float
+    normal_prior_weight: float
+    multi_view_ncc_weight: float
 
 
 @dataclass
@@ -68,9 +70,9 @@ class LossTerms:
             "rgb": self.rgb,
             "mask": opt.lambda_mask * self.mask,
             "depth_normal": opt.lambda_depth_normal * self.depth_normal,
-            "normal_prior": opt.lambda_normal_prior * self.normal_prior,
+            "normal_prior": schedule.normal_prior_weight * self.normal_prior,
             "depth_prior": schedule.depth_prior_weight * self.depth_prior,
-            "ncc": opt.lambda_multi_view_ncc * self.ncc,
+            "ncc": schedule.multi_view_ncc_weight * self.ncc,
             "geo": opt.lambda_multi_view_geo * self.geo,
         }
 
@@ -84,14 +86,49 @@ def ramp_weight(iteration, start_iteration, ramp_iterations):
     return min((iteration - start_iteration + 1) / ramp_iterations, 1.0)
 
 
+def normal_prior_weight(iteration, opt):
+    """train_demo 的 7k init / 15k geometry 日程；15k 后保持尾段权重。
+
+    lambda_normal_prior 是初始/尾段基准，默认 .1；中段依次为 1.5 倍和 2 倍。
+    短训按 demo 截断 geometry 终点；长训截断进度，避免原 demo 外推成负权重。
+    """
+    if iteration < opt.normal_prior_from_iter:
+        return 0.0
+    if iteration <= 3000:
+        multiplier = 1.0
+    elif iteration <= 5000:
+        multiplier = 1.5
+    elif iteration <= 7000:
+        multiplier = 2.0
+    else:
+        geometry_end = min(15000, opt.iterations)
+        progress = min((iteration - 7001) / max(geometry_end - 7001, 1), 1.0)
+        multiplier = 2.0 if progress < 0.5 else 2.0 - (progress - 0.5) / 0.5
+    return opt.lambda_normal_prior * multiplier
+
+
+def multi_view_ncc_weight(iteration, opt):
+    """有 normal prior 的 demo NCC 日程；15k 后保持尾值，不采用无 prior 分支。
+
+    lambda_multi_view_ncc 默认 .2，geometry 前半程降至其一半，后半程降至四分之一。
+    短训的 geometry 终点与 normal prior 一样截到总 iterations。
+    """
+    if iteration <= 7000:
+        return 0.0
+    geometry_end = min(15000, opt.iterations)
+    progress = min((iteration - 7001) / max(geometry_end - 7001, 1), 1.0)
+    if progress < 0.5:
+        multiplier = 1.0 + (0.5 - 1.0) * (progress / 0.5)
+    else:
+        multiplier = 0.5 + (0.25 - 0.5) * ((progress - 0.5) / 0.5)
+    return opt.lambda_multi_view_ncc * multiplier
+
+
 def loss_schedule(camera, opt, iteration):
     """根据实际参数和当前帧 prior 决定启用项，不再由目录名称猜测场景类型。"""
     reg_enabled = iteration >= opt.regularization_from_iter
-    normal_enabled = (
-        opt.lambda_normal_prior > 0
-        and iteration >= opt.normal_prior_from_iter
-        and camera.normal_prior is not None
-    )
+    normal_weight = normal_prior_weight(iteration, opt) if camera.normal_prior is not None else 0.0
+    normal_enabled = normal_weight > 0
     depth_enabled = (
         opt.lambda_depth_prior > 0
         and iteration >= opt.depth_prior_from_iter
@@ -104,6 +141,8 @@ def loss_schedule(camera, opt, iteration):
         needs_depth=reg_enabled or normal_enabled or depth_enabled,
         depth_prior_weight=opt.lambda_depth_prior
         * ramp_weight(iteration, opt.depth_prior_from_iter, opt.depth_prior_ramp_iters),
+        normal_prior_weight=normal_weight,
+        multi_view_ncc_weight=multi_view_ncc_weight(iteration, opt) if reg_enabled else 0.0,
     )
 
 
@@ -181,15 +220,16 @@ def compute_training_losses(
                 valid_points.squeeze(), error, torch.zeros_like(error)
             ).mean()
 
-    # 外部法线保留原来的无向 cosine：正反方向都视为一致；本次不改成有向损失。
+    # 与 train_demo 一致：有向 cosine，只监督 alpha>.5 的有效几何像素。
+    # alpha 仅用于布尔筛选，不缩放 prior，也不接收本项的梯度。
     if schedule.normal_prior_enabled:
-        prior = camera.normal_prior * render_pkg["mask"].detach()
-        mask = camera.normal_prior_mask.squeeze(0) & valid_points.squeeze()
+        prior = camera.normal_prior
+        mask = camera.normal_prior_mask.squeeze(0) & (render_pkg["mask"].squeeze(0) > 0.5) & valid_points.squeeze()
         if mask.any():
             render_error = (
-                1 - F.cosine_similarity(render_pkg["normal"], prior, dim=0).abs()
+                1 - F.cosine_similarity(render_pkg["normal"], prior, dim=0)
             )
-            depth_error = 1 - F.cosine_similarity(depth_normal, prior, dim=0).abs()
+            depth_error = 1 - F.cosine_similarity(depth_normal, prior, dim=0)
             terms.normal_prior = (render_error + depth_error)[mask].mean()
 
     if schedule.depth_prior_enabled:
@@ -207,7 +247,7 @@ def compute_training_losses(
             terms.depth_prior = masked_l1_depth_loss(depth, prior, mask)
 
     if schedule.reg_enabled and (
-        opt.lambda_multi_view_ncc > 0 or opt.lambda_multi_view_geo > 0
+        schedule.multi_view_ncc_weight > 0 or opt.lambda_multi_view_geo > 0
     ):
         if patchmatch is None:
             raise ValueError("Enabled multi-view losses require a PatchMatch instance")
