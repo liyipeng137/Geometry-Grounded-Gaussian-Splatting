@@ -15,6 +15,18 @@
 #include <torch/extension.h>
 #include <tuple>
 
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+GeometryScoreCUDA(
+    const torch::Tensor& means3D, const torch::Tensor& opacity,
+    const torch::Tensor& scales, const torch::Tensor& rotations,
+    const float scale_modifier, const torch::Tensor& viewmatrix,
+    const torch::Tensor& projmatrix, const float tan_fovx, const float tan_fovy,
+    const float kernel_size, const torch::Tensor& campos,
+    const torch::Tensor& target_range, const torch::Tensor& tolerance_range,
+    const torch::Tensor& error_map, const torch::Tensor& support_map,
+    const torch::Tensor& weight_map, const int image_height,
+    const int image_width, const bool debug);
+
 std::tuple<int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 RasterizeGaussiansCUDA(
     const torch::Tensor& background,
@@ -44,6 +56,7 @@ RasterizeGaussiansCUDA(
     const bool require_depth,
     const bool get_flag,
     const bool record_transmittance,
+    const int depth_search_expansions,
     const bool debug);
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
@@ -82,6 +95,7 @@ RasterizeGaussiansBackwardCUDA(
     const torch::Tensor& imageBuffer,
     const torch::Tensor& tileBuffer,
     const bool require_depth,
+    const bool protect_invalid_depth,
     const bool debug);
 
 torch::Tensor markVisible(

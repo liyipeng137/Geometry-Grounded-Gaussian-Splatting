@@ -19,6 +19,15 @@
 #include <glm/glm.hpp>
 
 namespace FORWARD {
+// 独立几何评分，只读排序后的 Gaussian；所有输出均为浮点 alpha*T 累积。
+void geometryScore(
+    const dim3 grid, dim3 block, const uint2* ranges, const uint32_t* point_list,
+    int W, int H, const float2* means2D, const float4* conic_opacity,
+    const float4* ray_planes, const float* target_range, const float* tolerance_range,
+    const float* error_map, const float* support_map, const float* weight_map,
+    float* error_sum, float* support_sum, float* near_weight_sum,
+    float* weight_sum, float* off_surface_sum);
+
 // Perform initial steps for each Gaussian prior to rasterization.
 void preprocess(
     const int P, int SHD, int SHM, int SGD, int SGM,
@@ -80,7 +89,8 @@ void render(
     float* out_normal,
     float* out_mdepth,
     float* normal_length,
-    bool require_depth);
+    bool require_depth,
+    int depth_search_expansions = 0);
 } // namespace FORWARD
 
 #endif

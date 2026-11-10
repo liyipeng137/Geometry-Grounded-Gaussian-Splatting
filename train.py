@@ -6,15 +6,16 @@
 # under the terms of the LICENSE.md file.
 # For inquiries contact george.drettakis@inria.fr
 #
-"""GGGS 真实相机基线训练。
+"""GGGS 正式入口：真实基线，以及固定 GenRecon 虚拟几何联合流程。
 
 阅读顺序：main → training → update_topology。
 损失细节在 utils/training_losses.py；配置、日志、评估和 checkpoint 在
 utils/training_io.py。这里保留训练阶段的先后关系，不隐藏在 Trainer 框架中。
 
-此入口不再包含伪视角 / R2C 实验。初始化仍是当前训练相机的 RGBD→TSDF
-点云，并非直接加载 tsdf_mesh.ply。normal prior 与 NCC 默认采用 train_demo 日程；
-训练帧必须同时有 normal/depth prior，详见 docs/training_baseline.md。
+初始化仍是当前真实相机的 RGBD→TSDF 点云。指定 --virtual_geometry_config
+后额外加入已审核机位的固定D/N；没有虚拟RGB、appearance ID或PatchMatch邻居。
+真实监督保留，几何增密/补点在optimizer安全边界后统一提交。
+详见 docs/virtual_geometry_training.md；省略配置时保持原真实基线生命周期。
 """
 
 import math
@@ -223,19 +224,55 @@ def update_topology(
 
 
 def training(dataset, opt, pipe, args):
-    """一次真实相机基线训练；每个 iteration 渲染一个相机。"""
+    """每步必有真实相机，按日程附加虚拟相机，两路梯度共用一次参数更新。
+
+    baseline保留backward→topology→step；joint使用step→安全拓扑事务。
+    虚拟渲染不推进iteration，不增加独立optimizer step。
+    """
     validate_options(opt, args)
 
+    joint_config = teacher = joint = None
+    if getattr(args, "virtual_geometry_config", None):
+        if dataset.disable_filter3D:
+            raise ValueError("Virtual geometry uses the joint 3D filter; --disable_filter3D is incompatible")
+        from utils.virtual_geometry_config import load_joint_config, config_identity, virtual_schedule
+        from utils.virtual_geometry_data import VirtualGeometryDataset
+        from utils.virtual_geometry_losses import compute_virtual_geometry_losses
+        from utils.geometry_topology import GeometryTopology
+        from utils.joint_runtime import JointRuntime, JOINT_RUNTIME_KEY
+        from utils.training_io import JOINT_RESUME_POLICY
+        from utils.virtual_geometry_config import JOINT_RECIPE
+
+        joint_config = load_joint_config(args.virtual_geometry_config)
+        opt.dense_optimizer_updates = True
+        args.dense_optimizer_updates = True
+        teacher = VirtualGeometryDataset(
+            joint_config["teacher_manifest"], device="cuda",
+            gpu_cache_size=joint_config["gpu_cache_size"],
+            cpu_cache_size=joint_config["cpu_cache_size"], seed=args.training_seed,
+        )
+
     # 1. 初始化与可选续训。Scene 负责完整 K/pose、输入对应和 RGBD 初值。
-    parameters, start_iteration, split = load_checkpoint(args.start_checkpoint)
+    if joint_config:
+        parameters, start_iteration, split = load_checkpoint(args.start_checkpoint, joint=True)
+        joint_identity = {"config_sha256": config_identity(joint_config), "teacher": teacher.identity}
+        if parameters is not None and parameters[14][JOINT_RUNTIME_KEY]["identity"] != joint_identity:
+            raise ValueError("Joint checkpoint teacher/config changed; use a fresh output/run")
+    else:
+        parameters, start_iteration, split = load_checkpoint(args.start_checkpoint)
     if start_iteration >= opt.iterations:
         raise ValueError(
             "Checkpoint iteration must be smaller than the requested iterations"
         )
-    writer = prepare_output(dataset, opt, pipe, args)
+    if joint_config:
+        writer = prepare_output(dataset, opt, pipe, args, joint_config=joint_config, joint_identity=joint_identity)
+    else:
+        writer = prepare_output(dataset, opt, pipe, args)
     gaussians = GaussianModel(dataset.sh_degree, dataset.sg_degree)
     scene = Scene(dataset, gaussians)
     validate_training_priors(scene.getTrainCameras())
+    if teacher is not None:
+        teacher.validate_real_cameras(scene.getTrainCameras(), dataset.source_path)
     gaussians.training_setup(opt)
     restore_checkpoint(
         gaussians, opt, args.start_checkpoint, parameters, split, scene.model_path
@@ -250,6 +287,18 @@ def training(dataset, opt, pipe, args):
         device="cuda",
     )
     refresh_filter(gaussians, dataset, cameras)
+
+    # 虚拟cache独立，不改变真实相机集合、scene extent和外观参数身份。
+    viewpoint_stack = []
+    if joint_config:
+        topology = GeometryTopology(
+            gaussians, scene, teacher, joint_config, pipe, background,
+            dataset.kernel_size, frame_cache=frame_cache, opt=opt,
+        )
+        joint = JointRuntime(joint_config, teacher, topology, scene.model_path, start_iteration)
+        if parameters is not None:
+            viewpoint_stack = joint.restore(parameters[14][JOINT_RUNTIME_KEY], gaussians, cameras)
+            parameters = None  # 拓扑变动后不继续持有旧checkpoint的大张量。
 
     # 构造与调用 PatchMatch 使用同一份有效权重，关闭两项时不建立它。
     patchmatch = None
@@ -274,12 +323,14 @@ def training(dataset, opt, pipe, args):
     )
 
     logger = TrainingLogger(scene, opt, args, start_iteration, writer)
+    if joint:
+        logger.stats.update(recipe=JOINT_RECIPE, rng_resume_policy=JOINT_RESUME_POLICY,
+                            iteration_order="real/virtual backward -> optimizer -> safe topology -> save")
     start_event, end_event = (
         torch.cuda.Event(enable_timing=True),
         torch.cuda.Event(enable_timing=True),
     )
     progress = tqdm(total=opt.iterations - start_iteration, desc="Training")
-    viewpoint_stack = []
     try:
         for iteration in range(start_iteration + 1, opt.iterations + 1):
             start_event.record()
@@ -299,6 +350,7 @@ def training(dataset, opt, pipe, args):
 
             # 3. 渲染。需要 D/N 的阶段才请求 median depth，避免额外 CUDA 工作。
             schedule = loss_schedule(camera, opt, iteration)
+            render_options = {"depth_search_expansions": joint_config["depth_search_expansions"]} if joint else {}
             buffers = render(
                 camera,
                 gaussians,
@@ -306,6 +358,7 @@ def training(dataset, opt, pipe, args):
                 background,
                 dataset.kernel_size,
                 require_depth=schedule.needs_depth,
+                **render_options,
             )
 
             # 4. 同视角几何 / prior 和相邻视角 PatchMatch，统一计算与加权。
@@ -329,13 +382,40 @@ def training(dataset, opt, pipe, args):
                 nearest_camera=nearest,
                 iteration=iteration,
             )
+            if joint and not bool(torch.isfinite(losses.total)):
+                raise FloatingPointError(f"Nonfinite real loss before joint update at iteration {iteration}")
             losses.total.backward()
+            if joint:
+                joint.topology.collect_real(buffers)
+                use_virtual, ramp, stage = virtual_schedule(iteration, joint_config)
+                if use_virtual:
+                    virtual_index, virtual_camera = teacher.next_view()
+                    virtual_buffers = render(
+                        virtual_camera, gaussians, pipe, background, dataset.kernel_size,
+                        require_depth=True, **render_options,
+                    )
+                    virtual_losses = compute_virtual_geometry_losses(
+                        virtual_buffers, virtual_camera, weights=joint_config["loss_weights"], ramp=ramp,
+                    )
+                    if not bool(torch.isfinite(virtual_losses.total)):
+                        raise FloatingPointError(f"Nonfinite virtual loss before update at iteration {iteration}")
+                    virtual_losses.total.backward()
+                    joint.topology.collect_virtual(virtual_buffers, virtual_camera)
+                    joint.record(iteration, virtual_index, virtual_camera, virtual_losses, stage, ramp)
+                    del virtual_losses, virtual_buffers
             end_event.record()
             # 原循环通过 loss.item() 隐式等待 CUDA；这里显式等待后再读取事件。
             end_event.synchronize()
 
-            # 5. 仅记录 / 评估 / 保存 PLY。保持旧版“optimizer 前 PLY”语义。
+            # 5. joint先更新，再到SH累积已消费的边界增删点，最后保存。
+            # baseline保留原先optimizer前保存PLY的语义。
             with torch.no_grad():
+                if joint:
+                    gaussians.optimizer_step(iteration)
+                    if iteration == joint_config["last_opacity_reset"]:
+                        gaussians.reset_opacity()
+                        logger.stats["opacity_reset_iterations"].append(iteration)
+                    joint.topology.step(iteration)
                 logger.record_loss(
                     iteration,
                     camera,
@@ -374,46 +454,50 @@ def training(dataset, opt, pipe, args):
                     print(f"[ITER {iteration}] Saving Gaussian PLY")
                     scene.save(iteration)
 
-                # 6. 增密 / 剪枝 / opacity reset / filter。必须先于 optimizer。
-                update_topology(
-                    iteration,
-                    gaussians,
-                    scene,
-                    dataset,
-                    opt,
-                    pipe,
-                    background,
-                    buffers,
-                    logger.stats,
-                    frame_cache,
-                )
+                # 6. 原真实baseline专用：保持topology-before-step。joint已在上方提交。
+                if not joint:
+                    update_topology(
+                        iteration, gaussians, scene, dataset, opt, pipe, background,
+                        buffers, logger.stats, frame_cache,
+                    )
 
-                # 7. 参数更新。不要在主循环额外 zero_grad：FastGS 依靠累积梯度。
-                # 旧配方最后一个 iteration 仅计算/导出，不执行 optimizer.step。
-                if iteration < opt.iterations:
+                # 7. baseline末步仅导出；joint在上方每步（含末步）都已更新。
+                # 两条路径都不额外zero_grad，以保留尚未消费的SH累计梯度。
+                if not joint and iteration < opt.iterations:
                     gaussians.optimizer_step(iteration)
 
                 # 8. checkpoint 在更新后保存，与只含模型的 PLY 区分开。
                 if iteration in args.checkpoint_iterations:
-                    save_checkpoint(gaussians, scene, iteration, args)
+                    if joint:
+                        save_checkpoint(gaussians, scene, iteration, args,
+                                        joint_runtime=joint.capture(gaussians, viewpoint_stack))
+                    else:
+                        save_checkpoint(gaussians, scene, iteration, args)
                 if (
                     iteration % 100 == 0
                     or iteration in args.checkpoint_iterations
                     or iteration == opt.iterations
                 ):
+                    if joint:
+                        joint.flush()
+                        logger.stats["virtual_geometry"] = joint.summary()
                     logger.flush_stats(gaussians)
         logger.stats["status"] = "completed"
     except Exception as error:
         logger.stats.update(status="failed", error=f"{type(error).__name__}: {error}")
         raise
     finally:
+        if joint:
+            joint.flush()
+            logger.stats["virtual_geometry"] = joint.summary()
+            joint.close()
         logger.flush_stats(gaussians)
         logger.close()
         progress.close()
 
 
 def main():
-    parser = ArgumentParser(description="GGGS real-camera baseline training")
+    parser = ArgumentParser(description="GGGS real-camera and GenRecon virtual-geometry joint training")
     model = ModelParams(parser)
     optimization = OptimizationParams(parser)
     pipeline = PipelineParams(parser)
@@ -447,6 +531,10 @@ def main():
         help="The final iteration is always checkpointed",
     )
     parser.add_argument("--start_checkpoint", type=str, default=None)
+    parser.add_argument(
+        "--virtual_geometry_config", type=str, default=None,
+        help="正式虚拟D/N联合流程JSON；省略时保持真实基线，需先准备固定teacher缓存",
+    )
     parser.add_argument("--training_seed", type=int, default=0)
     parser.add_argument(
         "--log_interval",

@@ -238,16 +238,18 @@ class GaussianModel:
         validated_payload = list(model_args)
         validated_payload[7] = self._opacity
         _require_finite_restore_values(validated_payload)
+        # 先恢复外观对象，再建optimizer；否则mode3会更新Scene的旧embedding，
+        # 而photometric loss使用checkpoint的新Parameter，续训时二者失去绑定。
+        self._appearance_embeddings = _appearance_embeddings
+        if self.app_model == self.App_model.GOF:
+            self.appearance_network = AppearanceNetwork(3 + 64, 3).cuda()
+            self.appearance_network.load_state_dict(app_dict)
         self.training_setup(training_args)
         self.xyz_gradient_accum = xyz_gradient_accum
         self.denom = denom
         self.optimizer.load_state_dict(opt_dict)
         if self.shoptimizer is not None and shopt_dict is not None:
             self.shoptimizer.load_state_dict(shopt_dict)
-        if self.app_model == self.App_model.GOF:
-            self.appearance_network = AppearanceNetwork(3 + 64, 3).cuda()
-            self.appearance_network.load_state_dict(app_dict)
-        self._appearance_embeddings = _appearance_embeddings
         if self.app_model == self.App_model.PPISP:
             self.ppisp.restore(app_dict)
 
@@ -931,6 +933,22 @@ class GaussianModel:
         self._sg_sharpness = self._sg_sharpness[valid_points_mask]
         self._sg_color = self._sg_color[valid_points_mask]
         self.filter_3D = self.filter_3D[valid_points_mask]
+
+    @torch.no_grad()
+    def apply_topology_transaction(self, keep, additions, addition_filter, metadata,
+                                   addition_metadata, max_points=2500000):
+        """Joint-only atomic mutation after main/SH gradients are consumed."""
+        from utils.geometry_topology import apply_gaussian_transaction
+        return apply_gaussian_transaction(self, keep, additions, addition_filter,
+                                          metadata, addition_metadata, max_points)
+
+    @torch.no_grad()
+    def compute_joint_3D_filter(self, cameras, metadata, virtual_records):
+        """Real-camera filter, with a bounded Gen-only witness fallback."""
+        from utils.geometry_topology import joint_filter_for_points
+        self.filter_3D = joint_filter_for_points(
+            self.get_xyz, cameras, metadata["root_gen"], metadata["h_ref"],
+            metadata["witness"], virtual_records, self.filter_3D)
 
     def cat_tensors_to_optimizer(self, tensors_dict):
         optimizable_tensors = {}

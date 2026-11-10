@@ -16,6 +16,12 @@ from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianR
 from scene.gaussian_model import GaussianModel
 
 
+DEPTH_NO_CONTRIBUTOR = 0
+DEPTH_LOW_COVERAGE = 1
+DEPTH_ROOT_FAILED = 2
+DEPTH_VALID = 3
+
+
 def render(
     viewpoint_camera,
     pc: GaussianModel,
@@ -27,6 +33,7 @@ def render(
     get_flag: bool = False,
     metric_map: Optional[torch.Tensor] = None,
     record_transmittance: bool = False,
+    depth_search_expansions: int = 0,
 ):
     """
     Render the scene. 
@@ -67,6 +74,7 @@ def render(
         get_flag=get_flag,
         metric_map=metric_map,
         record_transmittance=record_transmittance,
+        depth_search_expansions=depth_search_expansions,
     )
 
     rasterizer = GaussianRasterizer(raster_settings=raster_settings)
@@ -125,6 +133,16 @@ def render(
     if require_depth and hasattr(viewpoint_camera, "camera_z_depth"):
         rendered_median_depth = viewpoint_camera.camera_z_depth(rendered_median_depth)
 
+    depth_status = None
+    if require_depth:
+        # no_contributor 指没有通过 rasterizer alpha 截断的实际贡献；并非
+        # 声称像素邻域中完全没有 Gaussian 中心或 footprint。
+        with torch.no_grad():
+            depth_status = torch.full_like(rendered_alpha, DEPTH_ROOT_FAILED, dtype=torch.int8)
+            depth_status[rendered_alpha < 0.55] = DEPTH_LOW_COVERAGE
+            depth_status[rendered_alpha == 0] = DEPTH_NO_CONTRIBUTOR
+            depth_status[torch.isfinite(rendered_median_depth) & (rendered_median_depth > 0)] = DEPTH_VALID
+
     # Those Gaussians that were frustum culled or had a radius of 0 were not visible.
     # They will be excluded from value updates used in the splitting criteria.
     return {"render": rendered_image,
@@ -137,7 +155,64 @@ def render(
             "accum_metric_counts": accum_metric_counts,
             "transmittance_avg": transmittance_avg,
             "num_covered_pixels": num_covered_pixels,
+            "depth_status": depth_status,
             }
+
+
+@torch.no_grad()
+def geometry_score(camera, pc, pipe, bg, kernel_size, target_depth, depth_tolerance,
+                   error_map, support_map, weight_map):
+    """几何归属统计，不反传，也不复用 RGB 的整数 metricCount。
+
+    输入 D/tolerance 为 camera-Z；每条有效 teacher 射线按 W*alpha*T 累计。
+    weight_sum 覆盖所有实际贡献，near_weight_sum/error_sum/support_sum 仅
+    覆盖 ray-plane 峰值落在目标深度带内的贡献，off_surface_sum 是带外贡献。
+    完全空射线不会产生逐点机会；它们由像素 coverage/repair 单独处理。
+    """
+    device = pc.get_xyz.device
+    height, width = camera.image_height, camera.image_width
+
+    def image_map(value, name):
+        tensor = torch.as_tensor(value, dtype=torch.float32, device=device)
+        if tensor.numel() == 1:
+            tensor = tensor.expand(height, width)
+        if tensor.numel() != height * width:
+            raise ValueError(f"{name} must match the camera pixel grid")
+        return tensor.reshape(height, width).contiguous()
+
+    depth = image_map(target_depth, "target_depth")
+    tolerance = image_map(depth_tolerance, "depth_tolerance")
+    error = image_map(error_map, "error_map")
+    support = image_map(support_map, "support_map")
+    weight = image_map(weight_map, "weight_map")
+    for name, tensor in (("error_map", error), ("support_map", support), ("weight_map", weight)):
+        if not torch.isfinite(tensor).all() or (tensor < 0).any():
+            raise ValueError(f"{name} must be finite and nonnegative")
+    valid = torch.isfinite(depth) & (depth > 0) & torch.isfinite(tolerance) & (tolerance > 0)
+    weight = torch.where(valid, weight, 0).contiguous()
+    # CUDA ray_plane 的 t 是射线距离。不能乘图像中心的旧 rln 因子：
+    # 非中心主点必须使用真实 K，与 camera_z_depth 的逆变换一致。
+    x = (torch.arange(width, device=device, dtype=torch.float32) - camera.Cx) / camera.Fx
+    y = (torch.arange(height, device=device, dtype=torch.float32) - camera.Cy) / camera.Fy
+    ray_norm = torch.sqrt(1 + x[None, :].square() + y[:, None].square())
+    target_range = torch.where(valid, depth * ray_norm, 0).contiguous()
+    tolerance_range = torch.where(valid, tolerance * ray_norm, 0).contiguous()
+    settings = GaussianRasterizationSettings(
+        image_height=height, image_width=width,
+        tanfovx=math.tan(camera.FoVx * 0.5), tanfovy=math.tan(camera.FoVy * 0.5),
+        kernel_size=kernel_size, bg=bg, scale_modifier=1.0,
+        viewmatrix=camera.world_view_transform, projmatrix=camera.full_proj_transform,
+        sh_degree=0, sg_degree=0, campos=camera.camera_center,
+        prefiltered=False, require_depth=False, debug=pipe.debug,
+        get_flag=False, metric_map=torch.empty(0, dtype=torch.int32, device=device),
+    )
+    scales, opacity = pc.get_scaling_n_opacity_with_3D_filter
+    outputs = GaussianRasterizer(settings).geometry_score(
+        pc.get_xyz, opacity, scales, pc.get_rotation, target_range,
+        tolerance_range, error, support, weight,
+    )
+    names = ("error_sum", "support_sum", "near_weight_sum", "weight_sum", "off_surface_sum")
+    return dict(zip(names, outputs))
 
 # integration is adopted from GOF for marching tetrahedra https://github.com/autonomousvision/gaussian-opacity-fields/blob/main/gaussian_renderer/__init__.py
 def integrate(points3D, viewpoint_camera, pc : GaussianModel, pipe, kernel_size : float, scaling_modifier = 1.0):

@@ -23,6 +23,7 @@ from scene.train_split import (
     validate_checkpoint_split,
 )
 from utils.photometric import get_photometric_backend
+from utils.virtual_geometry_config import JOINT_RECIPE
 
 
 RECIPE = "gggs_real_baseline"
@@ -30,6 +31,11 @@ RESUME_POLICY = (
     "Same-dataset continuation; process RNG is reseeded. Camera sampling stack, "
     "RNG states and pending accumulated gradients are not restored."
 )
+JOINT_RESUME_POLICY = (
+    "Same real dataset and frozen teacher/config; restore real/virtual sampling, "
+    "RNG, pending SH gradients and topology state. CUDA kernels need not be bitwise deterministic."
+)
+JOINT_RUNTIME_KEY = "gggs_virtual_geometry_runtime"
 
 
 def write_json(path, value):
@@ -61,14 +67,25 @@ def require_baseline_checkpoint(state, iteration):
     return state
 
 
-def load_checkpoint(path):
+def require_joint_checkpoint(state, iteration):
+    if (not isinstance(state, dict) or state.get("schema_version") != 2
+            or state.get("recipe") != JOINT_RECIPE or state.get("iteration") != iteration
+            or not isinstance(state.get("joint_identity"), dict)):
+        raise ValueError("Resume requires a matching virtual-geometry joint checkpoint")
+    # Reuse the existing real-data/initialization contract; only the recipe differs.
+    require_baseline_checkpoint({**state, "schema_version": 1, "recipe": RECIPE}, iteration)
+    return state
+
+
+def load_checkpoint(path, joint=False):
     """先验证配方与数据证明，再建立 Scene；不信任旁边的 sidecar 代替嵌入状态。"""
     if not path:
         return None, 0, None
     parameters, iteration = torch.load(path, weights_only=False)
-    state = require_baseline_checkpoint(
-        checkpoint_training_state(parameters, iteration), iteration
-    )
+    validator = require_joint_checkpoint if joint else require_baseline_checkpoint
+    state = validator(checkpoint_training_state(parameters, iteration), iteration)
+    if joint and not isinstance(parameters[14].get(JOINT_RUNTIME_KEY), dict):
+        raise ValueError("Joint checkpoint lacks optimizer/topology/sampler continuation state")
     split = read_checkpoint_split(path, embedded_state=state)
     return parameters, iteration, split
 
@@ -79,7 +96,7 @@ def restore_checkpoint(gaussians, opt, path, parameters, split, output):
         gaussians.restore(parameters, opt)
 
 
-def prepare_output(dataset, opt, pipe, args):
+def prepare_output(dataset, opt, pipe, args, joint_config=None, joint_identity=None):
     """保存实际生效配置；cfg_args 继续兼容现有 render / mesh_extract 入口。"""
     if not dataset.model_path:
         run_id = os.getenv("OAR_JOB_ID") or str(uuid.uuid4())[:10]
@@ -109,13 +126,14 @@ def prepare_output(dataset, opt, pipe, args):
             "config": asdict(PPISPConfig(use_controller=False, controller_distillation=False)),
             "rgb_supervision": "L1 and SSIM on PPISP output",
             "vcd_vcp": "PPISP output compared with captured RGB",
-            "optimizer": "official PPISP optimizer/scheduler, every non-final iteration",
+            "optimizer": ("official PPISP optimizer/scheduler, every iteration including final"
+                          if joint_config else "official PPISP optimizer/scheduler, every non-final iteration"),
             "camera_groups": "COLMAP camera IDs; frames are training image identities",
         }
     write_json(
         output / "training_config.json",
         {
-            "recipe": RECIPE,
+            "recipe": JOINT_RECIPE if joint_config else RECIPE,
             **groups,
             "resolved_args": {
                 key: value for group in groups.values() for key, value in group.items()
@@ -159,8 +177,13 @@ def prepare_output(dataset, opt, pipe, args):
             else "legacy_fastgs",
             "photometric_backend": get_photometric_backend(),
             "ppisp": ppisp_config,
-            "iteration_order": "backward -> report/PLY -> topology/filter -> optimizer (except final iteration) -> checkpoint",
-            "rng_resume_policy": RESUME_POLICY,
+            "iteration_order": (
+                "real backward -> optional virtual backward -> optimizer (including final iteration) -> safe topology -> report/PLY/checkpoint"
+                if joint_config else
+                "backward -> report/PLY -> topology/filter -> optimizer (except final iteration) -> checkpoint"
+            ),
+            "rng_resume_policy": JOINT_RESUME_POLICY if joint_config else RESUME_POLICY,
+            "virtual_geometry": {"config": joint_config, "identity": joint_identity} if joint_config else None,
             "argv": sys.argv,
         },
     )
@@ -173,20 +196,26 @@ def prepare_output(dataset, opt, pipe, args):
     return SummaryWriter(str(output))
 
 
-def save_checkpoint(gaussians, scene, iteration, args):
+def save_checkpoint(gaussians, scene, iteration, args, joint_runtime=None):
     """checkpoint 位于 optimizer 之后；保留相机、标定、输入内容和初始化校验。"""
     output = Path(scene.model_path)
     state = {
-        "schema_version": 1,
-        "recipe": RECIPE,
+        "schema_version": 2 if joint_runtime else 1,
+        "recipe": JOINT_RECIPE if joint_runtime else RECIPE,
         "iteration": iteration,
         "training_seed": args.training_seed,
-        "rng_resume_policy": RESUME_POLICY,
+        "rng_resume_policy": JOINT_RESUME_POLICY if joint_runtime else RESUME_POLICY,
         "camera_split": json.loads((output / "camera_split.json").read_text()),
     }
-    require_baseline_checkpoint(state, iteration)
+    if joint_runtime:
+        state["joint_identity"] = joint_runtime["identity"]
+        require_joint_checkpoint(state, iteration)
+    else:
+        require_baseline_checkpoint(state, iteration)
     captured = gaussians.capture()
     captured[14][CHECKPOINT_STATE_KEY] = state
+    if joint_runtime:
+        captured[14][JOINT_RUNTIME_KEY] = joint_runtime
     path = output / f"chkpnt{iteration}.pth"
     temporary = path.with_suffix(".pth.tmp")
     torch.save((captured, iteration), temporary)

@@ -15,6 +15,7 @@
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("rasterize_gaussians", &RasterizeGaussiansCUDA);
   m.def("rasterize_gaussians_backward", &RasterizeGaussiansBackwardCUDA);
+  m.def("geometry_score_gaussians", &GeometryScoreCUDA);
   m.def("integrate_gaussians_to_points", &IntegrateGaussiansToPointsCUDA);
   m.def("evaluate_sdf_from_signle_view", &evaluateSDFfromSingleView);
   m.def("mark_visible", &markVisible);

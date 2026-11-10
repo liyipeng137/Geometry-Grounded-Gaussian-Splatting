@@ -64,7 +64,8 @@ public:
         bool record_transmittance = false,
         float* transmittance_sum  = nullptr,
         int* covered_count        = nullptr,
-        bool debug         = false);
+        bool debug         = false,
+        int depth_search_expansions = 0);
 
     static void backward(
         std::function<char*(size_t)> geometryBuffer,

@@ -307,7 +307,8 @@ int CudaRasterizer::Rasterizer::forward(
     bool record_transmittance,
     float* transmittance_sum,
     int* covered_count,
-    bool debug) {
+    bool debug,
+    int depth_search_expansions) {
     const float focal_y = height / (2.0f * tan_fovy);
     const float focal_x = width / (2.0f * tan_fovx);
 
@@ -442,7 +443,8 @@ int CudaRasterizer::Rasterizer::forward(
                    out_normal,
                    out_mdepth,
                    imgState.normal_length,
-                   require_depth),
+                   require_depth,
+                   depth_search_expansions),
                debug);
     return num_rendered;
 }

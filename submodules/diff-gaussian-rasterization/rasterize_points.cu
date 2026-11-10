@@ -11,6 +11,8 @@
 
 #include "cuda_rasterizer/config.h"
 #include "cuda_rasterizer/rasterizer.h"
+#include "cuda_rasterizer/rasterizer_impl.h"
+#include "cuda_rasterizer/render_forward.h"
 #include <cstdio>
 #include <cuda_runtime_api.h>
 #include <fstream>
@@ -65,10 +67,13 @@ RasterizeGaussiansCUDA(
     const bool require_depth,
     const bool get_flag,
     const bool record_transmittance,
+    const int depth_search_expansions,
     const bool debug) {
     if (means3D.ndimension() != 2 || means3D.size(1) != 3) {
         AT_ERROR("means3D must have dimensions (num_points, 3)");
     }
+    TORCH_CHECK(depth_search_expansions >= 0 && depth_search_expansions <= 4,
+                "depth_search_expansions must be between zero and four");
 
     const int P = means3D.size(0);
     const int H = image_height;
@@ -158,7 +163,8 @@ RasterizeGaussiansCUDA(
             record_transmittance,
             transmittance_sum_ptr,
             covered_count_ptr,
-            debug);
+            debug,
+            depth_search_expansions);
     }
     return std::make_tuple(
         rendered,
@@ -174,6 +180,67 @@ RasterizeGaussiansCUDA(
         metricCount,
         transmittance_sum,
         covered_count);
+}
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+GeometryScoreCUDA(
+    const torch::Tensor& means3D, const torch::Tensor& opacity,
+    const torch::Tensor& scales, const torch::Tensor& rotations,
+    const float scale_modifier, const torch::Tensor& viewmatrix,
+    const torch::Tensor& projmatrix, const float tan_fovx, const float tan_fovy,
+    const float kernel_size, const torch::Tensor& campos,
+    const torch::Tensor& target_range, const torch::Tensor& tolerance_range,
+    const torch::Tensor& error_map, const torch::Tensor& support_map,
+    const torch::Tensor& weight_map, const int image_height,
+    const int image_width, const bool debug) {
+    torch::NoGradGuard no_grad;
+    TORCH_CHECK(means3D.is_cuda() && means3D.scalar_type() == torch::kFloat32,
+                "geometry score expects CUDA float32 Gaussian parameters");
+    TORCH_CHECK(image_height > 0 && image_width > 0, "geometry score needs a nonempty pixel grid");
+    for (const auto* map : {&target_range, &tolerance_range, &error_map, &support_map, &weight_map}) {
+        TORCH_CHECK(map->is_cuda() && map->scalar_type() == torch::kFloat32 && map->is_contiguous(),
+                    "geometry score maps must be contiguous CUDA float32 tensors");
+        TORCH_CHECK(map->numel() == image_height * image_width, "geometry score map size mismatch");
+        TORCH_CHECK(map->device() == means3D.device(), "geometry score maps must share the Gaussian device");
+    }
+    const int P = means3D.size(0);
+    auto options = means3D.options();
+    auto errors = torch::zeros({P}, options), supports = torch::zeros({P}, options);
+    auto near_weights = torch::zeros({P}, options), weights = torch::zeros({P}, options);
+    auto off_surface = torch::zeros({P}, options);
+    if (P == 0)
+        return std::make_tuple(errors, supports, near_weights, weights, off_surface);
+
+    // 独立 no-grad pass 复用同一预处理、tile 排序与 alpha 截断；不求 D50、
+    // 不读取颜色模型，也不写训练端的增密梯度或 metricCount。
+    auto empty = torch::empty({0}, options);
+    auto metric = torch::empty({0}, options.dtype(torch::kInt32));
+    auto rendering = RasterizeGaussiansCUDA(
+        torch::zeros({3}, options), means3D, torch::zeros({P, 3}, options),
+        opacity, scales, rotations, empty, empty, empty, empty, empty,
+        0, 0, scale_modifier, viewmatrix, projmatrix, tan_fovx, tan_fovy,
+        kernel_size, metric, image_height, image_width, campos,
+        false, false, false, false, 0, debug);
+    const int rendered = std::get<0>(rendering);
+    char* geometry = reinterpret_cast<char*>(std::get<6>(rendering).data_ptr());
+    char* binning = reinterpret_cast<char*>(std::get<7>(rendering).data_ptr());
+    char* tiles = reinterpret_cast<char*>(std::get<9>(rendering).data_ptr());
+    auto geometry_state = CudaRasterizer::GeometryState::fromChunk(geometry, P);
+    auto binning_state = CudaRasterizer::BinningState::fromChunk(binning, rendered);
+    dim3 grid((image_width + BLOCK_X - 1) / BLOCK_X, (image_height + BLOCK_Y - 1) / BLOCK_Y, 1);
+    dim3 block(BLOCK_X, BLOCK_Y, 1);
+    auto tile_state = CudaRasterizer::TileState<false>::fromChunk(tiles, grid.x * grid.y);
+    FORWARD::geometryScore(grid, block, tile_state.gaussian_ranges,
+        binning_state.point_list, image_width, image_height, geometry_state.means2D,
+        geometry_state.conic_opacity, geometry_state.ray_planes,
+        target_range.data_ptr<float>(), tolerance_range.data_ptr<float>(),
+        error_map.data_ptr<float>(), support_map.data_ptr<float>(), weight_map.data_ptr<float>(),
+        errors.data_ptr<float>(), supports.data_ptr<float>(), near_weights.data_ptr<float>(),
+        weights.data_ptr<float>(), off_surface.data_ptr<float>());
+    TORCH_CHECK(cudaGetLastError() == cudaSuccess, "geometry score CUDA launch failed");
+    if (debug)
+        TORCH_CHECK(cudaDeviceSynchronize() == cudaSuccess, "geometry score CUDA execution failed");
+    return std::make_tuple(errors, supports, near_weights, weights, off_surface);
 }
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
@@ -212,10 +279,18 @@ RasterizeGaussiansBackwardCUDA(
     const torch::Tensor& imageBuffer,
     const torch::Tensor& tileBuffer,
     const bool require_depth,
+    const bool protect_invalid_depth,
     const bool debug) {
     const int P = means3D.size(0);
     const int H = dL_dout_color.size(1);
     const int W = dL_dout_color.size(2);
+    // 只改变 joint 调用：无 D50 根时不存在可用的隐函数深度导数。
+    // 默认 baseline 不额外处理，保持原来的数值路径。
+    torch::Tensor depth_gradient = dL_dout_mdepth;
+    if (protect_invalid_depth) {
+        depth_gradient = torch::where(torch::isfinite(mdepth) & mdepth.gt(0),
+                                      dL_dout_mdepth, torch::zeros_like(dL_dout_mdepth));
+    }
 
     int SHM = 0, SGM = 0;
     if (sh.size(0) != 0) {
@@ -274,7 +349,7 @@ RasterizeGaussiansBackwardCUDA(
             reinterpret_cast<char*>(imageBuffer.contiguous().data_ptr()),
             reinterpret_cast<char*>(tileBuffer.contiguous().data_ptr()),
             dL_dout_color.contiguous().data_ptr<float>(),
-            dL_dout_mdepth.contiguous().data_ptr<float>(),
+            depth_gradient.contiguous().data_ptr<float>(),
             dL_dout_alpha.contiguous().data_ptr<float>(),
             dL_dout_normal.contiguous().data_ptr<float>(),
             dL_dmeans3D.contiguous().data_ptr<float>(),

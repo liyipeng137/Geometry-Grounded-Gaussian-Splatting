@@ -103,6 +103,7 @@ class _RasterizeGaussians(torch.autograd.Function):
             raster_settings.require_depth,
             get_flag,
             record_transmittance,
+            raster_settings.depth_search_expansions,
             raster_settings.debug,
         )
 
@@ -245,6 +246,7 @@ class _RasterizeGaussians(torch.autograd.Function):
             imgBuffer,
             tileBuffer,
             raster_settings.require_depth,
+            raster_settings.depth_search_expansions > 0,
             raster_settings.debug,
         )
 
@@ -320,12 +322,27 @@ class GaussianRasterizationSettings(NamedTuple):
     get_flag: bool
     metric_map: torch.Tensor
     record_transmittance: bool = False
+    depth_search_expansions: int = 0
 
 
 class GaussianRasterizer(nn.Module):
     def __init__(self, raster_settings):
         super().__init__()
         self.raster_settings = raster_settings
+
+    @torch.no_grad()
+    def geometry_score(self, means3D, opacities, scales, rotations, target_range,
+                       tolerance_range, error_map, support_map, weight_map):
+        """No-grad alpha*T statistics; input depth bands are Euclidean ray ranges."""
+        settings = self.raster_settings
+        return _C.geometry_score_gaussians(
+            means3D.contiguous(), opacities.contiguous(), scales.contiguous(), rotations.contiguous(),
+            settings.scale_modifier, settings.viewmatrix, settings.projmatrix,
+            settings.tanfovx, settings.tanfovy, settings.kernel_size, settings.campos,
+            target_range.contiguous(), tolerance_range.contiguous(), error_map.contiguous(),
+            support_map.contiguous(), weight_map.contiguous(),
+            settings.image_height, settings.image_width, settings.debug,
+        )
 
     def markVisible(self, positions):
         # Mark visible points (based on frustum culling for camera) with a boolean

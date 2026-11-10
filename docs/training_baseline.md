@@ -1,5 +1,8 @@
 # GGGS 真实相机基线训练
 
+本文描述未指定 `--virtual_geometry_config` 的真实基线路径。
+同一 `train.py` 中的 GenRecon 联合模式另见 [虚拟几何训练说明](virtual_geometry_training.md)。
+
 这次整理以 `dev/gggs-fast-scene` 的 `0c9a4ac` 为起点，只保留真实相机训练。
 目标是把当前 GGGS 跑成后续对照基线；没有加入 Gaussian Wrapping 或改变渲染公式。
 

@@ -416,7 +416,8 @@ __global__ void __launch_bounds__(BLOCK_X* BLOCK_Y)
         float* __restrict__ out_alpha,
         float* __restrict__ out_normal,
         float* __restrict__ out_mdepth,
-        float* __restrict__ normal_length) {
+        float* __restrict__ normal_length,
+        const int depth_search_expansions) {
     // Identify current tile and associated min/max pixel range.
     auto block                 = cg::this_thread_block();
     uint32_t horizontal_blocks = (W + BLOCK_X - 1) / BLOCK_X;
@@ -661,6 +662,32 @@ __global__ void __launch_bounds__(BLOCK_X* BLOCK_Y)
         float w_max = __saturatef((T_p[0] - 0.5f) / (T_p[0] - T_p[SPLIT]));
         float w_min = 1.f - w_max;
         mDepth      = in_range ? w_max * depth_max + w_min * depth_min : 0.f;
+
+        // joint 模式仅为原来无根、但有足够 opacity 的像素有限扩大区间。
+        // 所有线程仍经过同一组 barrier；已命中的像素不重新计算或覆盖深度。
+        bool root_found = in_range && isfinite(mDepth) && mDepth > 0.f;
+        for (int attempt = 1; attempt <= depth_search_expansions; ++attempt) {
+            const bool retry = inside && !root_found && last_contributor > 0 && T <= MIN_TRANSMITTANCE;
+            if (!__syncthreads_or(retry))
+                break;
+            const float search_range = SAMPLE_RANGE * static_cast<float>(1 << attempt);
+            depth_min = fmaxf(mDepthinit - search_range, 0.f);
+            depth_max = fmaxf(mDepthinit + search_range, 0.f);
+            in_range = retry;
+            iter(std::true_type{});
+            for (int i = 0; i < SPLIT_ITERATIONS - 1; ++i)
+                iter(std::false_type{});
+            if (retry && in_range) {
+                const float upper_weight = __saturatef((T_p[0] - 0.5f) / (T_p[0] - T_p[SPLIT]));
+                const float candidate = upper_weight * depth_max + (1.f - upper_weight) * depth_min;
+                if (isfinite(candidate) && candidate > 0.f) {
+                    mDepth = candidate;
+                    root_found = true;
+                }
+            }
+        }
+        if (depth_search_expansions > 0 && !root_found)
+            mDepth = 0.f;
     }
     // All threads that treat valid pixel write out their final
     // rendering data to the frame and auxiliary buffers.
@@ -687,6 +714,90 @@ __global__ void __launch_bounds__(BLOCK_X* BLOCK_Y)
     }
     if (block.thread_rank() == 0)
         max_contributors[block_id] = block_max;
+}
+
+// 评分不能借用 metricCount：这里保留连续贡献及前后层的深度归属。
+__global__ void __launch_bounds__(BLOCK_X * BLOCK_Y) geometryScoreCUDA(
+    const uint2* ranges, const uint32_t* point_list, int W, int H,
+    const float2* means2D, const float4* conic_opacity, const float4* ray_planes,
+    const float* target_range, const float* tolerance_range,
+    const float* error_map, const float* support_map, const float* weight_map,
+    float* error_sum, float* support_sum, float* near_weight_sum,
+    float* weight_sum, float* off_surface_sum) {
+    auto block = cg::this_thread_block();
+    const uint32_t block_id = block.group_index().y * ((W + BLOCK_X - 1) / BLOCK_X) + block.group_index().x;
+    const uint2 pixel = {block.group_index().x * BLOCK_X + block.thread_index().x,
+                         block.group_index().y * BLOCK_Y + block.thread_index().y};
+    const bool inside = pixel.x < W && pixel.y < H;
+    const uint32_t index = pixel.y * W + pixel.x;
+    const float weight = inside ? weight_map[index] : 0.f;
+    const float target = inside ? target_range[index] : 0.f;
+    const float tolerance = inside ? tolerance_range[index] : 0.f;
+    const float error = inside ? error_map[index] : 0.f;
+    const float support = inside ? support_map[index] : 0.f;
+    bool done = !inside || weight <= 0.f || !isfinite(target) || target <= 0.f || tolerance <= 0.f;
+    float T = 1.f;
+    const uint2 range = ranges[block_id];
+    const int rounds = (range.y - range.x + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    __shared__ int ids[BLOCK_SIZE];
+    __shared__ float2 xy[BLOCK_SIZE];
+    __shared__ float4 conic[BLOCK_SIZE];
+    __shared__ float4 planes[BLOCK_SIZE];
+    for (int batch = 0; batch < rounds; ++batch) {
+        if (__syncthreads_and(done))
+            break;
+        const uint32_t offset = range.x + batch * BLOCK_SIZE + block.thread_rank();
+        if (offset < range.y) {
+            const int id = point_list[offset];
+            ids[block.thread_rank()] = id;
+            xy[block.thread_rank()] = means2D[id];
+            conic[block.thread_rank()] = conic_opacity[id];
+            planes[block.thread_rank()] = ray_planes[id];
+        }
+        block.sync();
+        const int count = min(BLOCK_SIZE, static_cast<int>(range.y - range.x) - batch * BLOCK_SIZE);
+        for (int j = 0; !done && j < count; ++j) {
+            const float dx = xy[j].x - pixel.x, dy = xy[j].y - pixel.y;
+            const float4 c = conic[j];
+            const float power = -0.5f * (c.x * dx * dx + c.z * dy * dy) - c.y * dx * dy;
+            if (power > 0.f)
+                continue;
+            const float alpha = fminf(.99f, c.w * expf(power));
+            if (alpha < 1.f / 255.f)
+                continue;
+            const float next_T = T * (1.f - alpha);
+            if (next_T < .0001f) {
+                done = true;
+                continue;
+            }
+            const float contribution = weight * alpha * T;
+            const float4 plane = planes[j];
+            const float peak = plane.x * dx + plane.y * dy + plane.z;
+            const int id = ids[j];
+            atomicAdd(weight_sum + id, contribution);
+            if (isfinite(peak) && fabsf(peak - target) <= tolerance) {
+                atomicAdd(near_weight_sum + id, contribution);
+                atomicAdd(error_sum + id, contribution * error);
+                atomicAdd(support_sum + id, contribution * support);
+            } else {
+                atomicAdd(off_surface_sum + id, contribution);
+            }
+            T = next_T;
+        }
+    }
+}
+
+void FORWARD::geometryScore(
+    const dim3 grid, dim3 block, const uint2* ranges, const uint32_t* point_list,
+    int W, int H, const float2* means2D, const float4* conic_opacity,
+    const float4* ray_planes, const float* target_range, const float* tolerance_range,
+    const float* error_map, const float* support_map, const float* weight_map,
+    float* error_sum, float* support_sum, float* near_weight_sum,
+    float* weight_sum, float* off_surface_sum) {
+    geometryScoreCUDA<<<grid, block>>>(ranges, point_list, W, H, means2D,
+        conic_opacity, ray_planes, target_range, tolerance_range, error_map,
+        support_map, weight_map, error_sum, support_sum, near_weight_sum,
+        weight_sum, off_surface_sum);
 }
 
 // the Bool inputs can be replaced by an enumeration variable for different functions.
@@ -716,7 +827,8 @@ void FORWARD::render(
     float* out_normal,
     float* out_mdepth,
     float* normal_length,
-    bool require_depth) {
+    bool require_depth,
+    int depth_search_expansions) {
 #define RENDER_CUDA_CALL(template_depth)                                                \
     renderCUDA<NUM_CHANNELS, template_depth, SPLIT, SPLIT_ITERATIONS><<<grid, block>>>( \
         ranges, point_list, W, H, means2D, conic_opacity, colors,                       \
@@ -724,7 +836,7 @@ void FORWARD::render(
         n_contrib, max_contributor, metric_map, get_flag, metricCount,                  \
         record_transmittance, transmittance_sum, covered_count,                         \
         bg_color, out_color, out_alpha,                                                 \
-        out_normal, out_mdepth, normal_length)
+        out_normal, out_mdepth, normal_length, depth_search_expansions)
 
     if (require_depth)
         RENDER_CUDA_CALL(true);
