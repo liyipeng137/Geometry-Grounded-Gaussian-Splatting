@@ -1,0 +1,271 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<link rel="icon" href="data:,">
+<title>Camera selection preview</title>
+<style>
+:root{color-scheme:dark;--bg:#0c111b;--panel:#151d2b;--border:#2c3b50;--muted:#9caec5;--fg:#edf3fb;--real:#4f9cff;--trajectory:#ffad49;--surface:#bd86ff}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif}button,input,select{font:inherit}button,select,input[type=search]{color:var(--fg);background:#1b293b;border:1px solid var(--border);border-radius:6px;padding:7px 10px}button{cursor:pointer}button:hover,button.active{background:#2b4666;border-color:#6494cc}button:focus-visible,input:focus-visible,select:focus-visible,a:focus-visible{outline:2px solid #9ac9ff;outline-offset:2px}a{color:#a6cfff;text-decoration:none}a:hover{text-decoration:underline}header{padding:14px 20px;border-bottom:1px solid var(--border);display:flex;gap:18px;justify-content:space-between;align-items:center}h1{font-size:19px;line-height:1.3;margin:0 0 4px}h2{font-size:14px;margin:0 0 9px}.muted{color:var(--muted)}.small{font-size:12px}.download-links{display:flex;gap:12px;flex-wrap:wrap;justify-content:flex-end}.layout{display:grid;grid-template-columns:minmax(0,1fr) 370px;height:calc(100vh - 90px);min-height:650px}.viewport{min-width:0;position:relative;display:flex;flex-direction:column}.toolbar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding:12px 14px;border-bottom:1px solid var(--border)}.toolbar button{font-size:12px;padding:6px 9px}#plot{flex:1;min-height:420px}.scene-note{padding:7px 14px 12px;color:var(--muted);font-size:12px}.sidebar{background:var(--panel);border-left:1px solid var(--border);overflow:auto;padding:16px}.section{padding-bottom:16px;margin-bottom:16px;border-bottom:1px solid var(--border)}.groups{display:flex;gap:10px;flex-wrap:wrap}.groups label{display:flex;gap:5px;align-items:center;font-size:13px}.dot{width:8px;height:8px;display:inline-block;border-radius:50%;margin-right:2px}.row{display:flex;gap:8px;align-items:center;margin:8px 0}.row select,.row input[type=search]{width:100%;min-width:0}.controls{display:grid;grid-template-columns:1fr 1fr;gap:4px 12px}.controls label{font-size:12px}.controls input[type=range]{width:100%;accent-color:#7ca8e0}.controls .wide{grid-column:span 2}.check{display:flex;align-items:center;gap:5px;font-size:12px;margin:5px 0}.counter{margin-top:8px;color:var(--muted);font-size:12px}.selection-title{font-size:15px;font-weight:650;word-break:break-all;margin-bottom:6px}.tags{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px}.tag{font-size:11px;padding:2px 7px;background:#233149;border-radius:4px}.metric-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin:10px 0}.metric{padding:8px;background:#101825;border-radius:6px}.metric span{display:block;font-size:11px;color:var(--muted)}.metric strong{font-size:16px;font-weight:550}.image-tabs{display:flex;gap:6px;margin:8px 0}.image-tabs button{font-size:12px;padding:5px 10px}.preview-box{background:#080c12;min-height:180px;display:flex;align-items:center;justify-content:center;border:1px solid var(--border);border-radius:6px;overflow:hidden;position:relative}.preview-box img{width:100%;height:auto;display:block;max-height:340px;object-fit:contain}.preview-placeholder{padding:28px 22px;text-align:center;color:var(--muted);font-size:13px}.image-meta{font-size:11px;color:var(--muted);margin-top:6px;word-break:break-word}pre{font:11px/1.45 ui-monospace,SFMono-Regular,monospace;overflow:auto;max-height:260px;background:#0d1521;padding:10px;border-radius:5px}details summary{cursor:pointer;font-size:12px;color:#bed0e6;margin-top:10px}.warning{font-size:12px;padding:8px 10px;background:#382c1b;color:#f1ca90;border-radius:5px;margin:9px 0}.status{font-size:12px;color:var(--muted)}#error-banner{display:none;background:#622f32;color:#fff;padding:14px;white-space:pre-wrap}.tiny-button{font-size:12px;padding:5px 8px}.image-popup{position:fixed;inset:0;background:#000d;display:none;z-index:100;align-items:center;justify-content:center;padding:45px}.image-popup img{max-width:100%;max-height:100%;object-fit:contain}.image-popup button{position:absolute;right:18px;top:12px}.keyboard-hint{font-size:11px;color:var(--muted)}
+@media(max-width:1050px){.layout{grid-template-columns:minmax(0,1fr) 330px}.sidebar{padding:12px}header{padding:12px 14px}.download-links{font-size:12px}}@media(max-width:760px){header{display:block}.download-links{justify-content:flex-start;margin-top:8px}.layout{display:flex;flex-direction:column;height:auto}.viewport{height:65vh;min-height:470px}.sidebar{border-left:0;border-top:1px solid var(--border)}#plot{min-height:330px}.controls{grid-template-columns:1fr 1fr}}
+</style>
+<script>__PLOTLY_JS__</script>
+</head>
+<body>
+<div id="error-banner" role="alert"></div>
+<header><div><h1>完整机位预览 · Camera selection</h1><div id="subtitle" class="muted small"></div></div><div class="download-links" id="downloads"></div></header>
+<main class="layout">
+<section class="viewport">
+  <div class="toolbar"><button id="view-all">整体 / Fit</button><button id="view-top">顶视 / Top</button><button id="view-side">侧视 / Side</button><button id="view-camera">选中相机方向</button><button id="view-orbit">选中位置周围</button><span class="keyboard-hint">拖动旋转 · 滚轮缩放 · 点击相机查看</span></div>
+  <div id="plot" aria-label="All real and virtual camera poses in COLMAP world coordinates"></div>
+  <div class="scene-note">场景为原 mesh 的采样上下文，不是完整表面或贴图。右侧灰模 / normal / depth PNG 来自原始完整 mesh。相机序号不表示可通行轨迹；连接线仅显示已检查通过的 anchor → virtual。</div>
+</section>
+<aside class="sidebar">
+  <section class="section"><h2>显示范围</h2><div class="groups">
+    <label><input id="group-real" type="checkbox" checked><span class="dot" style="background:var(--real)"></span>真实 <span id="count-real"></span></label>
+    <label><input id="group-trajectory" type="checkbox" checked><span class="dot" style="background:var(--trajectory)"></span>轨迹邻域 <span id="count-trajectory"></span></label>
+    <label><input id="group-surface" type="checkbox" checked><span class="dot" style="background:var(--surface)"></span>表面朝向 <span id="count-surface"></span></label>
+  </div><div class="row"><input id="search" type="search" placeholder="筛选相机 ID / name / anchor" aria-label="Filter cameras"></div>
+  <label class="check"><input id="unknown-filter" type="checkbox">只显示 unknown 比例达到阈值的虚拟相机</label>
+  <div class="row small"><span>unknown ≥ <b id="unknown-value">0%</b></span><input id="unknown-min" type="range" min="0" max="1" step=".05" value="0" aria-label="Minimum unknown fraction"></div>
+  <div id="visible-count" class="counter"></div></section>
+  <section class="section"><h2>三维视图</h2><div class="controls">
+    <label>视锥尺度 <span id="scale-value"></span><input id="frustum-scale" type="range" min=".005" max=".12" step=".005" value=".025"></label>
+    <label>场景透明度 <span id="opacity-value"></span><input id="scene-opacity" type="range" min="0" max="1" step=".05" value=".35"></label>
+    <label>场景点大小<input id="point-size" type="range" min="1" max="4" step=".5" value="1.5"></label>
+    <label class="check"><input id="show-frusta" type="checkbox" checked>全部视锥</label>
+    <label class="check"><input id="show-sight" type="checkbox">视线方向</label>
+    <label class="check"><input id="show-links" type="checkbox">已审连接</label>
+  </div><div class="small muted" id="scene-count"></div></section>
+  <section class="section"><h2>逐相机检查</h2><div class="row"><button id="previous" class="tiny-button" aria-label="Previous camera">←</button><select id="camera-select" aria-label="Select camera"></select><button id="next" class="tiny-button" aria-label="Next camera">→</button></div>
+    <div id="selection-title" class="selection-title"></div><div id="selection-tags" class="tags"></div><div id="selection-metrics" class="metric-grid"></div>
+    <div class="image-tabs"><button data-image="shading" class="active">灰模</button><button data-image="normal">Normal</button><button data-image="depth">Depth</button><button id="expand-image" title="Open full size image">⤢</button></div>
+    <div class="preview-box"><img id="preview-image" alt="Selected camera exact-mesh raycast" hidden><div id="preview-placeholder" class="preview-placeholder"></div></div>
+    <div id="image-meta" class="image-meta"></div><div id="selection-warning"></div>
+    <details><summary>K、位姿与全部统计</summary><pre id="camera-details"></pre></details>
+  </section>
+  <section><h2>索引与说明</h2><div id="sheet-links" class="small"></div><p class="small muted">unknown 表示 teacher 表面缺少真实观测支持，不是已确认错误，也不是生成模型置信度。仅检查机位；此页面不修改相机选择或训练数据。</p><details><summary>运行元数据</summary><pre id="manifest-details"></pre></details></section>
+</aside>
+</main>
+<div id="image-popup" class="image-popup" role="dialog" aria-modal="true" aria-label="Full size exact-mesh render"><button id="close-popup">关闭 · Esc</button><img id="popup-image" alt="Full size exact-mesh raycast"></div>
+<script id="viewer-data" type="application/json">__VIEWER_DATA__</script>
+<script>
+'use strict';
+const D = JSON.parse(document.getElementById('viewer-data').textContent);
+const $ = id => document.getElementById(id);
+const colors = {real:'#4f9cff',trajectory:'#ffad49',surface:'#bd86ff'};
+const labels = {real:'真实',trajectory:'轨迹邻域虚拟',surface:'表面朝向虚拟'};
+const groups = ['real','trajectory','surface'];
+const byId = new Map(D.cameras.map(c => [String(c.id),c]));
+const maxSpan = Math.max(...D.bounds.span), center = D.bounds.center;
+const add = (a,b) => a.map((v,i)=>v+b[i]);
+const sub = (a,b) => a.map((v,i)=>v-b[i]);
+const mul = (a,s) => a.map(v=>v*s);
+const norm = a => {const n=Math.hypot(...a);return a.map(v=>v/(n||1));};
+const point = a => ({x:a[0],y:a[1],z:a[2]});
+const position = c => [c.c2w[0][3],c.c2w[1][3],c.c2w[2][3]];
+const axis = (c,n) => [c.c2w[0][n],c.c2w[1][n],c.c2w[2][n]];
+const worldFromCamera = (c,p) => c.c2w.slice(0,3).map(r=>r[0]*p[0]+r[1]*p[1]+r[2]*p[2]+r[3]);
+const pct = value => typeof value==='number' && Number.isFinite(value) ? (100*value).toFixed(1)+'%' : '—';
+let selected = D.cameras.find(c=>c.kind==='virtual') || D.cameras[0];
+let imageMode = 'shading';
+let traceIndex = {};
+let rendered = false;
+let visibleCameras = D.cameras;
+let imageToken = 0;
+
+function inverse3(a){
+  const [x,y,z]=a, A=y[1]*z[2]-y[2]*z[1], B=y[2]*z[0]-y[0]*z[2], C=y[0]*z[1]-y[1]*z[0];
+  const determinant=x[0]*A+x[1]*B+x[2]*C;
+  if(Math.abs(determinant)<1e-12) throw Error('Singular camera K');
+  return [[A,x[2]*z[1]-x[1]*z[2],x[1]*y[2]-x[2]*y[1]],
+          [B,x[0]*z[2]-x[2]*z[0],x[2]*y[0]-x[0]*y[2]],
+          [C,x[1]*z[0]-x[0]*z[1],x[0]*y[1]-x[1]*y[0]]].map(r=>r.map(v=>v/determinant));
+}
+function frustum(c,depth){
+  const inv=inverse3(c.K), C=position(c);
+  const corners=[[0,0,1],[c.width,0,1],[c.width,c.height,1],[0,c.height,1]].map(p=>{
+    const ray=inv.map(r=>r.reduce((s,v,i)=>s+v*p[i],0));
+    return worldFromCamera(c,mul(ray,depth/ray[2]));
+  });
+  const segments=[];
+  for(let i=0;i<4;i++) segments.push([C,corners[i]],[corners[i],corners[(i+1)%4]]);
+  return segments;
+}
+function lines(segments){
+  const x=[],y=[],z=[];
+  for(const segment of segments){for(const p of segment){x.push(p[0]);y.push(p[1]);z.push(p[2]);}x.push(null);y.push(null);z.push(null);}
+  return {x,y,z};
+}
+function lineTrace(segments,name,color,width,visible=true){
+  return {...lines(segments),type:'scatter3d',mode:'lines',name,line:{color,width},visible,hoverinfo:'skip',showlegend:false};
+}
+function filteredCameras(){
+  const term=$('search').value.trim().toLowerCase(), onlyUnknown=$('unknown-filter').checked, minimum=Number($('unknown-min').value);
+  return D.cameras.filter(c=>{
+    if(!$('group-'+c.group).checked) return false;
+    if(term && ![c.id,c.name,c.anchor_id,c.selection_source].join(' ').toLowerCase().includes(term)) return false;
+    if(onlyUnknown) return c.kind==='virtual' && typeof c.stats?.unknown_fraction==='number' && c.stats.unknown_fraction>=minimum;
+    return true;
+  });
+}
+function cameraTrace(cameras,group){
+  const points=cameras.map(position);
+  return {type:'scatter3d',mode:'markers',name:labels[group],x:points.map(p=>p[0]),y:points.map(p=>p[1]),z:points.map(p=>p[2]),
+    customdata:cameras.map(c=>String(c.id)),text:cameras.map(c=>`${c.id}<br>${labels[group]}<br>unknown ${pct(c.stats?.unknown_fraction)}`),
+    hovertemplate:'%{text}<extra></extra>',marker:{size:group==='real'?3.2:4.5,color:colors[group],opacity:1,line:{color:'#101622',width:.5}},showlegend:false};
+}
+function checkedLinks(cameras){
+  return cameras.filter(c=>c.kind==='virtual' && c.stats?.connection_checked===true && c.stats?.path_passed===true && byId.has(String(c.anchor_id)))
+    .map(c=>[position(byId.get(String(c.anchor_id))),position(c)]);
+}
+function selectedSegments(){
+  const depth=Number($('frustum-scale').value)*maxSpan;
+  return frustum(selected,depth*1.4);
+}
+function sceneRanges(){
+  return D.bounds.span.map((span,i)=>[D.bounds.lo[i]-span*.07,D.bounds.hi[i]+span*.07]);
+}
+function overviewCamera(mode='all'){
+  const {up,right,forward}=D.basis;
+  let direction=add(add(mul(right,1.15),mul(forward,-1.4)),mul(up,.8)), cameraUp=up;
+  if(mode==='top'){direction=mul(up,2.0);cameraUp=forward;}
+  if(mode==='side'){direction=mul(right,2.0);cameraUp=up;}
+  return {eye:point(direction),center:{x:0,y:0,z:0},up:point(cameraUp),projection:{type:mode==='all'?'perspective':'orthographic'}};
+}
+function makeTraces(){
+  const xyz=D.scene.xyz;
+  const traces=[{type:'scatter3d',mode:'markers',name:'Mesh samples',x:xyz.map(p=>p[0]),y:xyz.map(p=>p[1]),z:xyz.map(p=>p[2]),
+    marker:{size:Number($('point-size').value),opacity:Number($('scene-opacity').value),color:D.scene.rgb.map(c=>`rgb(${c.join(',')})`)},hoverinfo:'skip',showlegend:false}];
+  traceIndex={scene:0};
+  const depth=Number($('frustum-scale').value)*maxSpan;
+  for(const group of groups){
+    const cameras=visibleCameras.filter(c=>c.group===group);
+    traceIndex[group]=traces.length;traces.push(cameraTrace(cameras,group));
+    traceIndex[group+'Frusta']=traces.length;traces.push(lineTrace(cameras.flatMap(c=>frustum(c,depth)),labels[group]+' frusta',colors[group],1,$('show-frusta').checked));
+  }
+  traceIndex.links=traces.length;traces.push(lineTrace(checkedLinks(visibleCameras),'Checked anchor links','#51c3ca',2,$('show-links').checked));
+  traceIndex.sight=traces.length;traces.push(lineTrace(visibleCameras.map(c=>[position(c),c.target || add(position(c),mul(axis(c,2),depth*2))]),'Viewing directions','#7896ba',1,$('show-sight').checked));
+  traceIndex.selected=traces.length;traces.push(lineTrace(selectedSegments(),'Selected camera','#ffffff',4));
+  const C=position(selected);traceIndex.selectedCenter=traces.length;
+  traces.push({type:'scatter3d',mode:'markers',x:[C[0]],y:[C[1]],z:[C[2]],marker:{size:7,color:'#fff',symbol:'diamond',line:{width:2,color:colors[selected.group]}},hoverinfo:'skip',showlegend:false});
+  return traces;
+}
+async function updatePlot(initial=false){
+  visibleCameras=filteredCameras();
+  const range=sceneRanges(),layout={paper_bgcolor:'#0c111b',plot_bgcolor:'#0c111b',font:{color:'#b8c8dc'},margin:{l:0,r:0,t:0,b:0},uirevision:'world-poses',
+    scene:{aspectmode:'data',camera:overviewCamera(),xaxis:{title:{text:'COLMAP X'},range:range[0],backgroundcolor:'#0c111b',gridcolor:'#263448',zerolinecolor:'#3c4e66'},
+      yaxis:{title:{text:'COLMAP Y'},range:range[1],backgroundcolor:'#0c111b',gridcolor:'#263448',zerolinecolor:'#3c4e66'},
+      zaxis:{title:{text:'COLMAP Z'},range:range[2],backgroundcolor:'#0c111b',gridcolor:'#263448',zerolinecolor:'#3c4e66'}}};
+  if(initial){
+    await Plotly.newPlot('plot',makeTraces(),layout,{responsive:true,displaylogo:false,scrollZoom:true,modeBarButtonsToRemove:['toImage']});
+    $('plot').on('plotly_click',event=>{const id=event.points?.[0]?.customdata;if(id!==undefined && byId.has(String(id)))selectCamera(byId.get(String(id)));});
+    rendered=true;
+  }else{
+    const current=$('plot').layout.scene.camera;
+    layout.scene.camera=current;
+    await Plotly.react('plot',makeTraces(),layout,{responsive:true,displaylogo:false,scrollZoom:true,modeBarButtonsToRemove:['toImage']});
+  }
+  populateSelector();
+  const checked=checkedLinks(visibleCameras).length;
+  $('visible-count').textContent=`显示 ${visibleCameras.length} / ${D.cameras.length} 个机位 · 已审连接 ${checked} 条`;
+  $('scale-value').textContent=(100*Number($('frustum-scale').value)).toFixed(1)+'%';
+  $('opacity-value').textContent=Math.round(100*Number($('scene-opacity').value))+'%';
+  $('unknown-value').textContent=Math.round(100*Number($('unknown-min').value))+'%';
+}
+function populateSelector(){
+  const selector=$('camera-select');selector.replaceChildren();
+  const list=visibleCameras.includes(selected)?visibleCameras:[selected,...visibleCameras];
+  for(const c of list){const option=document.createElement('option');option.value=String(c.id);option.textContent=`${c.id} · ${labels[c.group]}`+(visibleCameras.includes(c)?'':' [筛选外]');option.selected=c===selected;selector.append(option);}
+}
+function selectCamera(camera){
+  selected=camera;populateSelector();updateDetails();
+  if(rendered){
+    const data=lines(selectedSegments()),C=position(selected);
+    Plotly.restyle('plot',{x:[data.x],y:[data.y],z:[data.z]},[traceIndex.selected]);
+    Plotly.restyle('plot',{x:[[C[0]]],y:[[C[1]]],z:[[C[2]]],'marker.line.color':[colors[selected.group]]},[traceIndex.selectedCenter]);
+  }
+}
+function appendMetric(label,value){
+  const box=document.createElement('div');box.className='metric';
+  const name=document.createElement('span');name.textContent=label;
+  const number=document.createElement('strong');number.textContent=value;
+  box.append(name,number);$('selection-metrics').append(box);
+}
+function updateDetails(){
+  $('selection-title').textContent=String(selected.id);
+  $('selection-tags').replaceChildren();
+  const positionLabel=selected.kind==='virtual' ? (selected.position_mode==='rotation_only'?'原位置转向':'位置有变化') : null;
+  for(const text of [labels[selected.group],positionLabel,`${selected.width} × ${selected.height}`,selected.anchor_id?`anchor: ${selected.anchor_id}`:null].filter(Boolean)){
+    const tag=document.createElement('span');tag.className='tag';tag.textContent=text;$('selection-tags').append(tag);
+  }
+  $('selection-metrics').replaceChildren();
+  appendMetric('unknown surface',pct(selected.stats?.unknown_fraction));appendMetric('有效 teacher 像素',pct(selected.stats?.visible_fraction));
+  $('camera-details').textContent=JSON.stringify(selected,null,2);
+  $('selection-warning').replaceChildren();
+  if(selected.kind==='virtual' && !(selected.stats?.connection_checked===true && selected.stats?.path_passed===true)){
+    const warning=document.createElement('div');warning.className='warning';warning.textContent='此机位没有已审通过的连接标记，未绘制 anchor 连接。';$('selection-warning').append(warning);
+  }
+  updateImage();
+}
+function updateImage(){
+  const token=++imageToken,image=$('preview-image'),placeholder=$('preview-placeholder');
+  image.hidden=true;placeholder.hidden=false;
+  document.querySelectorAll('[data-image]').forEach(button=>button.classList.toggle('active',button.dataset.image===imageMode));
+  const path=selected.preview?.[imageMode];
+  if(!path){image.removeAttribute('src');placeholder.textContent=selected.kind==='real'?'真实相机仅展示位姿；未复制原照片。请选择虚拟相机检查完整 mesh 渲染。':'没有此相机的完整 mesh 预览文件。';$('image-meta').textContent='';return;}
+  placeholder.textContent='加载完整 mesh 预览…';
+  image.onload=()=>{if(token!==imageToken)return;image.hidden=false;placeholder.hidden=true;};
+  image.onerror=()=>{if(token!==imageToken)return;image.hidden=true;placeholder.hidden=false;placeholder.textContent='无法加载 PNG。请保留 previews/ 与本 HTML 的相对目录结构。';};
+  image.src=path;image.alt=`${selected.id} / ${imageMode} / exact GenRecon mesh raycast`;
+  const reviewSize=selected.preview.width && selected.preview.height ? ` · ${selected.preview.width} × ${selected.preview.height} review` : '';
+  $('image-meta').textContent=`原始完整 mesh · ${imageMode}${reviewSize} · ${path}`;
+}
+function lookFromCamera(orbit=false){
+  const C=position(selected),forward=axis(selected,2),up=mul(axis(selected,1),-1);
+  const target=orbit?(selected.target || add(C,mul(forward,maxSpan*.12))):add(C,mul(forward,maxSpan*.15));
+  const eyeWorld=orbit?sub(C,mul(forward,maxSpan*.10)):C;
+  // Plotly aspectmode=data uses axis lengths relative to their geometric mean.
+  // A common scale preserves world directions even in a long, narrow room.
+  const ranges=sceneRanges(),sizes=ranges.map(r=>r[1]-r[0]);
+  const unit=Math.cbrt(sizes[0]*sizes[1]*sizes[2]);
+  const relative=p=>mul(sub(p,center),2/unit);
+  Plotly.relayout('plot',{'scene.camera':{eye:point(relative(eyeWorld)),center:point(relative(target)),up:point(up),projection:{type:'perspective'}}});
+}
+function browseCamera(delta){
+  if(!visibleCameras.length)return;
+  const index=visibleCameras.indexOf(selected),next=(Math.max(index,0)+delta+visibleCameras.length)%visibleCameras.length;
+  selectCamera(visibleCameras[next]);
+}
+function downloadLink(label,path,parent){const a=document.createElement('a');a.textContent=label;a.href=path;a.setAttribute('download','');parent.append(a);}
+async function initialize(){
+  const virtual=D.cameras.filter(c=>c.kind==='virtual');
+  const rotationOnly=virtual.filter(c=>c.position_mode==='rotation_only').length;
+  $('subtitle').textContent=`${D.title} · ${D.cameras.filter(c=>c.kind==='real').length} real + ${virtual.length} virtual · ${rotationOnly} 原位置转向 / ${virtual.length-rotationOnly} 位置有变化 · COLMAP world`;
+  for(const [label,key] of [['Manifest','manifest'],['Real poses','real_cameras_path'],['Virtual poses','virtual_cameras_path'],['Report','report_path']])if(D.links[key])downloadLink(label,D.links[key],$('downloads'));
+  for(const group of groups)$('count-'+group).textContent=D.cameras.filter(c=>c.group===group).length;
+  $('scene-count').textContent=`显示 ${D.scene.count.toLocaleString()} 个 mesh 样本；颜色为灰度 / 证据类别，不是纹理。`;
+  $('manifest-details').textContent=JSON.stringify(D.manifest,null,2);
+  for(const [label,path] of [['全部虚拟 contact sheet','contact_sheet.jpg'],['轨迹邻域 contact sheet','contact_sheet_trajectory.jpg'],['表面朝向 contact sheet','contact_sheet_surface.jpg'],['真实机位 contact sheet','contact_sheet_real.jpg']]){
+    const line=document.createElement('div');downloadLink(label,path,line);$('sheet-links').append(line);
+  }
+  for(const id of ['group-real','group-trajectory','group-surface','show-frusta','show-sight','show-links','unknown-filter'])$(id).addEventListener('change',()=>updatePlot());
+  for(const id of ['frustum-scale','scene-opacity','point-size','unknown-min'])$(id).addEventListener('change',()=>updatePlot());
+  $('search').addEventListener('input',()=>updatePlot());
+  $('camera-select').addEventListener('change',()=>selectCamera(byId.get($('camera-select').value)));
+  $('previous').onclick=()=>browseCamera(-1);$('next').onclick=()=>browseCamera(1);
+  $('view-all').onclick=()=>Plotly.relayout('plot',{'scene.camera':overviewCamera('all')});
+  $('view-top').onclick=()=>Plotly.relayout('plot',{'scene.camera':overviewCamera('top')});
+  $('view-side').onclick=()=>Plotly.relayout('plot',{'scene.camera':overviewCamera('side')});
+  $('view-camera').onclick=()=>lookFromCamera(false);$('view-orbit').onclick=()=>lookFromCamera(true);
+  document.querySelectorAll('[data-image]').forEach(button=>button.onclick=()=>{imageMode=button.dataset.image;updateImage();});
+  $('expand-image').onclick=()=>{const path=selected.preview?.[imageMode];if(!path)return;$('popup-image').src=path;$('image-popup').style.display='flex';$('close-popup').focus();};
+  $('close-popup').onclick=()=>$('image-popup').style.display='none';
+  $('image-popup').onclick=event=>{if(event.target===$('image-popup'))$('image-popup').style.display='none';};
+  document.addEventListener('keydown',event=>{if(event.key==='Escape')$('image-popup').style.display='none';});
+  await updatePlot(true);updateDetails();
+}
+initialize().catch(error=>{$('error-banner').style.display='block';$('error-banner').textContent='Viewer initialization failed: '+error.message;console.error(error);});
+</script>
+</body>
+</html>
