@@ -299,10 +299,13 @@ def topology_manager(api, model, monkeypatch, config=None):
     return manager
 
 
-def test_geometry_candidate_grows_even_when_real_vcd_rejects_every_point(api, model, monkeypatch):
+@pytest.mark.parametrize("patch_dtype", [np.int32, np.int64])
+def test_geometry_candidate_grows_even_when_real_vcd_rejects_every_point(api, model, monkeypatch, patch_dtype):
     torch = api.torch
     manager = topology_manager(api, model, monkeypatch, {"max_gaussians": 10, "max_growth_fraction": .9,
         "seed_from": 1, "seed_until": 1, "topology_until": 200})
+    # Production teacher archives use int32; metadata uses int64 point indices.
+    manager.teacher.atlas["patch_id"] = np.array([0], dtype=patch_dtype)
     manager.meta["real_grad"][0] = .1
     manager.meta["real_seen"][0] = 1
     manager.meta["error_streak"][0] = 2

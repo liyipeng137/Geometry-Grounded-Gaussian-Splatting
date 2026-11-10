@@ -597,7 +597,9 @@ class GeometryTopology:
             fallback = rotations(normal_quaternions(normals))[:, :, 0]
             tangent = torch.where((tangent.norm(dim=1) < .1)[:, None], fallback, tangent)
             tangent = torch.nn.functional.normalize(tangent, dim=1)
-            self.meta["patch_id"][parents] = torch.as_tensor(self.teacher.atlas["patch_id"][atlas_ids], device=self.device)
+            self.meta["patch_id"][parents] = torch.as_tensor(
+                self.teacher.atlas["patch_id"][atlas_ids],
+                dtype=self.meta["patch_id"].dtype, device=self.meta["patch_id"].device)
         offset = .5*scale.max(1).values.clamp(max=.02*self.scale)[:, None]*tangent
         split = scale.max(1).values > self._opt("percent_dense", .01)*self.scene.cameras_extent
         if source == 2:
