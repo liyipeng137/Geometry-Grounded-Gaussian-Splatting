@@ -125,3 +125,22 @@ bash scripts/run_dataset.sh /workspace/dataset/245_for_train \
 
 `scripts/run_245_virtual_geometry.sh` 保持原样，固定旧245数据集和旧teacher，
 用于历史实验复现。新数据集使用本页的A/B入口；历史20k记录和产物不被覆盖。
+
+## 先查看轨迹平移实验的预览
+
+仅选机位、看预览时，可以直接使用低层入口，输出到独立目录：
+
+```bash
+python scripts/select_virtual_cameras.py \
+  --dataset /workspace/dataset/245_for_train \
+  --mesh /workspace/dataset/245_for_train/genrecon_mesh.ply \
+  --output /workspace/dataset/245_for_train/virtual_geometry_preview_offset16_20261111 \
+  --target-count 160 --trajectory-offset-fraction 0.16
+python scripts/export_virtual_camera_preview.py \
+  --manifest /workspace/dataset/245_for_train/virtual_geometry_preview_offset16_20261111/manifest.json
+```
+
+`--trajectory-offset-fraction` 只控制轨迹锚点左/右/上/下平移，半径为
+`min(fraction * anchor_depth, fraction * scene_scale)`，默认仍是0.08。
+轨迹插值、surface look-at、候选数量、筛选规则保持原样；它们最终是否入选仍由
+同一贪心流程决定。这一步不生成teacher，也不替换训练自动发现的`virtual_geometry/`。

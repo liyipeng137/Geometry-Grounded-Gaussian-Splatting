@@ -305,7 +305,13 @@ def _camera_record(source, pose, target, source_kind, index):
             "anchor_id": source["id"], "stats": {}}
 
 
-def propose_candidates(cameras, atlas, scene_scale, candidate_limit, seed):
+def _validate_offset_fraction(value):
+    if not np.isfinite(value) or not 0 < value <= 1:
+        raise ValueError("trajectory_offset_fraction must be finite and lie in (0, 1]")
+
+
+def propose_candidates(cameras, atlas, scene_scale, candidate_limit, seed, trajectory_offset_fraction=.08):
+    _validate_offset_fraction(trajectory_offset_fraction)
     rng = np.random.default_rng(seed)
     poses = np.asarray([c["c2w"] for c in cameras])
     centers = poses[:, :3, 3]
@@ -321,7 +327,9 @@ def propose_candidates(cameras, atlas, scene_scale, candidate_limit, seed):
         source = cameras[anchor]
         pose = poses[anchor]
         anchor_depth = source["stats"].get("median_teacher_depth") or source["stats"]["median_real_depth"]
-        radius = min(.08 * anchor_depth, .08 * scene_scale)
+        # Only the four lateral/vertical trajectory offsets use this fraction.
+        # Interpolation and surface-look-at translation keep their own recipe.
+        radius = min(trajectory_offset_fraction * anchor_depth, trajectory_offset_fraction * scene_scale)
         for offset in ((-radius, 0, 0), (radius, 0, 0), (0, -radius, 0), (0, radius, 0)):
             candidate_pose = pose.copy()
             candidate_pose[:3, 3] += pose[:3, :3] @ offset
@@ -517,7 +525,9 @@ def save_preview(output, camera, rendered, scene_scale, render_camera=None):
 
 
 def run_selection(dataset, mesh_path, output, target_count=160, candidate_limit=1200,
-                  long_edge=256, surface_samples=120000, threads=8, seed=0, preview_long_edge=512):
+                  long_edge=256, surface_samples=120000, threads=8, seed=0, preview_long_edge=512,
+                  trajectory_offset_fraction=.08):
+    _validate_offset_fraction(trajectory_offset_fraction)
     dataset, mesh_path, output = Path(dataset).resolve(), Path(mesh_path).resolve(), Path(output).resolve()
     if output.exists() and any(output.iterdir()):
         raise FileExistsError(f"Refusing nonempty output directory: {output}")
@@ -527,7 +537,8 @@ def run_selection(dataset, mesh_path, output, target_count=160, candidate_limit=
     (output / "previews").mkdir()
     started = time.monotonic()
     config = dict(target_count=target_count, candidate_limit=candidate_limit, long_edge=long_edge,
-                  surface_samples=surface_samples, threads=threads, seed=seed, preview_long_edge=preview_long_edge)
+                  surface_samples=surface_samples, threads=threads, seed=seed, preview_long_edge=preview_long_edge,
+                  trajectory_offset_fraction=float(trajectory_offset_fraction))
     write_json(output / "state.json", {"status": "running", "config": config})
     log("loading_real_cameras")
     cameras, depths, scale, depth_paths, binary = load_cameras(dataset, long_edge)
@@ -554,7 +565,8 @@ def run_selection(dataset, mesh_path, output, target_count=160, candidate_limit=
         camera["stats"]["median_teacher_depth"] = float(np.median(valid)) if len(valid) else None
         if (index + 1) % 20 == 0:
             log("real_teacher_depths", done=index + 1, total=len(cameras))
-    candidates = propose_candidates(cameras, atlas, scale, candidate_limit, seed)
+    candidates = propose_candidates(cameras, atlas, scale, candidate_limit, seed,
+                                    trajectory_offset_fraction=trajectory_offset_fraction)
     log("candidates_proposed", candidates=len(candidates))
     by_id = {camera["id"]: camera for camera in cameras}
     accepted, coverage, audits = [], [], []

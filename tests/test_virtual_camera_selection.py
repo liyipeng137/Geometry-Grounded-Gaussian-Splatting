@@ -376,3 +376,37 @@ def test_offset_radius_prefers_teacher_depth_without_relabeling_real_statistics(
     distances = [np.linalg.norm(np.asarray(candidate["c2w"])[:3, 3] - origin) for candidate in offsets]
     np.testing.assert_allclose(distances, expected_radius, rtol=0, atol=1e-12)
     assert cam == original
+
+
+def test_larger_offset_changes_only_trajectory_centers_and_keeps_default_eight_percent():
+    cams = [camera("a", center=(.2, -.3, 0), rotation=rotation_z(.4)),
+            camera("b", center=(.7, -.2, 0), rotation=rotation_z(.6))]
+    for cam, depth in zip(cams, (1.0, 4.0)):
+        cam["stats"].update(median_real_depth=2., median_teacher_depth=depth)
+    _, _, atlas = selection_inputs([[0]])
+    atlas["normal_world"] = np.array([[0., 0., -1.]])
+    default = vcs.propose_candidates(cams, atlas, 3., 1000, 0)
+    old = vcs.propose_candidates(cams, atlas, 3., 1000, 0, trajectory_offset_fraction=.08)
+    new = vcs.propose_candidates(cams, atlas, 3., 1000, 0, trajectory_offset_fraction=.16)
+    assert default == old
+    assert [row["id"] for row in old] == [row["id"] for row in new]
+    anchors = {cam["id"]: np.asarray(cam["c2w"])[:3, 3] for cam in cams}
+    assert {row["selection_source"] for row in old} == {
+        "trajectory_offset", "trajectory_interpolation", "surface_lookat"}
+    for before, after in zip(old, new):
+        if before["selection_source"] != "trajectory_offset":
+            assert before == after
+            continue
+        a, b = np.asarray(before["c2w"]), np.asarray(after["c2w"])
+        center = anchors[before["anchor_id"]]
+        np.testing.assert_allclose(b[:3, 3] - center, 2 * (a[:3, 3] - center), atol=1e-12)
+        np.testing.assert_array_equal(a[:3, :3], b[:3, :3])
+        assert before["K"] == after["K"]
+
+
+@pytest.mark.parametrize("value", [0, -.1, float("nan"), float("inf"), 1.1])
+def test_invalid_offset_fraction_fails_before_writing_selection(value, tmp_path):
+    output = tmp_path / "unused"
+    with pytest.raises(ValueError, match="trajectory_offset_fraction"):
+        vcs.run_selection(tmp_path, tmp_path / "mesh.ply", output, trajectory_offset_fraction=value)
+    assert not output.exists()
