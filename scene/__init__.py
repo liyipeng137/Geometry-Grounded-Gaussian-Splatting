@@ -11,6 +11,7 @@
 
 import json
 import os
+from contextlib import nullcontext
 from typing import Sequence
 
 import numpy as np
@@ -28,7 +29,8 @@ class Scene:
 
     gaussians: GaussianModel
 
-    def __init__(self, args: ModelParams, gaussians: GaussianModel, load_iteration=None, shuffle=True, resolution_scales=[1.0]):
+    def __init__(self, args: ModelParams, gaussians: GaussianModel, load_iteration=None, shuffle=True, resolution_scales=[1.0],
+                 *, initialization_seed=0, initialization_record=None, resolved_init_ply=None):
         """b
         :param path: Path to colmap scene main folder.
         """
@@ -62,15 +64,21 @@ class Scene:
                 init_cache_dir=self.model_path,
                 # RGBD 初始化与训练监督共用深度来源，避免各自读取不同目录。
                 depth_prior_dir=getattr(args, "depth_prior_dir", "depth"),
-                init_ply=getattr(args, "init_ply", ""),
+                init_ply=resolved_init_ply if resolved_init_ply is not None else getattr(args, "init_ply", ""),
+                init_mesh=getattr(args, "init_mesh", ""),
+                init_seed=initialization_seed,
+                initialization_record=initialization_record,
+                load_initialization=self.loaded_iter is None,
             )
         elif os.path.exists(os.path.join(args.source_path, "transforms.json")):
             print("Found transforms_train.json file, assuming Blender data set!")
             scene_info = sceneLoadTypeCallbacks["Blender"](args.source_path, args.white_background, args.eval)
 
         if not self.loaded_iter:
-            with open(scene_info.ply_path, "rb") as src_file, open(os.path.join(self.model_path, "input.ply"), "wb") as dest_file:
-                dest_file.write(src_file.read())
+            input_copy = os.path.join(self.model_path, "input.ply")
+            if os.path.realpath(scene_info.ply_path) != os.path.realpath(input_copy):
+                with open(scene_info.ply_path, "rb") as src_file, open(input_copy, "wb") as dest_file:
+                    dest_file.write(src_file.read())
             json_cams = []
             camlist = []
             if scene_info.test_cameras:
@@ -112,7 +120,9 @@ class Scene:
                 tmp = torch.sum(center_rays[:, None] * center_rays[None], dim=-1)
                 angles_torch = torch.arccos(tmp.clamp(-1.0, 1.0)) * 180 / 3.14159
                 angles_np = angles_torch.detach().cpu().numpy()
-                with open(os.path.join(self.model_path, "multi_view.json"), "w") as file:
+                neighbor_record = (open(os.path.join(self.model_path, "multi_view.json"), "w")
+                                   if not self.loaded_iter else nullcontext())
+                with neighbor_record as file:
                     for id, cur_cam in enumerate(self.train_cameras[resolution_scale]):
                         sorted_indices = np.lexsort((angles_np[id], diss[id]))
                         # sorted_indices = np.lexsort((diss[id], angles[id]))
@@ -129,8 +139,9 @@ class Scene:
                             # cur_cam.nearest_names.append(self.train_cameras[resolution_scale][index].image_name)
                             json_d["nearest_name"].append(self.train_cameras[resolution_scale][index].image_name)
                         json_str = json.dumps(json_d, separators=(",", ":"))
-                        file.write(json_str)
-                        file.write("\n")
+                        if file is not None:
+                            file.write(json_str)
+                            file.write("\n")
 
         self.gaussians.create_app_model(
             len(scene_info.train_cameras), args.use_decoupled_appearance,

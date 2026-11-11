@@ -221,20 +221,23 @@ def _write_record(path, value):
 
 
 def readColmapSceneInfo(path, images, eval, llffhold=8, use_rgbd_init_ply=True,
-                       train_exclude_images="", init_cache_dir=None, depth_prior_dir="depth", init_ply=""):
-    """默认使用训练划分的 RGBD；显式 init_ply 只替换初始 XYZ/RGB。
+                       train_exclude_images="", init_cache_dir=None, depth_prior_dir="depth", init_ply="",
+                       init_mesh="", init_seed=0, initialization_record=None, load_initialization=True):
+    """默认 RGBD；mesh/PLY 只替换初始 XYZ/RGB，续训复用冻结的点云。
 
     ``depth_prior_dir`` 与训练监督使用同一配置，支持相对数据集或绝对目录。
     初始化、数据指纹和融合后的重新校验均读取这个目录；不回退到稀疏点云。
     外部点云不改变相机、priors、Gaussian 参数初始化或后续 filter/拓扑策略。
     """
-    if not use_rgbd_init_ply:
+    if load_initialization and initialization_record is None and init_ply and init_mesh:
+        raise ValueError("init_mesh and init_ply are mutually exclusive")
+    if load_initialization and not use_rgbd_init_ply:
         raise ValueError("Formal COLMAP input requires training-camera RGBD initialization")
-    if init_cache_dir is None:
+    if load_initialization and init_cache_dir is None:
         raise ValueError("COLMAP RGBD initialization requires an owned output cache directory")
     if (Path(path) / "mixed_dataset.json").exists():
         raise ValueError("Mixed/generated ordinary-camera datasets are outside the formal FFBA input contract")
-    depth_root = resolve_rgbd_depth_directory(path, depth_prior_dir)
+    depth_root = resolve_rgbd_depth_directory(path, depth_prior_dir) if load_initialization else None
     model = Path(path) / "sparse/0"
     if (model / "cameras.bin").is_file() and (model / "images.bin").is_file():
         cam_extrinsics = read_extrinsics_binary(str(model / "images.bin"))
@@ -248,6 +251,10 @@ def readColmapSceneInfo(path, images, eval, llffhold=8, use_rgbd_init_ply=True,
     if train_exclude_images and eval:
         raise ValueError("Explicit train_exclude_images cannot be combined with implicit --eval")
     train, test = partition_cameras(infos, excluded, eval, llffhold)
+    if not load_initialization:
+        # render/load_iteration 只需要相机；不访问初始 mesh/PLY/depth 或改写旧证明。
+        return SceneInfo(point_cloud=None, train_cameras=train, test_cameras=test,
+                         nerf_normalization=getNerfppNorm(train), ply_path=None)
     calibrations = {}
     assets = {}
     for camera in infos:
@@ -263,7 +270,37 @@ def readColmapSceneInfo(path, images, eval, llffhold=8, use_rgbd_init_ply=True,
         raise ValueError("No training camera has aligned NPY depth; refusing sparse/full-capture initialization fallback")
     cache = Path(init_cache_dir)
     cache.mkdir(parents=True, exist_ok=True)
-    if init_ply:
+    mesh_provenance = None
+    if initialization_record is None and init_mesh:
+        # 只在 fresh 训练调用；实际训练相机和 image_path 决定着色来源。
+        from utils.mesh_initialization import prepare_from_cameras
+        mesh_path = Path(init_mesh).expanduser().resolve(strict=True)
+        init_ply = prepare_from_cameras(path, mesh_path, cache / "initialization", train, seed=init_seed)
+        generation_path = Path(init_ply).parent / "metadata.json"
+        generation = json.loads(generation_path.read_text())
+        mesh_sha256 = generation.get("source_files_sha256", {}).get(str(mesh_path))
+        if (generation.get("status") != "complete" or generation.get("genrecon_mesh") != str(mesh_path)
+                or not isinstance(mesh_sha256, str) or len(mesh_sha256) != 64):
+            raise ValueError("Mesh initialization preparation lacks matching completed provenance")
+        mesh_provenance = {"requested_source": "mesh", "mesh_path": str(mesh_path),
+                           "mesh_sha256": mesh_sha256, "metadata_path": str(generation_path.resolve())}
+    if initialization_record is not None:
+        if not init_ply:
+            raise ValueError("Checkpoint initialization requires a resolved cached PLY")
+        ply_path = Path(init_ply).expanduser().resolve(strict=True)
+        expected_sha = initialization_record.get("ply_sha256")
+        if _sha256_file(ply_path) != expected_sha:
+            raise ValueError("Cached initialization PLY differs from checkpoint SHA")
+        pcd = fetchOpen3DPly(str(ply_path))
+        if _sha256_file(ply_path) != expected_sha:
+            raise RuntimeError("Cached initialization PLY changed while loading")
+        if (pcd.points.ndim != 2 or pcd.points.shape[1:] != (3,) or not len(pcd.points)
+                or pcd.colors.shape != pcd.points.shape or not np.isfinite(pcd.points).all()
+                or not np.isfinite(pcd.colors).all()
+                or len(pcd.points) != initialization_record.get("point_count")):
+            raise ValueError("Cached checkpoint initialization has invalid XYZ/RGB or point count")
+        print(f"Reusing checkpoint initialization: {ply_path}, points={len(pcd.points)}")
+    elif init_ply:
         # This input is intentionally a plain colored point cloud. No special
         # Gen lineage, virtual filter fallback, or early protection is added.
         ply_path = Path(init_ply).expanduser().resolve(strict=True)
@@ -275,6 +312,8 @@ def readColmapSceneInfo(path, images, eval, llffhold=8, use_rgbd_init_ply=True,
                 or pcd.colors.shape != pcd.points.shape or not np.isfinite(pcd.points).all()
                 or not np.isfinite(pcd.colors).all()):
             raise ValueError("External initialization must contain finite, nonempty XYZ/RGB")
+        if mesh_provenance is not None and generation.get("point_cloud_sha256") != ply_sha256:
+            raise ValueError("Prepared mesh initialization PLY differs from generation metadata")
         algorithm = "external_colored_ply_v1"
         identity = {"algorithm": algorithm, "ply_sha256": ply_sha256}
         init_fingerprint = calibration_fingerprint(identity)
@@ -339,18 +378,25 @@ def readColmapSceneInfo(path, images, eval, llffhold=8, use_rgbd_init_ply=True,
         current = {"rgb_sha256": _sha256_file(camera.image_path), "depth_sha256": _sha256_file(depth) if depth.is_file() else None}
         if current != assets[camera.colmap_image_name]:
             raise RuntimeError("RGB/depth source changed during initialization")
+    if initialization_record is not None:
+        initialization = dict(initialization_record)
+    else:
+        initialization = {"kind": "external_ply" if init_ply else "train_only_rgbd", "algorithm": algorithm,
+                          "ply_path": str(ply_path.resolve()), "ply_sha256": metadata["ply_sha256"],
+                          "point_count": metadata["point_count"], "cache_fingerprint": init_fingerprint,
+                          "proof_path": str(metadata_path.resolve())}
+        if mesh_provenance is not None:
+            initialization.update(mesh_provenance)
     split_record = {
         "schema_version": 3, "dataset_root": str(Path(path).resolve()), "source": split_source,
         "camera_calibration_fingerprints": calibrations, "calibration_fingerprint": calibration_fingerprint(calibrations),
         "dataset_content_fingerprint": calibration_fingerprint(assets),
         "train_camera_fingerprint": training_camera_fingerprint(train),
         "train_image_names": [camera.colmap_image_name for camera in train], "test_image_names": [camera.colmap_image_name for camera in test],
-        "initialization": {"kind": "external_ply" if init_ply else "train_only_rgbd", "algorithm": algorithm, "ply_path": str(ply_path.resolve()),
-                           "ply_sha256": metadata["ply_sha256"], "point_count": metadata["point_count"],
-                           "cache_fingerprint": init_fingerprint, "proof_path": str(metadata_path.resolve())},
+        "initialization": initialization,
         "pixel_center_convention": "colmap_half_integer",
         "scope": ("All input cameras are training views" if not test else
-                  "External PLY initialization; real supervision and neighbors exclude validation cameras" if init_ply else
+                  "External PLY initialization; real supervision and neighbors exclude validation cameras" if initialization["kind"] == "external_ply" else
                   "RGBD initialization, supervision and neighbors exclude validation cameras"),
     }
     _write_record(cache / "camera_split.json", split_record)

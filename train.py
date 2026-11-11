@@ -12,13 +12,15 @@
 损失细节在 utils/training_losses.py；配置、日志、评估和 checkpoint 在
 utils/training_io.py。这里保留训练阶段的先后关系，不隐藏在 Trainer 框架中。
 
-初始化仍是当前真实相机的 RGBD→TSDF 点云。指定 --virtual_geometry_config
+默认初始化为真实相机的 RGBD→TSDF 点云；--init_mesh 自动采样并投影真实照片颜色，
+--init_ply 复用已准备的点云。两者互斥，均不改变 filter/拓扑策略。指定 --virtual_geometry_config
 后额外加入已审核机位的固定D/N；没有虚拟RGB、appearance ID或PatchMatch邻居。
 真实监督保留，几何增密/补点在optimizer安全边界后统一提交。
 详见 docs/virtual_geometry_training.md；省略配置时保持原真实基线生命周期。
 """
 
 import math
+from pathlib import Path
 from argparse import ArgumentParser
 from random import randint, sample
 
@@ -30,6 +32,7 @@ from gaussian_renderer import render
 from scene import GaussianModel, Scene
 from scene.cameras import FramePayloadCache
 from utils.general_utils import safe_state
+from utils.initialization import validate_initialization_options, resolve_checkpoint_initialization
 from utils.loss_utils import PatchMatch
 from utils.training_io import (
     TrainingLogger,
@@ -37,6 +40,7 @@ from utils.training_io import (
     load_checkpoint,
     prepare_output,
     restore_checkpoint,
+    record_initialization,
     save_checkpoint,
 )
 from utils.training_losses import compute_training_losses, loss_schedule
@@ -230,6 +234,9 @@ def training(dataset, opt, pipe, args):
     虚拟渲染不推进iteration，不增加独立optimizer step。
     """
     validate_options(opt, args)
+    validate_initialization_options(dataset)
+    if getattr(dataset, "init_mesh", "") and not Path(dataset.source_path, "sparse").is_dir():
+        raise ValueError("--init_mesh requires a COLMAP dataset")
 
     joint_config = teacher = joint = None
     if getattr(args, "virtual_geometry_config", None):
@@ -252,7 +259,8 @@ def training(dataset, opt, pipe, args):
             cpu_cache_size=joint_config["cpu_cache_size"], seed=args.training_seed,
         )
 
-    # 1. 初始化与可选续训。Scene 负责完整 K/pose、输入对应和 RGBD 初值。
+    # 1. 先识别续训，再决定初始化来源。Scene 在训练划分确定后处理 mesh；
+    #    续训仅复用冻结点云，不再依赖原 mesh，也不重新运行 TSDF。
     if joint_config:
         parameters, start_iteration, split = load_checkpoint(args.start_checkpoint, joint=True)
         joint_identity = {"config_sha256": config_identity(joint_config), "teacher": teacher.identity}
@@ -264,12 +272,20 @@ def training(dataset, opt, pipe, args):
         raise ValueError(
             "Checkpoint iteration must be smaller than the requested iterations"
         )
+    resolved_init_ply = None
+    if split is not None:
+        resolved_init_ply = resolve_checkpoint_initialization(dataset, args.start_checkpoint, split)
     if joint_config:
         writer = prepare_output(dataset, opt, pipe, args, joint_config=joint_config, joint_identity=joint_identity)
     else:
         writer = prepare_output(dataset, opt, pipe, args)
     gaussians = GaussianModel(dataset.sh_degree, dataset.sg_degree)
-    scene = Scene(dataset, gaussians)
+    scene = Scene(dataset, gaussians, initialization_seed=args.training_seed,
+                  initialization_record=split["initialization"] if split is not None else None,
+                  resolved_init_ply=resolved_init_ply)
+    # Keep requested CLI options distinct from the resolved cached PLY. This
+    # prevents a saved --init_mesh config from also claiming --init_ply.
+    record_initialization(scene.model_path)
     validate_training_priors(scene.getTrainCameras())
     if teacher is not None:
         teacher.validate_real_cameras(scene.getTrainCameras(), dataset.source_path)
@@ -547,6 +563,7 @@ def main():
     opt = optimization.extract(args)
     try:
         validate_options(opt, args)
+        validate_initialization_options(args)
     except ValueError as error:
         parser.error(str(error))
     for name in ("test_iterations", "save_iterations", "checkpoint_iterations"):

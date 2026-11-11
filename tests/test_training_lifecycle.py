@@ -96,7 +96,7 @@ def make_harness(start=0, stop=3, multiview=False, failure_at=None):
     ]
 
     class Scene:
-        def __init__(self, dataset, model):
+        def __init__(self, dataset, model, **initialization):
             self.gaussians = model
             self.model_path = dataset.model_path
             self.ply_states = {}
@@ -225,6 +225,7 @@ def make_harness(start=0, stop=3, multiview=False, failure_at=None):
         "load_checkpoint": lambda path: (None, start, None),
         "prepare_output": lambda *args: None,
         "restore_checkpoint": lambda *args: None,
+        "record_initialization": lambda *args: None,
         "GaussianModel": Model, "Scene": Scene, "FramePayloadCache": Cache,
         "PatchMatch": patchmatch_factory, "TrainingLogger": Logger, "tqdm": Progress,
         "randint": lambda lower, upper: 0, "sample": lambda candidates, count: candidates[:count],
@@ -235,6 +236,7 @@ def make_harness(start=0, stop=3, multiview=False, failure_at=None):
         "save_checkpoint": checkpoint,
     }
     execute_definitions("utils/training_losses.py", {"LossSchedule", "loss_schedule", "ramp_weight", "normal_prior_weight", "multi_view_ncc_weight"}, namespace)
+    execute_definitions("utils/initialization.py", {"validate_initialization_options"}, namespace)
     execute_definitions("train.py", {"validate_options", "validate_training_priors", "refresh_filter", "training"}, namespace)
     opt = SimpleNamespace(
         iterations=stop, densification_interval=100, opacity_reset_interval=3000,

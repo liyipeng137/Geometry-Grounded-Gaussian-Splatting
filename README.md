@@ -13,6 +13,10 @@
 几何增密/补点、日程和续训契约见 [虚拟几何训练说明](docs/virtual_geometry_training.md)。
 省略该配置时保留真实基线；已审核机位不重新选择，也不需要生成贴图。
 
+初始化默认使用 RGBD/TSDF。指定 `--init_mesh PATH` 可在训练内自动准备20万表面点及
+训练照片颜色；`--init_ply PATH` 可复用已有点云。缓存、续训和渲染行为见
+[Mesh 初始化入口](docs/mesh_initialization.md)。
+
 **Baowen Zhang, Chenxing Jiang, Heng Li, Shaojie Shen, Ping Tan**
 
 [Project Page](https://baowenz.github.io/geometry_grounded_gaussian_splatting/)  

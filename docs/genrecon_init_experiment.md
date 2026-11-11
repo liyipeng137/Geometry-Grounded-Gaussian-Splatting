@@ -1,5 +1,24 @@
 # GenRecon 全局点云初始化实验
 
+正式训练现可直接传 `--init_mesh`，由 `train.py` 自动完成采样与训练照片着色，
+无需先单独运行准备脚本：
+
+```bash
+OMP_NUM_THREADS=8 OPENBLAS_NUM_THREADS=1 bash scripts/run_245_virtual_geometry.sh \
+  /workspace/outputs/gggs_245_mesh_init_NEW \
+  --init_mesh /workspace/dataset/245_for_train/genrecon_mesh.ply
+```
+
+初始化缓存位于新 run 的 `initialization/`。固定20万点，采样 seed 来自
+`--training_seed`；颜色仅取实际训练划分及 `--images` 对应的照片。
+此参数不重建虚拟 teacher。默认 TSDF、PLY复用、续训与离线渲染的完整说明见
+[Mesh 初始化入口](mesh_initialization.md)。
+
+## 已完成实验的两步流程
+
+下面保留2026-11-11实验实际使用的“准备 PLY → `--init_ply`”流程，
+不将历史运行改写为使用新入口。示例中的历史输出目录已有产物；复跑时使用新目录。
+
 本实验从 baseline02（`3981080`）的完整 20k 联合流程出发，只替换初始 XYZ/RGB：
 在同 COLMAP 坐标系的 GenRecon mesh 全表面按三角面积均匀抽取 200,000 点，
 再从真实照片投影颜色。不会筛除所有训练相机都不可见的表面，也不增加

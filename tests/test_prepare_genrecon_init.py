@@ -1,9 +1,12 @@
 """Global surface sampling and real-image visibility contracts, without training."""
 
 import importlib.util
+import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
+from PIL import Image
 from plyfile import PlyData
 import pytest
 
@@ -151,3 +154,91 @@ def test_open3d_exact_mesh_first_hit_occlusion():
     scene = MODULE.MeshScene(vertices, np.array([[0, 1, 2], [3, 4, 5]], np.uint32), 1)
     points = np.array([[0., 0., 2.], [0., 0., 3.]], np.float32)
     np.testing.assert_array_equal(MODULE.visible_samples(scene, points, np.array([0, 1]), np.zeros(3)), [True, False])
+
+
+def camera_info(tmp_path, name="camera.png", rotation=None, translation=None):
+    path = tmp_path / name
+    Image.fromarray(np.full((9, 9, 3), 90, np.uint8)).save(path)
+    return SimpleNamespace(colmap_image_name=name, image_name=name, image_path=str(path), width=9, height=9,
+                           K=np.array([[4., 0., 4.5], [0., 4., 4.5], [0., 0., 1.]], np.float64),
+                           R=np.eye(3) if rotation is None else rotation,
+                           T=np.array([.1234567890123, -.2345678901234, .3456789012345]) if translation is None else translation)
+
+
+def test_camera_info_pose_preserves_transposed_rotation_and_double_precision(tmp_path):
+    angle = .354123456789
+    rotation = np.array([[np.cos(angle), -np.sin(angle), 0.], [np.sin(angle), np.cos(angle), 0.], [0., 0., 1.]], np.float64)
+    info = camera_info(tmp_path, rotation=rotation)
+    output = MODULE.views_from_cameras([info])[0]
+    np.testing.assert_array_equal(output["c2w"][:3, :3], info.R)
+    np.testing.assert_array_equal(output["c2w"][:3, 3], -info.R @ info.T)
+    np.testing.assert_array_equal(output["K"], info.K)
+    assert output["c2w"].dtype == np.float64
+    assert output["image_path"] == str(Path(info.image_path).resolve())
+
+
+def text_colmap_dataset(tmp_path):
+    sparse = tmp_path / "sparse/0"
+    sparse.mkdir(parents=True)
+    (sparse / "cameras.txt").write_text("1 PINHOLE 9 9 4 4 4.5 4.5\n")
+    image_dir = tmp_path / "alternate_images"
+    image_dir.mkdir()
+    rows = []
+    for index in range(9):
+        name = f"frame_{index}.png"
+        Image.fromarray(np.full((9, 9, 3), index * 20, np.uint8)).save(image_dir / name)
+        rows.extend([f"{index+1} 1 0 0 0 {index*.01} 0 0 1 {name}", ""])
+    (sparse / "images.txt").write_text("\n".join(rows) + "\n")
+    return tmp_path
+
+
+def test_manual_cli_uses_actual_images_and_same_eval_exclusion_split(tmp_path):
+    dataset = text_colmap_dataset(tmp_path)
+    all_views, _ = MODULE.load_real_views(dataset, images="alternate_images")
+    assert len(all_views) == 9
+    assert all(Path(v["image_path"]).parent.name == "alternate_images" for v in all_views)
+    evaluation_views, _ = MODULE.load_real_views(dataset, images="alternate_images", eval_mode=True)
+    assert [v["name"] for v in evaluation_views] == [f"frame_{i}.png" for i in range(1, 8)]
+    excluded = tmp_path / "excluded.json"
+    excluded.write_text(json.dumps(["frame_2.png", "frame_5.png"]))
+    subset, _ = MODULE.load_real_views(dataset, images="alternate_images", train_exclude_images=str(excluded))
+    assert len(subset) == 7 and not {"frame_2.png", "frame_5.png"} & {v["name"] for v in subset}
+    with pytest.raises(ValueError, match="cannot be combined"):
+        MODULE.load_real_views(dataset, images="alternate_images", eval_mode=True, train_exclude_images=str(excluded))
+
+
+def test_camera_info_entry_only_passes_actual_subset_and_given_image_paths(tmp_path, monkeypatch):
+    from utils import mesh_initialization
+    included = camera_info(tmp_path, name="included.png")
+    unused = camera_info(tmp_path, name="heldout.png")
+    del unused
+    captured = {}
+
+    def receive(dataset, mesh, output, views, calibration_files, seed, threads):
+        captured.update(views=views, seed=seed)
+        return Path(output) / "point_cloud.ply"
+
+    monkeypatch.setattr(mesh_initialization, "_prepare_views", receive)
+    result = MODULE.prepare_from_cameras(tmp_path, tmp_path / "mesh.ply", tmp_path / "out", [included], seed=7)
+    assert result.name == "point_cloud.ply"
+    assert captured["seed"] == 7
+    assert [v["name"] for v in captured["views"]] == ["included.png"]
+    assert captured["views"][0]["image_path"] == str(Path(included.image_path).resolve())
+
+
+def test_cli_and_camera_info_paths_have_identical_geometry_and_color_for_same_subset(tmp_path):
+    dataset = text_colmap_dataset(tmp_path)
+    cli, _ = MODULE.load_real_views(dataset, images="alternate_images", eval_mode=True)
+    infos = [SimpleNamespace(colmap_image_name=v["name"], image_name=v["name"], image_path=v["image_path"],
+                             width=v["width"], height=v["height"], K=v["K"], R=v["c2w"][:3, :3],
+                             T=-v["c2w"][:3, :3].T @ v["c2w"][:3, 3]) for v in cli]
+    integrated = MODULE.views_from_cameras(infos)
+    for a, b in zip(cli, integrated):
+        np.testing.assert_array_equal(a["K"], b["K"])
+        np.testing.assert_array_equal(a["c2w"], b["c2w"])
+    xyz = np.array([[0., 0., 2.], [.1, .1, 2.]], np.float32)
+    normals = np.array([[0., 0., 1.], [0., 0., 1.]], np.float32)
+    a = MODULE.project_colors(xyz, normals, np.zeros(2, int), cli, PlaneScene())
+    b = MODULE.project_colors(xyz, normals, np.zeros(2, int), integrated, PlaneScene())
+    np.testing.assert_array_equal(a[0], b[0])
+    np.testing.assert_array_equal(a[1], b[1])

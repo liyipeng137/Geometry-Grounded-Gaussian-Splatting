@@ -196,6 +196,16 @@ def prepare_output(dataset, opt, pipe, args, joint_config=None, joint_identity=N
     return SummaryWriter(str(output))
 
 
+def record_initialization(output):
+    """Record the resolved source separately from the user's mutually exclusive flags."""
+    output = Path(output)
+    if not (output / "camera_split.json").is_file():
+        return  # Legacy synthetic scenes have no COLMAP initialization proof.
+    config = json.loads((output / "training_config.json").read_text())
+    config["initialization"] = json.loads((output / "camera_split.json").read_text())["initialization"]
+    write_json(output / "training_config.json", config)
+
+
 def save_checkpoint(gaussians, scene, iteration, args, joint_runtime=None):
     """checkpoint 位于 optimizer 之后；保留相机、标定、输入内容和初始化校验。"""
     output = Path(scene.model_path)

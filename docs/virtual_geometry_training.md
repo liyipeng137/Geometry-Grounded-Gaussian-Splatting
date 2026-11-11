@@ -20,8 +20,9 @@ bash scripts/run_245_virtual_geometry.sh /workspace/outputs/gggs_245_virtual_joi
 ```
 
 输出目录必须是新的。等价入口是 `python train.py ... --virtual_geometry_config
-configs/virtual_geometry_245.json`。不传这项时仍运行既有真实baseline，初始化均沿用
-原来的train-only RGBD/TSDF点云及数据指纹，不改真实训练划分。
+configs/virtual_geometry_245.json`。不传这项时仍运行既有真实baseline。初始化默认使用
+train-only RGBD/TSDF；也可独立指定 `--init_mesh` 或 `--init_ply`，见
+[初始化入口](mesh_initialization.md)。切换初值不改变真实训练划分或重建虚拟teacher。
 联合模式依赖受控的3D filter，不接受`--disable_filter3D`，避免该标志被周期刷新静默覆盖。
 
 首次换机器需要编译本分支的 rasterizer；旧 wheel 不包含新增几何评分接口：
