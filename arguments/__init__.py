@@ -84,7 +84,9 @@ class ModelParams(ParamGroup):
         self.depth_confidence_format = "png"
         self.train_exclude_images = ""
         self.init_ply = ""  # Prepared XYZ/RGB; mutually exclusive with init_mesh.
-        self.init_mesh = ""  # Opt in to global 200k surface sampling and real-photo coloring.
+        self.init_mesh = ""  # Opt in to global surface sampling and real-photo coloring.
+        self.init_num_points = 200000
+        self.colmap_dir = "sparse/0"
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args):

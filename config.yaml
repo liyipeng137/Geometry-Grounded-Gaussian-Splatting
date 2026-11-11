@@ -1,0 +1,116 @@
+# Delivery defaults. Paths in inputs are relative to --dataset.
+# Joint topology/reset schedule is controlled only by geometry, not legacy training aliases.
+version: 1
+seed: 0
+inputs:
+  images: images
+  depth: depth
+  normals: normals
+  colmap: sparse/0
+  mesh: genrecon_mesh.ply
+initialization:
+  method: gen_mesh
+  num_points: 200000
+virtual_views:
+  max_count: 160
+  trajectory_offset_fraction: 0.16
+  candidate_limit: 1200
+  atlas_points: 120000
+  selection_long_edge: 256
+  teacher_long_edge: 512
+training:
+  appearance_mode: 3
+  iterations: 20000
+  dense_optimizer_updates: true
+  position_lr_init: 0.00016
+  position_lr_final: 1.6e-06
+  position_lr_delay_mult: 0.01
+  position_lr_max_steps: 30000
+  feature_dc_lr: 0.0013
+  feature_rest_lr: 0.00011
+  opacity_lr: 0.05
+  scaling_lr: 0.005
+  rotation_lr: 0.001
+  sg_axis_lr: 0.002
+  sg_sharpness_lr: 0.095
+  sg_color: 0.00064
+  appearance_embeddings_lr: 0.001
+  appearance_network_lr: 0.001
+  pgsr_appearance_lr: 0.001
+  gs_appearance_lr_init: 0.01
+  gs_appearance_lr_final: 0.001
+  gs_appearance_lr_delay_steps: 0
+  gs_appearance_lr_delay_mult: 0.0
+  percent_dense: 0.01
+  lambda_dssim: 0.2
+  lambda_depth_normal: 0.05
+  lambda_mask: 0.0
+  densify_from_iter: 500
+  regularization_from_iter: 7000
+  densify_grad_threshold: 0.0002
+  lambda_multi_view_geo: 0.02
+  lambda_multi_view_ncc: 0.2
+  lambda_normal_prior: 0.1
+  normal_prior_from_iter: 1
+  lambda_depth_prior: 0.4
+  real_depth_loss_mode: absolute
+  real_depth_relative_epsilon: 0.01
+  real_depth_relative_floor: 0.05
+  depth_prior_from_iter: 3000
+  depth_prior_ramp_iters: 0
+  vcd_enable: true
+  vcd_from_iter: 500
+  vcd_num_cams: 10
+  vcd_loss_thresh: 0.1
+  vcd_importance_thresh: 5
+  vcp_enable: true
+  vcp_from_iter: 500
+  vcp_remove_ratio: 0.9
+  multi_view_patch_size: 3
+  multi_view_pixel_noise_th: 1.0
+geometry:
+  start_iteration: 3501
+  ramp_end_iteration: 5000
+  topology_until: 15000
+  seed_from: 5001
+  seed_until: 14000
+  warm_interval: 4
+  joint_interval: 2
+  tail_interval: 4
+  last_opacity_reset: 3000
+  depth_search_expansions: 2
+  gpu_cache_size: 2
+  cpu_cache_size: 160
+  audit_interval: 500
+  audit_views: 16
+  priority_views: 8
+  topology_interval: 100
+  max_gaussians: 2500000
+  max_growth: 20000
+  max_growth_fraction: 0.05
+  geometry_reserve: 0.1
+  geometry_reserve_release: 12000
+  seed_batch_limit: 5000
+  seed_fraction: 0.01
+  seed_total_limit: 150000
+  grace_updates: 500
+  patch_prune_fraction: 0.1
+  loss_weights:
+    depth: 0.2
+    normal_render: 0.05
+    normal_depth: 0.05
+    coverage: 0.05
+runtime:
+  cpu_threads: 8
+  real_gpu_cache: 4
+  rgb_cache_gb: 2.0
+cache:
+  reuse: true
+outputs:
+  camera_preview: false
+  evaluation_iterations: []
+  save_iterations: []
+  viewer_ply: false
+  checkpoint_interval: 0
+  save_final_checkpoint: false
+  log_interval: 200

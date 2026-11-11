@@ -11,10 +11,13 @@ import numpy as np
 from PIL import Image
 from plyfile import PlyData, PlyElement
 
-from utils.virtual_camera_selection import MeshScene, log, sha256, unit, write_json
+from utils.virtual_camera_selection import log, sha256, unit, write_json
+from utils.mesh_resources import MeshScene as MeshScene  # Existing CLI/tests import this name.
+from utils.mesh_resources import MeshResources, sample_surface_from_arrays
 
 
 POINT_COUNT = 200000
+RGB_CACHE_BYTES = 2 * 1024 ** 3
 
 
 def load_real_views(dataset, images="images", eval_mode=False, train_exclude_images=""):
@@ -102,36 +105,7 @@ def views_from_cameras(train_cameras):
 
 def sample_surface(vertices, faces, count, seed, block_size=250000):
     """精确全部三角面积 CDF；只在固定大小块中展开三角坐标。"""
-    if count < 1 or faces.ndim != 2 or faces.shape[1] != 3:
-        raise ValueError("Positive count and triangle faces required")
-    cdf = np.empty(len(faces), np.float64)
-    for start in range(0, len(faces), block_size):
-        ids = faces[start:start + block_size]
-        if (ids < 0).any() or (ids >= len(vertices)).any():
-            raise ValueError("Invalid mesh face index")
-        triangle = vertices[ids]
-        a, b, c = triangle[:, 0], triangle[:, 1], triangle[:, 2]
-        cdf[start:start + len(ids)] = .5 * np.linalg.norm(np.cross(b - a, c - a), axis=1)
-        if start % (20 * block_size) == 0:
-            log("gen_init_area_scan", done=start, total=len(faces))
-    if not np.isfinite(cdf).all() or cdf.sum() <= 0:
-        raise ValueError("Mesh has nonfinite or zero total surface area")
-    degenerate_faces = int((cdf == 0).sum())
-    np.cumsum(cdf, out=cdf)
-    total_area = float(cdf[-1])
-    rng = np.random.default_rng(seed)
-    face_ids = np.searchsorted(cdf, rng.random(count) * total_area, side="right")
-    del cdf
-    triangle = vertices[faces[face_ids]]
-    a, b, c = triangle[:, 0], triangle[:, 1], triangle[:, 2]
-    u, v = np.sqrt(rng.random(count)), rng.random(count)
-    points = (1 - u[:, None]) * a + (u * (1 - v))[:, None] * b + (u * v)[:, None] * c
-    normals = unit(np.cross(b - a, c - a))
-    return points.astype(np.float32), normals.astype(np.float32), face_ids.astype(np.int64), {
-        "total_area": total_area, "degenerate_faces": degenerate_faces,
-        "sampled_distinct_faces": int(len(np.unique(face_ids))),
-        "method": "all-triangle exact area CDF and uniform barycentric sampling; no visibility selection",
-    }
+    return sample_surface_from_arrays(vertices, faces, count, seed, kind="initialization", block_size=block_size)
 
 
 def project_points(points, view):
@@ -169,9 +143,11 @@ def visible_samples(scene, points, face_ids, center):
     return visible
 
 
-def project_colors(points, normals, face_ids, views, scene, image_reader=None):
+def project_colors(points, normals, face_ids, views, scene, image_reader=None, rgb_cache_bytes=RGB_CACHE_BYTES):
     """每点选一个可见真实机位；失败继续所有候选，未见点保留中性灰。"""
     count = len(points)
+    if isinstance(rgb_cache_bytes, bool) or not isinstance(rgb_cache_bytes, (int, np.integer)) or rgb_cache_bytes < 0:
+        raise ValueError("RGB cache byte budget must be a nonnegative integer")
     scores = np.full((len(views), count), -np.inf, np.float32)
     for index, view in enumerate(views):
         _, valid = project_points(points, view)
@@ -186,16 +162,24 @@ def project_colors(points, normals, face_ids, views, scene, image_reader=None):
     source_view = np.full(count, -1, np.int32)
     attempts = np.zeros(count, np.uint16)
     image_cache = OrderedDict()
+    cached_bytes = peak_cached_bytes = 0
+    camera_centers = np.asarray([view["c2w"] for view in views])[:, :3, 3]
 
     def read_image(view_index):
+        nonlocal cached_bytes, peak_cached_bytes
         if view_index not in image_cache:
             view = views[view_index]
             image = image_reader(view) if image_reader else np.asarray(Image.open(view["image_path"]).convert("RGB"))
             if image.shape != (view["height"], view["width"], 3):
                 raise ValueError(f"Real image dimensions differ from COLMAP: {view['name']}")
+            if image.nbytes > rgb_cache_bytes:
+                return image
+            while image_cache and cached_bytes + image.nbytes > rgb_cache_bytes:
+                _, previous = image_cache.popitem(last=False)
+                cached_bytes -= previous.nbytes
             image_cache[view_index] = image
-            if len(image_cache) > 16:
-                image_cache.popitem(last=False)
+            cached_bytes += image.nbytes
+            peak_cached_bytes = max(peak_cached_bytes, cached_bytes)
         image_cache.move_to_end(view_index)
         return image_cache[view_index]
 
@@ -204,14 +188,13 @@ def project_colors(points, normals, face_ids, views, scene, image_reader=None):
         if not len(pending):
             break
         chosen_views = order[rank, pending]
-        for view_index in np.unique(chosen_views):
-            indices = pending[chosen_views == view_index]
+        # 同 rank 的不同 camera origins 合并一次 native raycast，数值定义不变。
+        visible = visible_samples(scene, points[pending], face_ids[pending], camera_centers[chosen_views])
+        attempts[pending] += 1
+        visible_points, visible_views = pending[visible], chosen_views[visible]
+        for view_index in np.unique(visible_views):
+            indices = visible_points[visible_views == view_index]
             view = views[int(view_index)]
-            visible = visible_samples(scene, points[indices], face_ids[indices], np.asarray(view["c2w"])[:3, 3])
-            attempts[indices] += 1
-            indices = indices[visible]
-            if not len(indices):
-                continue
             pixels, valid = project_points(points[indices], view)
             if not valid.all():
                 raise RuntimeError("Camera candidate changed during RGB projection")
@@ -225,6 +208,7 @@ def project_colors(points, normals, face_ids, views, scene, image_reader=None):
              "colored_fraction": float(colored.mean()), "no_image_candidate_points": int((candidate_counts == 0).sum()),
              "all_image_candidates_occluded_points": int(((~colored) & (candidate_counts > 0)).sum()),
              "checked_rays": int(attempts.sum(dtype=np.int64)),
+             "rgb_cache_bytes_limit": int(rgb_cache_bytes), "rgb_cache_peak_bytes": int(peak_cached_bytes),
              "attempt_quantiles_0_50_90_99_100": np.quantile(attempts, [0, .5, .9, .99, 1]).tolist(),
              "source_camera_counts": {views[i]["name"]: int((source_view == i).sum()) for i in np.unique(source_view[colored])}}
     return colors, source_view, stats
@@ -242,29 +226,32 @@ def write_point_cloud(path, points, normals, colors):
     PlyData([PlyElement.describe(records, "vertex")], text=False).write(path)
 
 
-def _prepare_views(dataset, mesh_path, output, views, calibration_files, seed=0, threads=8):
+def _prepare_views(dataset, mesh_path, output, views, calibration_files, seed=0, threads=8,
+                   num_points=POINT_COUNT, mesh_resources=None, rgb_cache_bytes=RGB_CACHE_BYTES):
     dataset, mesh_path, output = Path(dataset).resolve(), Path(mesh_path).resolve(), Path(output).resolve()
     if output.exists() and any(output.iterdir()):
         raise FileExistsError(f"Refusing nonempty output directory: {output}")
+    if isinstance(num_points, bool) or not isinstance(num_points, (int, np.integer)) or num_points < 1:
+        raise ValueError("Initialization point count must be a positive integer")
+    resources = mesh_resources or MeshResources(mesh_path, threads)
+    if resources.mesh_path != mesh_path:
+        raise ValueError("Shared mesh resources belong to another mesh")
     input_files = [mesh_path, *calibration_files, *(Path(view["image_path"]) for view in views)]
     fingerprints = {str(path): sha256(path) for path in input_files}
+    if fingerprints[str(mesh_path)] != resources.mesh_sha256:
+        raise ValueError("Shared mesh identity differs from current initialization input")
     producers = {str(Path(__file__).resolve()): sha256(__file__),
                  str(Path(__file__).resolve().parents[1] / "utils/virtual_camera_selection.py"):
-                     sha256(Path(__file__).resolve().parents[1] / "utils/virtual_camera_selection.py")}
+                     sha256(Path(__file__).resolve().parents[1] / "utils/virtual_camera_selection.py"),
+                 str(Path(__file__).resolve().with_name("mesh_resources.py")): sha256(Path(__file__).resolve().with_name("mesh_resources.py"))}
     output.mkdir(parents=True, exist_ok=True)
-    write_json(output / "state.json", {"status": "running", "seed": seed, "point_count": POINT_COUNT})
+    write_json(output / "state.json", {"status": "running", "seed": seed, "point_count": int(num_points)})
     try:
-        mesh = PlyData.read(mesh_path, mmap="r", known_list_len={"face": {"vertex_indices": 3}})
-        records = mesh["vertex"].data
-        vertices = np.column_stack([records[key] for key in ("x", "y", "z")]).astype(np.float32)
-        faces = mesh["face"].data["vertex_indices"]
-        points, normals, face_ids, sampling = sample_surface(vertices, faces, POINT_COUNT, seed)
-        log("gen_init_exact_mesh_acceleration", vertices=len(vertices), triangles=len(faces))
-        scene = MeshScene(vertices, faces, threads)
-        mesh_counts = {"vertices": len(vertices), "triangles": len(faces)}
-        del vertices, faces, mesh
-        colors, source_views, coloring = project_colors(points, normals, face_ids, views, scene)
-        if len(points) != POINT_COUNT or not np.isfinite(points).all() or not np.isfinite(normals).all():
+        points, normals, face_ids, sampling = resources.sample_surface(num_points, seed, kind="initialization")
+        mesh_counts = {"vertices": len(resources.vertices), "triangles": len(resources.faces)}
+        log("gen_init_exact_mesh_acceleration", **mesh_counts)
+        colors, source_views, coloring = project_colors(points, normals, face_ids, views, resources.scene, rgb_cache_bytes=rgb_cache_bytes)
+        if len(points) != num_points or not np.isfinite(points).all() or not np.isfinite(normals).all():
             raise RuntimeError("Invalid initialization sample count/coordinates")
         ply_path = output / "point_cloud.ply"
         write_point_cloud(ply_path, points, normals, colors)
@@ -276,7 +263,7 @@ def _prepare_views(dataset, mesh_path, output, views, calibration_files, seed=0,
         camera_hash = hashlib.sha256(json.dumps(camera_records, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()).hexdigest()
         metadata = {"schema_version": 1, "status": "complete", "initialization_source": "genrecon_global_surface",
                     "dataset": str(dataset), "genrecon_mesh": str(mesh_path), "coordinate_system": "unchanged COLMAP world",
-                    "point_count": POINT_COUNT, "seed": seed, "real_camera_count": len(views), "mesh": mesh_counts,
+                    "point_count": int(num_points), "seed": seed, "real_camera_count": len(views), "mesh": mesh_counts,
                     "sampling": sampling, "coloring": coloring, "source_files_sha256": fingerprints,
                     "producer_files_sha256": producers, "point_cloud_path": str(ply_path), "point_cloud_sha256": sha256(ply_path),
                     "provenance_path": "sampling_provenance.npz", "provenance_sha256": sha256(output / "sampling_provenance.npz"),
@@ -292,7 +279,7 @@ def _prepare_views(dataset, mesh_path, output, views, calibration_files, seed=0,
                                     "No filter, protection, Gaussian scale, rotation, or opacity recipe is changed here."]}
         write_json(output / "metadata.json", metadata)
         write_json(output / "state.json", {"status": "complete", "metadata_sha256": sha256(output / "metadata.json")})
-        log("gen_init_complete", output=str(output), point_count=POINT_COUNT,
+        log("gen_init_complete", output=str(output), point_count=int(num_points),
             colored_fraction=coloring["colored_fraction"], neutral_points=coloring["neutral_points"],
             checked_rays=coloring["checked_rays"])
         return ply_path
@@ -301,16 +288,20 @@ def _prepare_views(dataset, mesh_path, output, views, calibration_files, seed=0,
         raise
 
 
-def prepare_from_cameras(dataset, mesh_path, output, train_cameras, seed=0, threads=8):
+def prepare_from_cameras(dataset, mesh_path, output, train_cameras, seed=0, threads=8,
+                         num_points=POINT_COUNT, mesh_resources=None, rgb_cache_bytes=RGB_CACHE_BYTES,
+                         calibration_files=None):
     """训练入口：只用已划分的 CameraInfo 着色，返回该次独占输出的 PLY。"""
     output = Path(output).resolve()
     if output.exists() and any(output.iterdir()):
         raise FileExistsError(f"Refusing nonempty output directory: {output}")
     views = views_from_cameras(train_cameras)
-    sparse = Path(dataset).resolve() / "sparse/0"
-    extension = "bin" if (sparse / "cameras.bin").is_file() and (sparse / "images.bin").is_file() else "txt"
-    calibration_files = [sparse / f"cameras.{extension}", sparse / f"images.{extension}"]
-    return _prepare_views(dataset, mesh_path, output, views, calibration_files, seed, threads)
+    if calibration_files is None:
+        sparse = Path(dataset).resolve() / "sparse/0"
+        extension = "bin" if (sparse / "cameras.bin").is_file() and (sparse / "images.bin").is_file() else "txt"
+        calibration_files = [sparse / f"cameras.{extension}", sparse / f"images.{extension}"]
+    return _prepare_views(dataset, mesh_path, output, views, calibration_files, seed, threads,
+                          num_points=num_points, mesh_resources=mesh_resources, rgb_cache_bytes=rgb_cache_bytes)
 
 
 def prepare(dataset, mesh_path, output, seed=0, threads=8, images="images", eval_mode=False, train_exclude_images=""):

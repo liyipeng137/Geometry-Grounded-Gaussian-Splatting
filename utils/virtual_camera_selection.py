@@ -14,6 +14,8 @@ import numpy as np
 from scipy.spatial import cKDTree
 from scipy.spatial.transform import Rotation, Slerp
 
+from utils.mesh_resources import MeshResources
+from utils.mesh_resources import MeshScene as MeshScene  # Public compatibility export.
 
 SCHEMA_VERSION = 2
 EVIDENCE_NAMES = {0: "unknown", 1: "support", 2: "mixed", 3: "conflict"}
@@ -188,12 +190,21 @@ def path_safety(start, end, scene, cameras, depths, scene_scale, threads=8):
             "required_clearance": clearance, "segment_crosses_mesh": bool(crossed)}
 
 
-def load_cameras(dataset, long_edge):
+def _input_paths(dataset, input_paths=None):
+    dataset = Path(dataset).expanduser().resolve()
+    supplied = input_paths or {}
+    defaults = {"images": dataset / "images", "depth": dataset / "depth", "normals": dataset / "normals",
+                "colmap": dataset / "sparse/0", "mesh": dataset / "genrecon_mesh.ply"}
+    return {key: Path(supplied.get(key, value)).expanduser().resolve() for key, value in defaults.items()}
+
+
+def load_cameras(dataset, long_edge, input_paths=None):
     path = Path(__file__).resolve().parents[1] / "scene/colmap_loader.py"
     spec = importlib.util.spec_from_file_location("virtual_selection_colmap", path)
     loader = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(loader)
-    sparse = dataset / "sparse/0"
+    paths = _input_paths(dataset, input_paths)
+    sparse = paths["colmap"]
     binary = (sparse / "cameras.bin").is_file()
     intrinsics = loader.read_intrinsics_binary(sparse / "cameras.bin") if binary else loader.read_intrinsics_text(sparse / "cameras.txt")
     images = loader.read_extrinsics_binary(sparse / "images.bin") if binary else loader.read_extrinsics_text(sparse / "images.txt")
@@ -213,7 +224,7 @@ def load_cameras(dataset, long_edge):
         pose = np.eye(4)
         pose[:3, :3] = image.qvec2rotmat().T
         pose[:3, 3] = -pose[:3, :3] @ image.tvec
-        depth_path = dataset / "depth" / Path(image.name).with_suffix(".npy")
+        depth_path = paths["depth"] / Path(image.name).with_suffix(".npy")
         depth = np.load(depth_path, mmap_mode="r", allow_pickle=False)
         if depth.ndim != 2:
             raise ValueError(f"Expected HxW camera-Z depth: {depth_path}")
@@ -230,60 +241,19 @@ def load_cameras(dataset, long_edge):
                         "selection_source": "real", "width": width, "height": height,
                         "K": intrinsic.tolist(), "c2w": pose.tolist(), "anchor_id": None,
                         "target": (pose[:3, 3] + pose[:3, 2] * float(np.median(valid))).tolist(),
-                        "image_path": str(dataset / "images" / image.name), "depth_path": str(depth_path),
+                        "image_path": str(paths["images"] / image.name), "depth_path": str(depth_path),
                         "stats": {"median_real_depth": float(np.median(valid))}})
     return cameras, depths, float(np.median(np.concatenate(samples))), depth_paths, binary
 
 
-class MeshScene:
-    def __init__(self, vertices, faces, threads):
-        import open3d as o3d
-        self.o3d, self.threads = o3d, threads
-        self.scene = o3d.t.geometry.RaycastingScene(nthreads=threads)
-        self.scene.add_triangles(o3d.core.Tensor(np.ascontiguousarray(vertices, np.float32)),
-                                 o3d.core.Tensor(np.ascontiguousarray(faces, np.uint32)))
-
-    def cast(self, rays):
-        return {key: value.numpy() for key, value in self.scene.cast_rays(
-            self.o3d.core.Tensor(np.ascontiguousarray(rays, np.float32)), nthreads=self.threads).items()}
-
-    def distance(self, points):
-        return self.scene.compute_distance(self.o3d.core.Tensor(np.ascontiguousarray(points, np.float32)),
-                                           nthreads=self.threads).numpy()
-
-    def first_hit(self, origins, directions):
-        return self.cast(np.concatenate((origins, directions), axis=-1))["t_hit"]
-
-
-def load_mesh_and_samples(path, count, seed, scene_scale):
+def load_mesh_and_samples(path, count, seed, scene_scale, mesh_resources=None):
     """Exact full-face area sampling in bounded blocks, not face-index sampling."""
-    from plyfile import PlyData
-    mesh = PlyData.read(path, mmap="r", known_list_len={"face": {"vertex_indices": 3}})
-    records = mesh["vertex"].data
-    vertices = np.column_stack([records[name] for name in ("x", "y", "z")]).astype(np.float32)
-    faces = mesh["face"].data["vertex_indices"]
-    if faces.ndim != 2 or faces.shape[1] != 3:
-        raise ValueError("Triangle mesh required")
-    areas = np.empty(len(faces), np.float64)
-    block_size = 250000
-    for start in range(0, len(faces), block_size):
-        triangles = vertices[faces[start:start + block_size]]
-        areas[start:start + len(triangles)] = .5 * np.linalg.norm(np.cross(
-            triangles[:, 1] - triangles[:, 0], triangles[:, 2] - triangles[:, 0]), axis=1)
-        if start % (block_size * 20) == 0:
-            log("mesh_area_scan", done=start, total=len(faces))
-    if not np.isfinite(areas).all() or areas.sum() <= 0:
-        raise ValueError("Mesh has invalid area")
-    total_area = float(areas.sum())
-    np.cumsum(areas, out=areas)
-    rng = np.random.default_rng(seed)
-    ids = np.searchsorted(areas, rng.random(count) * total_area).astype(np.int64)
-    del areas
-    triangles = vertices[faces[ids]]
-    a, b, c = triangles[:, 0], triangles[:, 1], triangles[:, 2]
-    u, v = np.sqrt(rng.random(count)), rng.random(count)
-    xyz = (1 - u[:, None]) * a + (u * (1 - v))[:, None] * b + (u * v)[:, None] * c
-    normals = unit(np.cross(b - a, c - a))
+    resources = mesh_resources or MeshResources(path)
+    if resources.mesh_path != Path(path).expanduser().resolve():
+        raise ValueError("Shared mesh resources belong to another mesh")
+    vertices, faces = resources.vertices, resources.faces
+    xyz, normals, ids, sampling = resources.sample_surface(count, seed, kind="atlas")
+    total_area = sampling["total_area"]
     # Unsigned normal bin + spatial cell is a surface-region proxy only.
     dominant = np.argmax(np.abs(normals), axis=1)
     canonical = normals * np.where(normals[np.arange(count), dominant] < 0, -1., 1.)[:, None]
@@ -310,7 +280,7 @@ def _validate_offset_fraction(value):
         raise ValueError("trajectory_offset_fraction must be finite and lie in (0, 1]")
 
 
-def propose_candidates(cameras, atlas, scene_scale, candidate_limit, seed, trajectory_offset_fraction=.08):
+def propose_candidates(cameras, atlas, scene_scale, candidate_limit, seed, trajectory_offset_fraction=.16):
     _validate_offset_fraction(trajectory_offset_fraction)
     rng = np.random.default_rng(seed)
     poses = np.asarray([c["c2w"] for c in cameras])
@@ -526,36 +496,50 @@ def save_preview(output, camera, rendered, scene_scale, render_camera=None):
 
 def run_selection(dataset, mesh_path, output, target_count=160, candidate_limit=1200,
                   long_edge=256, surface_samples=120000, threads=8, seed=0, preview_long_edge=512,
-                  trajectory_offset_fraction=.08):
+                  trajectory_offset_fraction=.16, *, mesh_resources=None, export_previews=True,
+                  detailed_audit=True, input_paths=None):
     _validate_offset_fraction(trajectory_offset_fraction)
     dataset, mesh_path, output = Path(dataset).resolve(), Path(mesh_path).resolve(), Path(output).resolve()
+    paths = _input_paths(dataset, input_paths)
+    if input_paths is not None and "mesh" in input_paths and paths["mesh"] != mesh_path:
+        raise ValueError("Input mesh path differs from requested mesh")
+    paths["mesh"] = mesh_path
+    resources = mesh_resources or MeshResources(mesh_path, threads)
+    if resources.mesh_path != mesh_path:
+        raise ValueError("Shared mesh resources belong to another mesh")
     if output.exists() and any(output.iterdir()):
         raise FileExistsError(f"Refusing nonempty output directory: {output}")
     if not 1 <= target_count <= candidate_limit or min(long_edge, preview_long_edge) < 32 or surface_samples < 100:
         raise ValueError("Invalid selection dimensions/counts")
     output.mkdir(parents=True, exist_ok=True)
-    (output / "previews").mkdir()
+    if export_previews:
+        (output / "previews").mkdir()
     started = time.monotonic()
     config = dict(target_count=target_count, candidate_limit=candidate_limit, long_edge=long_edge,
                   surface_samples=surface_samples, threads=threads, seed=seed, preview_long_edge=preview_long_edge,
-                  trajectory_offset_fraction=float(trajectory_offset_fraction))
+                  trajectory_offset_fraction=float(trajectory_offset_fraction), export_previews=bool(export_previews),
+                  detailed_audit=bool(detailed_audit))
     write_json(output / "state.json", {"status": "running", "config": config})
     log("loading_real_cameras")
-    cameras, depths, scale, depth_paths, binary = load_cameras(dataset, long_edge)
+    cameras, depths, scale, depth_paths, binary = load_cameras(dataset, long_edge, paths)
     log("real_inputs_loaded", cameras=len(cameras), scene_scale=scale)
     suffix = "bin" if binary else "txt"
-    sources = [mesh_path, dataset / f"sparse/0/cameras.{suffix}", dataset / f"sparse/0/images.{suffix}",
-               Path(__file__).resolve(), Path(__file__).resolve().parents[1] / "scripts/select_virtual_cameras.py", *depth_paths]
+    sources = [mesh_path, paths["colmap"] / f"cameras.{suffix}", paths["colmap"] / f"images.{suffix}",
+               Path(__file__).resolve(), Path(__file__).resolve().with_name("mesh_resources.py"),
+               Path(__file__).resolve().parents[1] / "scripts/select_virtual_cameras.py", *depth_paths]
     fingerprints = {str(path): sha256(path) for path in sources}
     write_json(output / "source_fingerprints.json", fingerprints)
-    vertices, faces, atlas, mesh_info = load_mesh_and_samples(mesh_path, surface_samples, seed, scale)
+    if fingerprints[str(mesh_path)] != resources.mesh_sha256:
+        raise ValueError("Shared mesh identity differs from the current input")
+    vertices, faces, atlas, mesh_info = load_mesh_and_samples(mesh_path, surface_samples, seed, scale, resources)
     atlas.update(aggregate_evidence(atlas["xyz"], cameras, depths, scale))
     np.savez_compressed(output / "sample_atlas.npz", **atlas)
-    colors = np.array([[145, 154, 168], [105, 190, 145], [230, 174, 82], [225, 88, 91]], np.uint8)
-    np.savez_compressed(output / "scene_preview.npz", xyz=atlas["xyz"], rgb=colors[atlas["evidence_class"]],
-                        normal_world=atlas["normal_world"], evidence_class=atlas["evidence_class"], patch_id=atlas["patch_id"])
+    if export_previews:
+        colors = np.array([[145, 154, 168], [105, 190, 145], [230, 174, 82], [225, 88, 91]], np.uint8)
+        np.savez_compressed(output / "scene_preview.npz", xyz=atlas["xyz"], rgb=colors[atlas["evidence_class"]],
+                            normal_world=atlas["normal_world"], evidence_class=atlas["evidence_class"], patch_id=atlas["patch_id"])
     log("building_exact_mesh_acceleration", **mesh_info)
-    scene = MeshScene(vertices, faces, threads)
+    scene = resources.scene
     del vertices, faces
     tree = cKDTree(atlas["xyz"])
     # Anchor displacement uses teacher depth, as defined by the design.
@@ -591,32 +575,37 @@ def run_selection(dataset, mesh_path, output, target_count=160, candidate_limit=
             candidate["rejection_reason"] = audit["reason"]
         candidate.setdefault("accepted", False)
         audits.append(candidate)
-        # Always leave reviewable progress even if a long mesh job is interrupted.
-        with (output / "candidate_audit.jsonl").open("a") as stream:
-            stream.write(json.dumps(candidate, allow_nan=False) + "\n")
+        if detailed_audit:
+            with (output / "candidate_audit.jsonl").open("a") as stream:
+                stream.write(json.dumps(candidate, allow_nan=False) + "\n")
         if (index + 1) % 20 == 0 or index + 1 == len(candidates):
             log("candidate_audit", done=index + 1, total=len(candidates), accepted=len(accepted))
     if not accepted:
-        write_json(output / "candidates.json", {"schema_version": 2, "candidates": audits})
+        if detailed_audit:
+            write_json(output / "candidates.json", {"schema_version": 2, "candidates": audits})
         write_json(output / "state.json", {"status": "failed_no_safe_candidates", "config": config})
-        raise RuntimeError("No safe candidates; inspect candidate_audit.jsonl")
+        raise RuntimeError("No safe candidates; inspect selection progress and state.json")
     chosen, report = greedy_select(accepted, coverage, atlas, target_count)
     selected = [accepted[index] for index in chosen]
-    np.savez_compressed(output / "coverage.npz", exposure=report.pop("exposure"), direction_count=report.pop("direction_count"))
+    exposure, direction_count = report.pop("exposure"), report.pop("direction_count")
+    if detailed_audit:
+        np.savez_compressed(output / "coverage.npz", exposure=exposure, direction_count=direction_count)
     chosen_ids = {camera["id"] for camera in selected}
     for candidate in audits:
         candidate["selected"] = candidate["id"] in chosen_ids
         if candidate["accepted"] and not candidate["selected"]:
             candidate["selection_rejection_reason"] = "redundant_or_budget_limited"
-    all_preview_cameras = cameras + selected
-    for index, camera in enumerate(all_preview_cameras):
-        preview_camera = resized_camera(camera, preview_long_edge)
-        save_preview(output, camera, scene.cast(camera_rays(preview_camera)), scale, preview_camera)
-        if (index + 1) % 20 == 0:
-            log("camera_previews", done=index + 1, total=len(all_preview_cameras))
+    if export_previews:
+        all_preview_cameras = cameras + selected
+        for index, camera in enumerate(all_preview_cameras):
+            preview_camera = resized_camera(camera, preview_long_edge)
+            save_preview(output, camera, scene.cast(camera_rays(preview_camera)), scale, preview_camera)
+            if (index + 1) % 20 == 0:
+                log("camera_previews", done=index + 1, total=len(all_preview_cameras))
     write_json(output / "real_cameras.json", {"schema_version": 2, "cameras": cameras})
     write_json(output / "virtual_cameras.json", {"schema_version": 2, "cameras": selected})
-    write_json(output / "candidates.json", {"schema_version": 2, "candidates": audits})
+    if detailed_audit:
+        write_json(output / "candidates.json", {"schema_version": 2, "candidates": audits})
     rejections = {}
     for camera in audits:
         if not camera["accepted"]:
@@ -638,9 +627,14 @@ def run_selection(dataset, mesh_path, output, target_count=160, candidate_limit=
                 "scene_scale": scale, "pixel_center_convention": "colmap_half_integer", "depth_convention": "camera_z",
                 "normal_convention": "camera_space_unit_face_normal_toward_camera", "units": "scene",
                 "real_cameras_path": "real_cameras.json", "virtual_cameras_path": "virtual_cameras.json",
-                "scene_preview_path": "scene_preview.npz", "atlas_path": "sample_atlas.npz",
-                "report_path": "report.json", "candidates_path": "candidates.json", "coverage_path": "coverage.npz",
-                "source_fingerprints_path": "source_fingerprints.json", "preview_colors": "evidence categories; not texture"}
+                "atlas_path": "sample_atlas.npz", "report_path": "report.json",
+                "source_fingerprints_path": "source_fingerprints.json",
+                "input_paths": {key: str(value) for key, value in paths.items()},
+                "export_previews": bool(export_previews), "detailed_audit": bool(detailed_audit)}
+    if export_previews:
+        manifest.update(scene_preview_path="scene_preview.npz", preview_colors="evidence categories; not texture")
+    if detailed_audit:
+        manifest.update(candidates_path="candidates.json", coverage_path="coverage.npz")
     write_json(output / "manifest.json", manifest)
     receipt_paths = sorted(path for path in output.rglob("*") if path.is_file() and path.name not in ("state.json", "receipt.json"))
     write_json(output / "receipt.json", {"schema_version": 2, "files": {str(path.relative_to(output)): sha256(path) for path in receipt_paths}})

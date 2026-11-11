@@ -54,7 +54,7 @@ class Scene:
         self.test_cameras = {}
 
         print(args.source_path)
-        if os.path.exists(os.path.join(args.source_path, "sparse")):
+        if os.path.exists(os.path.join(args.source_path, getattr(args, "colmap_dir", "sparse/0"))):
             scene_info = sceneLoadTypeCallbacks["Colmap"](
                 args.source_path,
                 args.images,
@@ -69,6 +69,8 @@ class Scene:
                 init_seed=initialization_seed,
                 initialization_record=initialization_record,
                 load_initialization=self.loaded_iter is None,
+                init_num_points=getattr(args, "init_num_points", 200000),
+                colmap_dir=getattr(args, "colmap_dir", "sparse/0"),
             )
         elif os.path.exists(os.path.join(args.source_path, "transforms.json")):
             print("Found transforms_train.json file, assuming Blender data set!")
@@ -162,14 +164,21 @@ class Scene:
                     log_max_scale = torch.log(max_scale).repeat(3, 1).permute(1, 0)
                     self.gaussians._scaling[:] = torch.clamp_max(self.gaussians._scaling, log_max_scale)
 
-    def save(self, iteration):
+    def save(self, iteration, save_viewer=True):
         point_cloud_path = os.path.join(self.model_path, "point_cloud/iteration_{}".format(iteration))
         self.gaussians.save_ply(os.path.join(point_cloud_path, "point_cloud.ply"))
         if self.gaussians.app_model == GaussianModel.App_model.PGSR:
-            self.gaussians.save_3dgsviewer_ply(os.path.join(point_cloud_path, "point_cloud_3dgsviewer.ply"))
+            if not save_viewer:
+                # Delivery keeps the small learned appearance state without a second full PLY.
+                torch.save({"frame_names": [c.source_image_name for c in self.getTrainCameras()],
+                            "embeddings": self.gaussians._appearance_embeddings.detach().cpu()},
+                           os.path.join(point_cloud_path, "appearance.pth"))
+            if save_viewer:
+                self.gaussians.save_3dgsviewer_ply(os.path.join(point_cloud_path, "point_cloud_3dgsviewer.ply"))
         elif self.gaussians.app_model == GaussianModel.App_model.PPISP:
             # PLY contains canonical colors; view-dependent ISP cannot be baked into it.
-            self.gaussians.save_3dgsviewer_ply(os.path.join(point_cloud_path, "point_cloud_canonical_3dgsviewer.ply"))
+            if save_viewer:
+                self.gaussians.save_3dgsviewer_ply(os.path.join(point_cloud_path, "point_cloud_canonical_3dgsviewer.ply"))
             state_path = os.path.join(point_cloud_path, "ppisp.pth")
             torch.save(self.gaussians.ppisp.export_state(), state_path + ".tmp")
             os.replace(state_path + ".tmp", state_path)

@@ -98,6 +98,12 @@ def _reset_opacity_probabilities(logits, coefficient, maximum_filtered_opacity=0
     return result.clamp(epsilon, 1 - epsilon)
 
 
+def _ply_elements(columns, dtype_full):
+    """Pack homogeneous float32 fields without millions of temporary Python tuples."""
+    packed = np.ascontiguousarray(np.concatenate(columns, axis=1), dtype=np.float32)
+    return packed.view(np.dtype(dtype_full)).reshape(packed.shape[0])
+
+
 class GaussianModel:
     class App_model(Enum):
         NO = 0
@@ -685,9 +691,10 @@ class GaussianModel:
         filter_3D = self.filter_3D.detach().cpu().numpy()
         dtype_full = [(attribute, "f4") for attribute in self.construct_list_of_attributes()]
 
-        elements = np.empty(xyz.shape[0], dtype=dtype_full)
-        attributes = np.concatenate((xyz, normals, f_dc, f_rest, opacities, scale, rotation, sg_axis, sg_sharpness, sg_color, filter_3D), axis=1)
-        elements[:] = list(map(tuple, attributes))
+        elements = _ply_elements(
+            (xyz, normals, f_dc, f_rest, opacities, scale, rotation, sg_axis, sg_sharpness, sg_color, filter_3D),
+            dtype_full,
+        )
         el = PlyElement.describe(elements, "vertex")
         PlyData([el]).write(path)
 
@@ -738,9 +745,7 @@ class GaussianModel:
         attrs.extend([f"rot_{i}" for i in range(rotation.shape[1])])
         dtype_full = [(attribute, "f4") for attribute in attrs]
 
-        elements = np.empty(xyz.shape[0], dtype=dtype_full)
-        packed = np.concatenate((xyz, normals, f_dc, f_rest, opacities, scale, rotation), axis=1)
-        elements[:] = list(map(tuple, packed))
+        elements = _ply_elements((xyz, normals, f_dc, f_rest, opacities, scale, rotation), dtype_full)
         el = PlyElement.describe(elements, "vertex")
         PlyData([el]).write(path)
 

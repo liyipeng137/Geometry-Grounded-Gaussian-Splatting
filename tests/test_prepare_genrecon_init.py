@@ -214,8 +214,8 @@ def test_camera_info_entry_only_passes_actual_subset_and_given_image_paths(tmp_p
     del unused
     captured = {}
 
-    def receive(dataset, mesh, output, views, calibration_files, seed, threads):
-        captured.update(views=views, seed=seed)
+    def receive(dataset, mesh, output, views, calibration_files, seed, threads, **kwargs):
+        captured.update(views=views, seed=seed, options=kwargs, calibration_files=calibration_files)
         return Path(output) / "point_cloud.ply"
 
     monkeypatch.setattr(mesh_initialization, "_prepare_views", receive)
@@ -224,6 +224,13 @@ def test_camera_info_entry_only_passes_actual_subset_and_given_image_paths(tmp_p
     assert captured["seed"] == 7
     assert [v["name"] for v in captured["views"]] == ["included.png"]
     assert captured["views"][0]["image_path"] == str(Path(included.image_path).resolve())
+    shared = object()
+    calibration = [tmp_path / "alternate_colmap/cameras.bin", tmp_path / "alternate_colmap/images.bin"]
+    MODULE.prepare_from_cameras(tmp_path, tmp_path / "mesh.ply", tmp_path / "out", [included],
+                                num_points=12345, mesh_resources=shared, rgb_cache_bytes=4096,
+                                calibration_files=calibration)
+    assert captured["options"] == {"num_points": 12345, "mesh_resources": shared, "rgb_cache_bytes": 4096}
+    assert captured["calibration_files"] == calibration
 
 
 def test_cli_and_camera_info_paths_have_identical_geometry_and_color_for_same_subset(tmp_path):

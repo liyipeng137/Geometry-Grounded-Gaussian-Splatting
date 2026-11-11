@@ -230,7 +230,7 @@ def update_topology(
             gaussians.compute_3D_filter(cameras=cameras)
 
 
-def training(dataset, opt, pipe, args):
+def training(dataset, opt, pipe, args, *, prepared_teacher=None):
     """每步必有真实相机，按日程附加虚拟相机，两路梯度共用一次参数更新。
 
     baseline保留backward→topology→step；joint使用step→安全拓扑事务。
@@ -238,7 +238,7 @@ def training(dataset, opt, pipe, args):
     """
     validate_options(opt, args)
     validate_initialization_options(dataset)
-    if getattr(dataset, "init_mesh", "") and not Path(dataset.source_path, "sparse").is_dir():
+    if getattr(dataset, "init_mesh", "") and not Path(dataset.source_path, getattr(dataset, "colmap_dir", "sparse/0")).is_dir():
         raise ValueError("--init_mesh requires a COLMAP dataset")
 
     # A is an explicit offline step. This only selects its completed config;
@@ -269,11 +269,18 @@ def training(dataset, opt, pipe, args):
         joint_config = load_joint_config(args.virtual_geometry_config)
         opt.dense_optimizer_updates = True
         args.dense_optimizer_updates = True
-        teacher = VirtualGeometryDataset(
-            joint_config["teacher_manifest"], device="cuda",
-            gpu_cache_size=joint_config["gpu_cache_size"],
-            cpu_cache_size=joint_config["cpu_cache_size"], seed=args.training_seed,
-        )
+        if prepared_teacher is not None:
+            if Path(prepared_teacher.path).resolve() != Path(joint_config["teacher_manifest"]).resolve():
+                raise ValueError("Prepared teacher does not match the configured manifest")
+            teacher = prepared_teacher
+        else:
+            teacher = VirtualGeometryDataset(
+                joint_config["teacher_manifest"], device="cuda",
+                gpu_cache_size=joint_config["gpu_cache_size"],
+                cpu_cache_size=joint_config["cpu_cache_size"], seed=args.training_seed,
+            )
+    elif prepared_teacher is not None:
+        raise ValueError("A prepared teacher requires virtual geometry training")
 
     # 1. 先识别续训，再决定初始化来源。Scene 在训练划分确定后处理 mesh；
     #    续训仅复用冻结点云，不再依赖原 mesh，也不重新运行 TSDF。
@@ -327,7 +334,11 @@ def training(dataset, opt, pipe, args):
             gaussians, scene, teacher, joint_config, pipe, background,
             dataset.kernel_size, frame_cache=frame_cache, opt=opt,
         )
-        joint = JointRuntime(joint_config, teacher, topology, scene.model_path, start_iteration)
+        joint = JointRuntime(
+            joint_config, teacher, topology, scene.model_path, start_iteration,
+            detailed_virtual_log=getattr(args, "detailed_virtual_log", True),
+            log_interval=args.log_interval, final_iteration=opt.iterations,
+        )
         if parameters is not None:
             viewpoint_stack = joint.restore(parameters[14][JOINT_RUNTIME_KEY], gaussians, cameras)
             parameters = None  # 拓扑变动后不继续持有旧checkpoint的大张量。
@@ -358,14 +369,16 @@ def training(dataset, opt, pipe, args):
     if joint:
         logger.stats.update(recipe=JOINT_RECIPE, rng_resume_policy=JOINT_RESUME_POLICY,
                             iteration_order="real/virtual backward -> optimizer -> safe topology -> save")
+    step_timing = getattr(args, "step_timing", True)
     start_event, end_event = (
         torch.cuda.Event(enable_timing=True),
         torch.cuda.Event(enable_timing=True),
-    )
+    ) if step_timing else (None, None)
     progress = tqdm(total=opt.iterations - start_iteration, desc="Training")
     try:
         for iteration in range(start_iteration + 1, opt.iterations + 1):
-            start_event.record()
+            if step_timing:
+                start_event.record()
             gaussians.update_learning_rate(iteration)
             if iteration % 1000 == 0:
                 gaussians.unlockSGdegree(100)
@@ -403,7 +416,10 @@ def training(dataset, opt, pipe, args):
             ):
                 nearest = cameras[sample(camera.nearest_id, 1)[0]]
                 if frame_cache is not None:
-                    nearest = frame_cache.ensure(nearest, keep=(camera,))
+                    nearest = frame_cache.ensure(
+                        nearest, keep=(camera,),
+                        fields=getattr(patchmatch, "neighbor_payload_fields", ("original_image",)),
+                    )
             losses = compute_training_losses(
                 buffers,
                 camera,
@@ -428,6 +444,7 @@ def training(dataset, opt, pipe, args):
                     )
                     virtual_losses = compute_virtual_geometry_losses(
                         virtual_buffers, virtual_camera, weights=joint_config["loss_weights"], ramp=ramp,
+                        collect_metrics=joint.should_record(iteration),
                     )
                     if not bool(torch.isfinite(virtual_losses.total)):
                         raise FloatingPointError(f"Nonfinite virtual loss before update at iteration {iteration}")
@@ -435,9 +452,10 @@ def training(dataset, opt, pipe, args):
                     joint.topology.collect_virtual(virtual_buffers, virtual_camera)
                     joint.record(iteration, virtual_index, virtual_camera, virtual_losses, stage, ramp)
                     del virtual_losses, virtual_buffers
-            end_event.record()
-            # 原循环通过 loss.item() 隐式等待 CUDA；这里显式等待后再读取事件。
-            end_event.synchronize()
+            if step_timing:
+                end_event.record()
+                # Only diagnostic timing requires this explicit event synchronization.
+                end_event.synchronize()
 
             # 5. joint先更新，再到SH累积已消费的边界增删点，最后保存。
             # baseline保留原先optimizer前保存PLY的语义。
@@ -454,7 +472,7 @@ def training(dataset, opt, pipe, args):
                     losses,
                     opt,
                     schedule,
-                    start_event.elapsed_time(end_event),
+                    start_event.elapsed_time(end_event) if step_timing else None,
                     gaussians,
                 )
                 progress.update(1)
@@ -484,7 +502,7 @@ def training(dataset, opt, pipe, args):
                     )
                 if iteration in args.save_iterations:
                     print(f"[ITER {iteration}] Saving Gaussian PLY")
-                    scene.save(iteration)
+                    scene.save(iteration, save_viewer=getattr(args, "save_viewer_ply", True))
 
                 # 6. 原真实baseline专用：保持topology-before-step。joint已在上方提交。
                 if not joint:
@@ -560,8 +578,18 @@ def main():
         nargs="*",
         type=int,
         default=[],
-        help="The final iteration is always checkpointed",
+        help="The final iteration is added unless --no_final_checkpoint is set",
     )
+    parser.add_argument("--no_viewer_ply", action="store_false", dest="save_viewer_ply", default=True,
+                        help="Skip the additional viewer PLY; keep the native Gaussian output")
+    parser.add_argument("--no_final_checkpoint", action="store_false", dest="save_final_checkpoint", default=True,
+                        help="Do not automatically add a final checkpoint; explicit checkpoints remain enabled")
+    parser.add_argument("--keep_last_checkpoint", action="store_true", default=False,
+                        help="After checkpoint and receipt succeed, remove older checkpoint pairs in this output directory")
+    parser.add_argument("--no_step_timing", action="store_false", dest="step_timing", default=True,
+                        help="Skip per-step CUDA timing events and their explicit synchronization")
+    parser.add_argument("--compact_virtual_log", action="store_false", dest="detailed_virtual_log", default=True,
+                        help="Write virtual diagnostics and TensorBoard scalars only at log intervals")
     parser.add_argument("--start_checkpoint", type=str, default=None)
     parser.add_argument(
         "--virtual_geometry_config", type=str, default=None,
@@ -596,9 +624,8 @@ def main():
             sorted(set(value for value in values if value <= args.iterations)),
         )
     args.save_iterations = sorted(set(args.save_iterations + [args.iterations]))
-    args.checkpoint_iterations = sorted(
-        set(args.checkpoint_iterations + [args.iterations])
-    )
+    if getattr(args, "save_final_checkpoint", True):
+        args.checkpoint_iterations = sorted(set(args.checkpoint_iterations + [args.iterations]))
 
     safe_state(args.quiet, seed=args.training_seed)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)

@@ -5,7 +5,6 @@
 
 import hashlib
 import json
-import math
 import os
 import sys
 import uuid
@@ -238,6 +237,13 @@ def save_checkpoint(gaussians, scene, iteration, args, joint_runtime=None):
         path.with_suffix(".state.json"),
         {**state, "checkpoint_sha256": digest.hexdigest()},
     )
+    if getattr(args, "keep_last_checkpoint", False):
+        # Both new files are complete. Unlink only this run's older entries;
+        # never resolve a symlink and delete a checkpoint in a resume-source run.
+        for previous in output.glob("chkpnt*.pth"):
+            if previous != path:
+                previous.unlink(missing_ok=True)
+                previous.with_suffix(".state.json").unlink(missing_ok=True)
     print(f"[ITER {iteration}] Saved checkpoint: {path}")
 
 
@@ -250,6 +256,10 @@ class TrainingLogger:
         self.log_interval = args.log_interval
         self.ema = {}
         self.loss_sums = {}
+        self.detailed_scalars = getattr(args, "detailed_virtual_log", True)
+        self._raw_names = self._weighted_names = None
+        self._last_values = self._sum_values = self._ema_values = None
+        self._scalar_state_dirty = False
         self.stream = (self.output / "loss.jsonl").open("w", buffering=1)
         self.stats = {
             "recipe": RECIPE,
@@ -298,25 +308,34 @@ class TrainingLogger:
     def record_loss(
         self, iteration, camera, losses, opt, schedule, elapsed_ms, gaussians
     ):
-        raw = {
-            name: float(value.detach().item())
-            for name, value in losses.raw_terms().items()
-        }
-        weighted = {
-            name: float(value.detach().item())
-            for name, value in losses.weighted_terms(opt, schedule).items()
-        }
-        total = float(losses.total.detach().item())
-        if not all(
-            math.isfinite(value) for value in [total, *raw.values(), *weighted.values()]
-        ):
+        raw_terms = losses.raw_terms()
+        weighted_terms = losses.weighted_terms(opt, schedule)
+        names, weighted_names = tuple(raw_terms), tuple(weighted_terms)
+        if self._raw_names is None:
+            self._raw_names, self._weighted_names = names, weighted_names
+        elif names != self._raw_names or weighted_names != self._weighted_names:
+            raise ValueError("Training loss logging fields changed during the run")
+        # One scalar finite check remains mandatory. Avoid synchronizing every term.
+        values = torch.stack([value.detach().reshape(()) for value in
+                              (*raw_terms.values(), *weighted_terms.values(), losses.total)]).to(torch.float64)
+        if not bool(torch.isfinite(values).all()):
             raise FloatingPointError(f"Non-finite loss at iteration {iteration}")
+        self._last_values = values
+        raw_values = torch.cat((values[:len(names)], values[-1:]))
+        if self._sum_values is None:
+            self._sum_values = raw_values.clone()
+            self._ema_values = .4 * raw_values
+        else:
+            self._sum_values.add_(raw_values)
+            self._ema_values = .4 * raw_values + .6 * self._ema_values
+        self._scalar_state_dirty = True
         self.stats["real_samples"] += 1
         self.stats["last_iteration"] = iteration
-        for name, value in {**raw, "total": total}.items():
-            self.ema[name] = 0.4 * value + 0.6 * self.ema.get(name, 0.0)
-            self.loss_sums[name] = self.loss_sums.get(name, 0.0) + value
-        if iteration % self.log_interval == 0 or iteration == opt.iterations:
+        log_due = iteration % self.log_interval == 0 or iteration == opt.iterations
+        tensorboard_due = self.writer and (self.detailed_scalars or log_due)
+        if log_due or tensorboard_due:
+            raw, weighted, total = self._read_scalar_state()
+        if log_due:
             record = {
                 "iteration": iteration,
                 "camera": camera.image_name,
@@ -329,13 +348,27 @@ class TrainingLogger:
                 "forward_backward_ms": elapsed_ms,
             }
             self.stream.write(json.dumps(record, allow_nan=False) + "\n")
-        if self.writer:
+        if tensorboard_due:
             for name, value in raw.items():
                 self.writer.add_scalar("train_loss/" + name, value, iteration)
             self.writer.add_scalar("train_loss/total", total, iteration)
-            self.writer.add_scalar("iter_time", elapsed_ms, iteration)
+            if elapsed_ms is not None:
+                self.writer.add_scalar("iter_time", elapsed_ms, iteration)
+
+    def _read_scalar_state(self):
+        raw_count, weighted_count = len(self._raw_names), len(self._weighted_names)
+        count = raw_count + weighted_count + 1
+        host = torch.cat((self._last_values, self._sum_values, self._ema_values)).cpu().tolist()
+        stat_names = (*self._raw_names, "total")
+        self.loss_sums = dict(zip(stat_names, host[count:count+len(stat_names)]))
+        self.ema = dict(zip(stat_names, host[count+len(stat_names):]))
+        self._scalar_state_dirty = False
+        return (dict(zip(self._raw_names, host[:raw_count])),
+                dict(zip(self._weighted_names, host[raw_count:raw_count+weighted_count])), host[count-1])
 
     def flush_stats(self, gaussians):
+        if self._scalar_state_dirty:
+            self._read_scalar_state()
         samples = self.stats["real_samples"]
         self.stats["mean_losses"] = {
             name: value / max(samples, 1) for name, value in self.loss_sums.items()

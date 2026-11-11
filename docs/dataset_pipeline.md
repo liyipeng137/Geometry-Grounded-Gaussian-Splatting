@@ -1,5 +1,16 @@
 # 按数据集运行：A 准备，B 训练
 
+新交付入口使用一条命令完成准备与训练：
+
+```bash
+python pipeline.py --dataset /workspace/dataset/245_for_train
+```
+
+默认 Gen mesh 20万点初始化、16%轨迹偏移、最多160个虚拟机位、模式3、20k iterations；
+参数由根目录 `config.yaml` 或 `--config` YAML 覆盖。详情见
+[交付管道说明](delivery_pipeline.md)。新入口使用 `DATASET/gggs/cache` 与 `DATASET/gggs/runs`。
+下文保留原 A/B 分步调试流程，其缓存位于 `DATASET/virtual_geometry`，输出默认值以本文描述为准。
+
 A 手动准备虚拟机位、预览和固定 depth/normal；B 运行训练。
 A 不启动训练，B 不自动生成或修复这些虚拟几何产物。两步复用现有筛选、teacher和联合训练
 算法，不改变其损失或日程。

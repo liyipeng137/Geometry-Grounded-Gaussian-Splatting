@@ -29,7 +29,7 @@ def mesh_preparer(external_reader, monkeypatch):
     calls = []
     module = ModuleType("utils.mesh_initialization")
 
-    def prepare(dataset, mesh_path, output, cameras, seed=0):
+    def prepare(dataset, mesh_path, output, cameras, seed=0, num_points=200000):
         calls.append((dataset, mesh_path, output, cameras.copy(), seed))
         output.mkdir(parents=True, exist_ok=True)
         path = output / "point_cloud.ply"

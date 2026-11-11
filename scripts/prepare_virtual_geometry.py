@@ -70,6 +70,8 @@ def prepare_pipeline(dataset, mesh=None, output=None, threads=8, seed=0):
             raise FileExistsError(f"Nonempty incomplete output is preserved: {root}")
         if Path(existing.get("dataset", "")).expanduser().resolve() != dataset or Path(existing.get("mesh", "")).expanduser().resolve() != mesh:
             raise ValueError("Existing virtual geometry belongs to another dataset or mesh")
+        if existing.get("trajectory_offset_fraction", .08) != .16:
+            raise ValueError("Existing cache has a different trajectory offset; choose a new output directory")
         if existing.get("seed") != seed:
             raise ValueError("Existing virtual geometry uses a different seed; choose a new output directory")
         config_path = validate_dataset_pipeline(dataset, root)
@@ -80,7 +82,7 @@ def prepare_pipeline(dataset, mesh=None, output=None, threads=8, seed=0):
 
     root.mkdir(parents=True, exist_ok=True)
     marker = {"schema_version": 1, "status": "running", "dataset": str(dataset), "mesh": str(mesh),
-              "stage": "camera_selection", "seed": seed, "threads": threads}
+              "stage": "camera_selection", "seed": seed, "threads": threads, "trajectory_offset_fraction": .16}
     write_json(marker_path, marker)
     try:
         log("virtual_geometry_stage", stage=marker["stage"], root=str(root))

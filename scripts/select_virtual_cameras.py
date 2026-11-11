@@ -15,7 +15,7 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--target-count", type=int, default=160)
     parser.add_argument("--candidate-limit", type=int, default=1200)
-    parser.add_argument("--trajectory-offset-fraction", type=float, default=.08,
+    parser.add_argument("--trajectory-offset-fraction", type=float, default=.16,
                         help="Lateral/vertical trajectory offset fraction; does not change surface/interpolation poses")
     parser.add_argument("--long-edge", type=int, default=256)
     parser.add_argument("--preview-long-edge", type=int, default=512)

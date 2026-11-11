@@ -369,7 +369,8 @@ def test_offset_radius_prefers_teacher_depth_without_relabeling_real_statistics(
     original = deepcopy(cam)
     _, _, atlas = selection_inputs([[0]])
     atlas["normal_world"] = np.array([[0.0, 0.0, -1.0]])
-    candidates = vcs.propose_candidates([cam], atlas, scene_scale=10.0, candidate_limit=32, seed=0)
+    candidates = vcs.propose_candidates([cam], atlas, scene_scale=10.0, candidate_limit=32, seed=0,
+                                        trajectory_offset_fraction=.08)
     offsets = [candidate for candidate in candidates if candidate["selection_source"] == "trajectory_offset"]
     assert len(offsets) == 4
     origin = np.asarray(cam["c2w"])[:3, 3]
@@ -378,7 +379,7 @@ def test_offset_radius_prefers_teacher_depth_without_relabeling_real_statistics(
     assert cam == original
 
 
-def test_larger_offset_changes_only_trajectory_centers_and_keeps_default_eight_percent():
+def test_larger_offset_changes_only_trajectory_centers_and_defaults_to_sixteen_percent():
     cams = [camera("a", center=(.2, -.3, 0), rotation=rotation_z(.4)),
             camera("b", center=(.7, -.2, 0), rotation=rotation_z(.6))]
     for cam, depth in zip(cams, (1.0, 4.0)):
@@ -388,7 +389,7 @@ def test_larger_offset_changes_only_trajectory_centers_and_keeps_default_eight_p
     default = vcs.propose_candidates(cams, atlas, 3., 1000, 0)
     old = vcs.propose_candidates(cams, atlas, 3., 1000, 0, trajectory_offset_fraction=.08)
     new = vcs.propose_candidates(cams, atlas, 3., 1000, 0, trajectory_offset_fraction=.16)
-    assert default == old
+    assert default == new
     assert [row["id"] for row in old] == [row["id"] for row in new]
     anchors = {cam["id"]: np.asarray(cam["c2w"])[:3, 3] for cam in cams}
     assert {row["selection_source"] for row in old} == {

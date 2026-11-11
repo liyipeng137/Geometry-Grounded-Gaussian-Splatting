@@ -222,7 +222,7 @@ def _write_record(path, value):
 
 def readColmapSceneInfo(path, images, eval, llffhold=8, use_rgbd_init_ply=True,
                        train_exclude_images="", init_cache_dir=None, depth_prior_dir="depth", init_ply="",
-                       init_mesh="", init_seed=0, initialization_record=None, load_initialization=True):
+                       init_mesh="", init_seed=0, initialization_record=None, load_initialization=True, init_num_points=200000, colmap_dir="sparse/0"):
     """默认 RGBD；mesh/PLY 只替换初始 XYZ/RGB，续训复用冻结的点云。
 
     ``depth_prior_dir`` 与训练监督使用同一配置，支持相对数据集或绝对目录。
@@ -238,7 +238,9 @@ def readColmapSceneInfo(path, images, eval, llffhold=8, use_rgbd_init_ply=True,
     if (Path(path) / "mixed_dataset.json").exists():
         raise ValueError("Mixed/generated ordinary-camera datasets are outside the formal FFBA input contract")
     depth_root = resolve_rgbd_depth_directory(path, depth_prior_dir) if load_initialization else None
-    model = Path(path) / "sparse/0"
+    if isinstance(init_num_points, bool) or not isinstance(init_num_points, int) or init_num_points < 1:
+        raise ValueError("init_num_points must be a positive integer")
+    model = Path(path) / colmap_dir
     if (model / "cameras.bin").is_file() and (model / "images.bin").is_file():
         cam_extrinsics = read_extrinsics_binary(str(model / "images.bin"))
         cam_intrinsics = read_intrinsics_binary(str(model / "cameras.bin"))
@@ -275,7 +277,7 @@ def readColmapSceneInfo(path, images, eval, llffhold=8, use_rgbd_init_ply=True,
         # 只在 fresh 训练调用；实际训练相机和 image_path 决定着色来源。
         from utils.mesh_initialization import prepare_from_cameras
         mesh_path = Path(init_mesh).expanduser().resolve(strict=True)
-        init_ply = prepare_from_cameras(path, mesh_path, cache / "initialization", train, seed=init_seed)
+        init_ply = prepare_from_cameras(path, mesh_path, cache / "initialization", train, seed=init_seed, num_points=init_num_points)
         generation_path = Path(init_ply).parent / "metadata.json"
         generation = json.loads(generation_path.read_text())
         mesh_sha256 = generation.get("source_files_sha256", {}).get(str(mesh_path))
@@ -331,7 +333,7 @@ def readColmapSceneInfo(path, images, eval, llffhold=8, use_rgbd_init_ply=True,
                     "depth_directory": str(depth_root),
                     "train_assets": train_assets,
                     "calibrations": {name: calibrations[name] for name in train_assets},
-                    "parameters": {"num_points": 200000, "voxel_length": 0.02, "sdf_trunc": 0.06, "depth_min": 0.05, "depth_max": 50.0,
+                    "parameters": {"num_points": init_num_points, "voxel_length": 0.02, "sdf_trunc": 0.06, "depth_min": 0.05, "depth_max": 50.0,
                                    "largest_mesh_components": 3, "component_rank": "triangle_count",
                                    "point_sampling": "final_filtered_mesh_vertices"}}
         init_fingerprint = calibration_fingerprint(identity)
@@ -346,7 +348,7 @@ def readColmapSceneInfo(path, images, eval, llffhold=8, use_rgbd_init_ply=True,
                 try:
                     with tempfile.NamedTemporaryFile(dir=cache, suffix=".ply", delete=False) as stream:
                         temporary = Path(stream.name)
-                    generate_ply_from_rgbd(train, num_points=200000, ply_path=str(temporary), cam_intrinsics=cam_intrinsics,
+                    generate_ply_from_rgbd(train, num_points=init_num_points, ply_path=str(temporary), cam_intrinsics=cam_intrinsics,
                                           source_path=path, pixel_center_convention="colmap_half_integer",
                                           depth_prior_dir=str(depth_root))
                     pcd = fetchOpen3DPly(str(temporary))

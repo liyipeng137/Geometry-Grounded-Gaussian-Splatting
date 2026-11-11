@@ -36,12 +36,19 @@ class FramePayloadCache:
             raise ValueError("frame_gpu_budget must be -1 or a positive integer")
         self._cache = OrderedDict()
 
-    def ensure(self, camera, keep=()):
+    def ensure(self, camera, keep=(), fields=None):
         if not self.enabled:
+            if fields is not None:
+                camera.load_payload_to_device(fields=fields)
             return camera
 
         key = id(camera)
         if key in self._cache:
+            # An RGB-only neighbor can later become the full real training frame.
+            if fields is None:
+                camera.load_payload_to_device()
+            else:
+                camera.load_payload_to_device(fields=fields)
             self._cache.move_to_end(key)
             return camera
 
@@ -58,7 +65,10 @@ class FramePayloadCache:
             if not evicted:
                 break
 
-        camera.load_payload_to_device()
+        if fields is None:
+            camera.load_payload_to_device()
+        else:
+            camera.load_payload_to_device(fields=fields)
         self._cache[key] = camera
         return camera
 
@@ -187,10 +197,14 @@ class Camera(nn.Module):
             setattr(self, name + "_cpu", None)
             setattr(self, name, None if tensor is None else tensor.to(self.data_device))
 
-    def load_payload_to_device(self):
+    def load_payload_to_device(self, fields=None):
+        fields = _PAYLOAD_FIELDS if fields is None else tuple(fields)
+        unknown = set(fields) - set(_PAYLOAD_FIELDS)
+        if unknown:
+            raise ValueError(f"Unknown camera payload fields: {sorted(unknown)}")
         if not self.lazy_payload:
             return
-        for name in _PAYLOAD_FIELDS:
+        for name in fields:
             cpu_tensor = getattr(self, name + "_cpu")
             if cpu_tensor is not None and getattr(self, name) is None:
                 setattr(self, name, cpu_tensor.to(self.data_device, non_blocking=True))

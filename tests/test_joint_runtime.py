@@ -111,18 +111,49 @@ def make_model():
 def runtime_factory(tmp_path, runtime_api):
     opened = []
 
-    def create(config=None):
+    def create(config=None, **runtime_options):
         output = tmp_path / f"segment-{len(opened)}"
         output.mkdir()
         config = config or {"teacher_manifest": "/teacher/manifest.json", "warm_interval": 4}
         teacher, topology = FakeTeacher(runtime_api.ShuffledViewSampler), FakeTopology()
-        runtime = runtime_api.JointRuntime(config, teacher, topology, output, start_iteration=7)
+        runtime = runtime_api.JointRuntime(config, teacher, topology, output, start_iteration=7, **runtime_options)
         opened.append(runtime)
         return runtime
 
     yield create
     for runtime in opened:
         runtime.close()
+
+
+def test_compact_virtual_logs_keep_cumulative_counts_and_loss_sums(runtime_factory):
+    runtime = runtime_factory(detailed_virtual_log=False, log_interval=10, final_iteration=12)
+    expected = 0.
+    for iteration in range(8, 13):
+        raw = torch.tensor(iteration*.1)
+        weighted = raw*.2
+        expected += float(weighted)
+        losses = SimpleNamespace(raw={"depth": raw}, weighted={"depth": weighted}, total=weighted,
+                                 metrics={"teacher_pixels": 12})
+        runtime.record(iteration, 0, SimpleNamespace(image_name="virtual"), losses, "joint", 1.)
+    summary = runtime.summary()
+    assert summary["virtual_samples"] == summary["segment_virtual_samples"] == 5
+    assert summary["weighted_loss_sums"]["depth"] == expected
+    assert summary["virtual_log_mode"] == "interval"
+    rows = [json.loads(line) for line in (runtime.output/"virtual_loss.jsonl").read_text().splitlines()]
+    assert [row["iteration"] for row in rows] == [10, 12]
+    saved = serialized(runtime.capture(make_model(), cameras()))
+    resumed = runtime_factory(detailed_virtual_log=False)
+    resumed.restore(saved, make_model(), cameras())
+    assert resumed.summary()["weighted_loss_sums"]["depth"] == expected
+
+
+def test_compact_virtual_log_checks_nonfinite_values_even_between_intervals(runtime_factory):
+    runtime = runtime_factory(detailed_virtual_log=False, log_interval=100)
+    losses = SimpleNamespace(raw={"depth": torch.tensor(float("nan"))}, weighted={"depth": torch.tensor(0.)},
+                             total=torch.tensor(0.), metrics={})
+    with pytest.raises(FloatingPointError):
+        runtime.record(8, 0, SimpleNamespace(image_name="virtual"), losses, "joint", 1.)
+    assert runtime.stats["virtual_samples"] == 0
 
 
 def cameras():

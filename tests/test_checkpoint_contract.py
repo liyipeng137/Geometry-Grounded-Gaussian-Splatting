@@ -12,6 +12,7 @@ import json
 import os
 from pathlib import Path
 import tempfile
+from types import SimpleNamespace
 
 import pytest
 
@@ -24,6 +25,75 @@ def execute_functions(path, names, namespace):
     nodes = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name in names]
     assert {node.name for node in nodes} == set(names)
     exec(compile(ast.Module(body=nodes, type_ignores=[]), str(ROOT / path), "exec"), namespace)
+
+
+@pytest.fixture
+def checkpoint_writer(tmp_path):
+    output = tmp_path / "new-run"
+    output.mkdir()
+    (output / "camera_split.json").write_text("{}")
+    namespace = {
+        "Path": Path, "json": json, "hashlib": hashlib,
+        "RECIPE": "test", "RESUME_POLICY": "test", "CHECKPOINT_STATE_KEY": "state",
+        "require_baseline_checkpoint": lambda state, iteration: state,
+        "torch": SimpleNamespace(save=lambda payload, path: Path(path).write_bytes(b"new checkpoint")),
+    }
+    execute_functions("utils/training_io.py", {"write_json", "save_checkpoint"}, namespace)
+    return SimpleNamespace(output=output, namespace=namespace,
+                           scene=SimpleNamespace(model_path=str(output)),
+                           model=SimpleNamespace(capture=lambda: tuple([None] * 14 + [{}])))
+
+
+@pytest.mark.parametrize("retain_latest", [False, True])
+def test_checkpoint_retention_keeps_current_pair_and_never_deletes_resume_source(checkpoint_writer, tmp_path, retain_latest):
+    writer = checkpoint_writer
+    source = tmp_path / "resume-source"
+    source.mkdir()
+    original, original_receipt = source / "chkpnt40.pth", source / "chkpnt40.state.json"
+    original.write_bytes(b"resume original")
+    original_receipt.write_text("original receipt")
+    old, old_receipt = writer.output / "chkpnt40.pth", writer.output / "chkpnt40.state.json"
+    old.write_bytes(b"old checkpoint")
+    old_receipt.write_text("old receipt")
+    alias, alias_receipt = writer.output / "chkpnt7.pth", writer.output / "chkpnt7.state.json"
+    alias.symlink_to(original)
+    alias_receipt.symlink_to(original_receipt)
+    unrelated = writer.output / "appearance.pth"
+    unrelated.write_bytes(b"keep appearance")
+    args = SimpleNamespace(training_seed=0)
+    if retain_latest:
+        args.keep_last_checkpoint = True
+    writer.namespace["save_checkpoint"](writer.model, writer.scene, 80, args)
+    current = writer.output / "chkpnt80.pth"
+    receipt = json.loads((writer.output / "chkpnt80.state.json").read_text())
+    assert current.read_bytes() == b"new checkpoint"
+    assert receipt["checkpoint_sha256"] == hashlib.sha256(current.read_bytes()).hexdigest()
+    assert old.exists() is (not retain_latest)
+    assert old_receipt.exists() is (not retain_latest)
+    assert alias.is_symlink() is (not retain_latest)
+    assert alias_receipt.is_symlink() is (not retain_latest)
+    assert original.read_bytes() == b"resume original"
+    assert original_receipt.read_text() == "original receipt"
+    assert unrelated.read_bytes() == b"keep appearance"
+
+
+def test_checkpoint_receipt_failure_does_not_prune_previous_pair(checkpoint_writer):
+    writer = checkpoint_writer
+    old, old_receipt = writer.output / "chkpnt40.pth", writer.output / "chkpnt40.state.json"
+    old.write_bytes(b"old checkpoint")
+    old_receipt.write_text("old receipt")
+
+    def fail_receipt(*args):
+        raise OSError("receipt unavailable")
+
+    writer.namespace["write_json"] = fail_receipt
+    with pytest.raises(OSError, match="receipt unavailable"):
+        writer.namespace["save_checkpoint"](writer.model, writer.scene, 80,
+                                            SimpleNamespace(training_seed=0, keep_last_checkpoint=True))
+    assert (writer.output / "chkpnt80.pth").is_file()
+    assert not (writer.output / "chkpnt80.state.json").exists()
+    assert old.read_bytes() == b"old checkpoint"
+    assert old_receipt.read_text() == "old receipt"
 
 
 @pytest.fixture

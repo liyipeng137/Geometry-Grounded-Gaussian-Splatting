@@ -10,7 +10,8 @@ from contextlib import nullcontext
 from dataclasses import dataclass
 import math
 from pathlib import Path
-from types import MethodType, SimpleNamespace
+from types import MethodType, ModuleType, SimpleNamespace
+import sys
 
 import pytest
 
@@ -70,7 +71,7 @@ def make_harness(start=0, stop=3, multiview=False, failure_at=None):
             event("training_setup")
 
         def update_learning_rate(self, iteration):
-            assert iteration == state.iteration
+            state.iteration = iteration
             event("learning_rate")
 
         def unlockSGdegree(self, degree):
@@ -100,6 +101,7 @@ def make_harness(start=0, stop=3, multiview=False, failure_at=None):
             self.gaussians = model
             self.model_path = dataset.model_path
             self.ply_states = {}
+            self.viewer_requests = {}
             state.scenes.append(self)
 
         def getTrainCameras(self):
@@ -108,17 +110,20 @@ def make_harness(start=0, stop=3, multiview=False, failure_at=None):
         def getTestCameras(self):
             return []
 
-        def save(self, iteration):
+        def save(self, iteration, save_viewer=True):
             self.ply_states[iteration] = len(self.gaussians.optimizer.steps)
+            self.viewer_requests[iteration] = save_viewer
             event("save_ply")
 
     class Cache:
         def __init__(self, budget):
             self.calls = []
+            self.field_calls = []
             state.caches.append(self)
 
-        def ensure(self, camera, keep=()):
+        def ensure(self, camera, keep=(), fields=None):
             self.calls.append((state.iteration, camera.image_name, tuple(item.image_name for item in keep)))
+            self.field_calls.append(fields)
             event("cache", camera.image_name, tuple(item.image_name for item in keep))
             return camera
 
@@ -154,10 +159,11 @@ def make_harness(start=0, stop=3, multiview=False, failure_at=None):
             self.ema = {name: 0.0 for name in ("total", "depth_prior", "depth_normal", "normal_prior", "ncc")}
             self.flushes = []
             self.closed = False
+            self.step_timing = getattr(args, "step_timing", True)
             state.loggers.append(self)
 
         def record_loss(self, iteration, camera, losses, opt, schedule, elapsed, gaussians):
-            assert elapsed == 1.25
+            assert elapsed == 1.25 if self.step_timing else elapsed is None
             event("record_loss", camera.image_name)
 
         def flush_stats(self, model):
@@ -222,8 +228,8 @@ def make_harness(start=0, stop=3, multiview=False, failure_at=None):
             tensor=lambda *args, **kwargs: object(), float32="float32", no_grad=nullcontext,
             cuda=SimpleNamespace(Event=CUDAEvent),
         ),
-        "load_checkpoint": lambda path: (None, start, None),
-        "prepare_output": lambda *args: None,
+        "load_checkpoint": lambda path, **kwargs: (None, start, None),
+        "prepare_output": lambda *args, **kwargs: None,
         "restore_checkpoint": lambda *args: None,
         "record_initialization": lambda *args: None,
         "resolve_virtual_geometry_config": lambda dataset, explicit_config=None, disabled=False: explicit_config,
@@ -258,9 +264,9 @@ def make_harness(start=0, stop=3, multiview=False, failure_at=None):
         disable_filter3D=True, kernel_size=0.0, model_path="unused-output", source_path="unused-dataset",
     )
     return SimpleNamespace(
-        run=lambda: namespace["training"](dataset, opt, SimpleNamespace(debug=False), args),
+        run=lambda **kwargs: namespace["training"](dataset, opt, SimpleNamespace(debug=False), args, **kwargs),
         state=state, trace=trace, args=args, patchmatch_calls=patchmatch_calls,
-        checkpoint_states=checkpoint_states, cameras=cameras,
+        checkpoint_states=checkpoint_states, cameras=cameras, dataset=dataset, namespace=namespace,
     )
 
 
@@ -306,6 +312,64 @@ def test_neighbor_payload_load_keeps_current_camera_resident():
         (7001, "frame_0.png", ()), (7001, "frame_1.png", ("frame_0.png",)),
         (7002, "frame_1.png", ()), (7002, "frame_0.png", ("frame_1.png",)),
     ]
+    assert harness.state.caches[0].field_calls == [None, ("original_image",), None, ("original_image",)]
+
+
+def test_production_flags_skip_cuda_timing_and_viewer_without_changing_updates():
+    harness = make_harness(stop=5)
+    harness.args.step_timing = False
+    harness.args.save_viewer_ply = False
+    harness.args.test_iterations = harness.args.checkpoint_iterations = []
+    harness.args.save_iterations = [5]
+    harness.run()
+    assert len(harness.state.models[0].optimizer.steps) == 4
+    assert harness.state.scenes[0].viewer_requests == {5: False}
+    assert not any("event" in row[1] or row[1] == "elapsed_time" for row in harness.trace)
+    assert harness.checkpoint_states == {}
+
+
+def test_prepared_teacher_is_rejected_for_real_only_training():
+    harness = make_harness()
+    with pytest.raises(ValueError, match="prepared teacher requires"):
+        harness.run(prepared_teacher=SimpleNamespace(path="unused"))
+
+
+@pytest.mark.parametrize("matching", [False, True])
+def test_prepared_teacher_manifest_checked_without_constructing_another_dataset(monkeypatch, tmp_path, matching):
+    harness = make_harness()
+    harness.dataset.disable_filter3D = False
+    harness.args.virtual_geometry_config = "joint.json"
+    harness.namespace["Path"] = Path
+    manifest = tmp_path/"teacher.json"
+
+    def unexpected_constructor(*args, **kwargs):
+        raise AssertionError("Prepared teacher must not be loaded a second time")
+
+    modules = {
+        "utils.virtual_geometry_config": dict(load_joint_config=lambda path: {"teacher_manifest": str(manifest)},
+                                              config_identity=lambda config: "fixed", virtual_schedule=lambda *args: None,
+                                              JOINT_RECIPE="joint"),
+        "utils.virtual_geometry_data": dict(VirtualGeometryDataset=unexpected_constructor),
+        "utils.virtual_geometry_losses": dict(compute_virtual_geometry_losses=None),
+        "utils.geometry_topology": dict(GeometryTopology=None),
+        "utils.joint_runtime": dict(JointRuntime=None, JOINT_RUNTIME_KEY="joint_state"),
+        "utils.training_io": dict(JOINT_RESUME_POLICY="joint"),
+    }
+    for name, values in modules.items():
+        module = ModuleType(name)
+        module.__dict__.update(values)
+        monkeypatch.setitem(sys.modules, name, module)
+
+    class ReachedScene(Exception):
+        pass
+
+    def stop_after_injection(*args, **kwargs):
+        raise ReachedScene
+
+    harness.namespace["Scene"] = stop_after_injection
+    teacher = SimpleNamespace(path=manifest if matching else tmp_path/"different.json", identity={"cache": "fixed"})
+    with pytest.raises(ReachedScene if matching else ValueError):
+        harness.run(prepared_teacher=teacher)
 
 
 def test_zero_scheduled_ncc_does_not_sample_a_neighbor():

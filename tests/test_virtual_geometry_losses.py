@@ -92,3 +92,19 @@ def test_noncentral_K_camera_z_conversion_uses_same_physical_ray():
     converted = cam.camera_z_depth(depth)
     assert not torch.allclose(converted, depth)
     assert torch.isfinite(converted).all()
+
+
+def test_skipping_diagnostics_preserves_all_losses_maps_and_gradients():
+    full_render, compact_render = package(2.12, .7), package(2.12, .7)
+    full = compute_virtual_geometry_losses(full_render, make_camera(), collect_metrics=True)
+    compact = compute_virtual_geometry_losses(compact_render, make_camera(), collect_metrics=False)
+    assert full.metrics and compact.metrics == {}
+    for name in full.raw:
+        torch.testing.assert_close(compact.raw[name], full.raw[name], rtol=0, atol=0)
+        torch.testing.assert_close(compact.weighted[name], full.weighted[name], rtol=0, atol=0)
+    for name in full.maps:
+        torch.testing.assert_close(compact.maps[name], full.maps[name], rtol=0, atol=0)
+    full.total.backward()
+    compact.total.backward()
+    for name in full_render:
+        torch.testing.assert_close(compact_render[name].grad, full_render[name].grad, rtol=0, atol=0)

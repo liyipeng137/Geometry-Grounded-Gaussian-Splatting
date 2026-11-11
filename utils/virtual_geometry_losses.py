@@ -34,7 +34,7 @@ def depth_normal(depth, valid, camera):
     return normal, F.pad(interior, (1, 1, 1, 1), value=False)
 
 
-def compute_virtual_geometry_losses(render_pkg, camera, weights=None, ramp=1.0):
+def compute_virtual_geometry_losses(render_pkg, camera, weights=None, ramp=1.0, *, collect_metrics=True):
     weights = dict(DEFAULT_WEIGHTS if weights is None else weights)
     if set(weights) != set(DEFAULT_WEIGHTS) or any(float(value) < 0 for value in weights.values()):
         raise ValueError("Virtual loss requires four nonnegative configured weights")
@@ -88,21 +88,26 @@ def compute_virtual_geometry_losses(render_pkg, camera, weights=None, ramp=1.0):
     weighted = {key: float(ramp) * float(weights[key]) * value for key, value in raw.items()}
     total = sum(weighted.values())
     with torch.no_grad():
-        count = teacher_valid.sum().clamp_min(1)
-        normal_count = normal_teacher_valid.sum().clamp_min(1)
         missing = teacher_valid & ~student_valid
-        fixed_depth = torch.where(student_valid, relative.abs(), torch.ones_like(relative))
-        fixed_normal = torch.where(normal_valid, render_error, torch.full_like(render_error, 2.))
-        metrics = {
-            "teacher_pixels": int(teacher_valid.sum()),
-            "teacher_normal_pixels": int(normal_teacher_valid.sum()),
-            "missing_fraction": float(missing.sum() / count),
-            "fixed_depth_relative_error": float(torch.where(teacher_valid, fixed_depth, 0).sum() / count),
-            "fixed_normal_cosine_error": float(torch.where(normal_teacher_valid, fixed_normal, 0).sum() / normal_count),
-            "root_search_failed_fraction": float(((status == 2) & teacher_valid).sum() / count),
-            "low_coverage_fraction": float(((status == 1) & teacher_valid).sum() / count),
-            "no_contributor_fraction": float(((status == 0) & teacher_valid).sum() / count),
-        }
+        metrics = {}
+        if collect_metrics:
+            teacher_count = teacher_valid.sum()
+            teacher_normal_count = normal_teacher_valid.sum()
+            count, normal_count = teacher_count.clamp_min(1), teacher_normal_count.clamp_min(1)
+            fixed_depth = torch.where(student_valid, relative.abs(), torch.ones_like(relative))
+            fixed_normal = torch.where(normal_valid, render_error, torch.full_like(render_error, 2.))
+            diagnostic = torch.stack([value.to(torch.float64) for value in (
+                teacher_count, teacher_normal_count, missing.sum()/count,
+                torch.where(teacher_valid, fixed_depth, 0).sum()/count,
+                torch.where(normal_teacher_valid, fixed_normal, 0).sum()/normal_count,
+                ((status == 2) & teacher_valid).sum()/count,
+                ((status == 1) & teacher_valid).sum()/count,
+                ((status == 0) & teacher_valid).sum()/count,
+            )]).cpu().tolist()
+            metrics = dict(zip(("teacher_pixels", "teacher_normal_pixels", "missing_fraction",
+                                "fixed_depth_relative_error", "fixed_normal_cosine_error",
+                                "root_search_failed_fraction", "low_coverage_fraction", "no_contributor_fraction"), diagnostic))
+            metrics["teacher_pixels"], metrics["teacher_normal_pixels"] = int(diagnostic[0]), int(diagnostic[1])
         maps = {"depth_valid": student_valid, "normal_valid": normal_valid, "normal_depth_valid": stencil_valid,
                 "teacher_valid": teacher_valid, "teacher_normal_valid": normal_teacher_valid,
                 "relative_depth_error": relative.abs().detach(), "normal_error": render_error.detach(),

@@ -1,6 +1,7 @@
 """冻结虚拟几何 teacher 的离线准备、校验和有限设备缓存。"""
 
 import copy
+import hashlib
 import importlib.util
 import json
 import shutil
@@ -20,6 +21,29 @@ from utils.virtual_camera_selection import (
 ARRAY_KEYS = {"depth", "normal", "valid_depth", "valid_normal", "q", "weight_depth",
               "weight_normal", "weight_coverage", "face_id", "patch_id", "evidence_class"}
 SCALAR_IMAGES = {"depth", "valid_depth", "valid_normal", "q", "weight_depth", "weight_normal", "weight_coverage"}
+
+
+def _arrays_fingerprint(arrays):
+    """同进程预载交接的内容证明；不重新压缩，也不改变磁盘 schema。"""
+    digest = hashlib.sha256()
+    for name in sorted(arrays):
+        value = np.ascontiguousarray(arrays[name])
+        digest.update(json.dumps([name, value.dtype.str, list(value.shape)], separators=(",", ":")).encode())
+        digest.update(memoryview(value).cast("B"))
+    return digest.hexdigest()
+
+
+def _source_fingerprint(path, preverified_sources):
+    """仅复用本进程调用者已验证的前置 SHA；阶段末仍完整重验来源。"""
+    key = str(Path(path).resolve())
+    if key not in preverified_sources:
+        return sha256(path)
+    expected = preverified_sources[key]
+    if not isinstance(expected, str) or len(expected) != 64 or any(c not in "0123456789abcdef" for c in expected):
+        raise ValueError(f"Invalid preverified source SHA: {path}")
+    if not Path(path).is_file():
+        raise ValueError(f"Preverified source is missing: {path}")
+    return expected
 
 
 def validate_camera(record):
@@ -162,8 +186,17 @@ def exposure_budget(pixel_counts, patch_areas):
     return result.astype(np.float32)
 
 
-def prepare_teacher(approved_manifest, output, dataset=None, long_edge=512, threads=8):
+def prepare_teacher(approved_manifest, output, dataset=None, long_edge=512, threads=8,
+                    *, mesh_resources=None, preverified_sources=None, input_paths=None, prepared_arrays=None):
+    """冻结 D/N 缓存；可复用同进程 mesh/来源证明，最终数组只压缩写盘一次。
+
+    prepared_arrays 是可选空 dict，成功后填入 index -> 内部预载 bundle，供
+    VirtualGeometryDataset(preloaded_arrays=...) 接管。公开默认路径仍完整校验。
+    """
     approved_manifest, output = Path(approved_manifest).resolve(), Path(output).resolve()
+    if prepared_arrays is not None and (not isinstance(prepared_arrays, dict) or prepared_arrays):
+        raise ValueError("prepared_arrays must be an empty dictionary")
+    preverified_sources = {str(Path(path).resolve()): value for path, value in (preverified_sources or {}).items()}
     if output.exists() and any(output.iterdir()):
         raise FileExistsError(f"Refusing nonempty teacher directory: {output}")
     approved = json.loads(approved_manifest.read_text())
@@ -187,11 +220,18 @@ def prepare_teacher(approved_manifest, output, dataset=None, long_edge=512, thre
     if not views or len({row["id"] for row in views}) != len(views):
         raise ValueError("Approved virtual camera IDs must be nonempty and unique")
     mesh_path = Path(approved["genrecon_mesh"])
+    paths = input_paths if input_paths is not None else approved.get("input_paths", {})
+    image_root = Path(paths.get("images", dataset / "images"))
+    normal_root = Path(paths.get("normals", dataset / "normals"))
+    if not image_root.is_absolute() or not normal_root.is_absolute():
+        raise ValueError("Resolved teacher image/normal input paths must be absolute")
+    if mesh_resources is not None and Path(mesh_resources.mesh_path).resolve() != mesh_path.resolve():
+        raise ValueError("Shared mesh resources differ from the approved teacher mesh")
     previous = json.loads((root / approved["source_fingerprints_path"]).read_text())
     approved_producers = {path: digest for path, digest in previous.items() if Path(path).suffix in (".py", ".sh", ".cu", ".cpp", ".h", ".so")}
     sources = {path: digest for path, digest in previous.items() if path not in approved_producers}
     for path, expected in sources.items():
-        if sha256(path) != expected:
+        if _source_fingerprint(path, preverified_sources) != expected:
             raise ValueError(f"Approved source changed: {path}")
     for path in (approved_manifest, source_pose_path, source_real_path, source_atlas_path,
                  root / approved["source_fingerprints_path"]):
@@ -201,8 +241,8 @@ def prepare_teacher(approved_manifest, output, dataset=None, long_edge=512, thre
     producers = {str(path): sha256(path) for path in producer_paths}
     for camera in real:
         name = Path(camera["name"])
-        for path in (dataset / "images" / name, dataset / "normals" / name.with_suffix(".png")):
-            sources[str(path)] = sha256(path)
+        for path in (image_root / name, normal_root / name.with_suffix(".png")):
+            sources[str(path)] = _source_fingerprint(path, preverified_sources)
     output.mkdir(parents=True, exist_ok=True)
     (output / "views").mkdir()
     write_json(output / "state.json", {"status": "running", "approved_manifest_sha256": sources[str(approved_manifest)]})
@@ -216,15 +256,19 @@ def prepare_teacher(approved_manifest, output, dataset=None, long_edge=512, thre
     patch_areas = np.bincount(atlas_regions, weights=atlas["area_weight"])
     fallback_area = float(np.median(atlas["area_weight"]))
     tree = cKDTree(atlas["xyz"])
-    from plyfile import PlyData
-    mesh = PlyData.read(mesh_path, mmap="r", known_list_len={"face": {"vertex_indices": 3}})
-    vertex = mesh["vertex"].data
-    vertices = np.column_stack([vertex[key] for key in ("x", "y", "z")]).astype(np.float32)
-    log("teacher_exact_mesh_load", vertices=len(vertices), faces=len(mesh["face"]))
-    scene = MeshScene(vertices, mesh["face"].data["vertex_indices"], threads)
-    del vertices, mesh
+    if mesh_resources is None:
+        from plyfile import PlyData
+        mesh = PlyData.read(mesh_path, mmap="r", known_list_len={"face": {"vertex_indices": 3}})
+        vertex = mesh["vertex"].data
+        vertices = np.column_stack([vertex[key] for key in ("x", "y", "z")]).astype(np.float32)
+        log("teacher_exact_mesh_load", vertices=len(vertices), faces=len(mesh["face"]))
+        scene = MeshScene(vertices, mesh["face"].data["vertex_indices"], threads)
+        del vertices, mesh
+    else:
+        log("teacher_exact_mesh_reused", vertices=len(mesh_resources.vertices), faces=len(mesh_resources.faces))
+        scene = mesh_resources.scene
     pixel_counts = np.zeros(len(region_ids), np.int64)
-    records = []
+    records, rendered_arrays = [], []
     for index, approved_view in enumerate(views):
         camera = resized_camera(approved_view, long_edge)
         validate_camera(camera)
@@ -234,7 +278,7 @@ def prepare_teacher(approved_manifest, output, dataset=None, long_edge=512, thre
         pixel_counts = np.pad(pixel_counts, (0, len(region_ids) - len(pixel_counts)))
         pixel_counts += np.bincount(arrays["patch_id"][arrays["valid_depth"]], minlength=len(pixel_counts))
         relative = f"views/{index:04d}.npz"
-        np.savez_compressed(output / relative, **arrays)
+        rendered_arrays.append(arrays)
         records.append({"id": camera["id"], "virtual_index": index, "width": camera["width"], "height": camera["height"],
                         "K": camera["K"], "c2w": camera["c2w"], "arrays_path": relative,
                         "selection_source": camera["selection_source"], "anchor_id": camera["anchor_id"], "stats": statistics})
@@ -245,7 +289,7 @@ def prepare_teacher(approved_manifest, output, dataset=None, long_edge=512, thre
     normalization = {"depth": 0., "normal": 0., "coverage": 0.}
     for index, record in enumerate(records):
         path = output / record["arrays_path"]
-        arrays = dict(np.load(path, allow_pickle=False))
+        arrays = rendered_arrays[index]
         valid = arrays["valid_depth"]
         arrays["q"][valid] = per_pixel[arrays["patch_id"][valid]]
         validate_arrays(arrays, record)
@@ -280,6 +324,10 @@ def prepare_teacher(approved_manifest, output, dataset=None, long_edge=512, thre
     write_json(output / "receipt.json", {"manifest_sha256": sha256(output / "manifest.json"),
                                          "files": {str(path.relative_to(output)): sha256(path) for path in output.rglob("*.npz")}})
     write_json(output / "state.json", {"status": "complete", "manifest_sha256": sha256(output / "manifest.json")})
+    if prepared_arrays is not None:
+        prepared_arrays.update({index: {"arrays": arrays, "arrays_sha256": records[index]["arrays_sha256"],
+                                        "content_sha256": _arrays_fingerprint(arrays)}
+                               for index, arrays in enumerate(rendered_arrays)})
     log("teacher_complete", output=str(output), views=len(records), normalizers=normalization)
     return output / "manifest.json"
 
@@ -310,7 +358,10 @@ class ShuffledViewSampler:
 
 
 class VirtualGeometryDataset:
-    def __init__(self, manifest_path, device="cuda", gpu_cache_size=2, cpu_cache_size=16, verify=True, seed=0):
+    def __init__(self, manifest_path, device="cuda", gpu_cache_size=2, cpu_cache_size=16, verify=True, seed=0,
+                 *, preloaded_arrays=None):
+        if preloaded_arrays is not None and (not verify or not isinstance(preloaded_arrays, dict)):
+            raise ValueError("Preloaded teacher arrays require normal on-disk verification and a dictionary")
         self.path = Path(manifest_path).resolve()
         self.root = self.path.parent
         self.manifest = json.loads(self.path.read_text())
@@ -356,6 +407,23 @@ class VirtualGeometryDataset:
             validate_camera(record)
             if verify and sha256(self.root / record["arrays_path"]) != record["arrays_sha256"]:
                 raise ValueError(f"Teacher view cache changed: {record['id']}")
+        if preloaded_arrays is not None:
+            for index, bundle in preloaded_arrays.items():
+                if not isinstance(index, int) or not 0 <= index < len(self.cameras):
+                    raise ValueError("Preloaded teacher view index is outside this pool")
+                if not isinstance(bundle, dict) or set(bundle) != {"arrays", "arrays_sha256", "content_sha256"}:
+                    raise ValueError("Invalid preloaded teacher array bundle")
+                record, arrays = self.cameras[index], bundle["arrays"]
+                if bundle["arrays_sha256"] != record["arrays_sha256"]:
+                    raise ValueError("Preloaded teacher arrays belong to another cache")
+                if not isinstance(arrays, dict):
+                    raise ValueError("Preloaded teacher arrays must be a dictionary")
+                validate_arrays(arrays, record)
+                if _arrays_fingerprint(arrays) != bundle["content_sha256"]:
+                    raise ValueError("Preloaded teacher arrays changed after preparation")
+                self._cpu[index] = arrays
+                while len(self._cpu) > self.cpu_cache_size:
+                    self._cpu.popitem(last=False)
         self._virtual_camera_class = None
 
     def __len__(self):

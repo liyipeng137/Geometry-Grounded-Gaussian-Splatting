@@ -5,3 +5,5 @@ opencv-python-headless
 plyfile
 tqdm
 scipy
+
+PyYAML

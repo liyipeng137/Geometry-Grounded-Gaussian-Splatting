@@ -136,6 +136,9 @@ def photometric_rgb_loss(image, gt_image, gaussians, view_idx, lambda_dssim):
 
 
 class PatchMatch:
+    # Neighbors provide RGB for NCC/debug only; geometry is sampled from Gaussians.
+    neighbor_payload_fields = ("original_image",)
+
     def __init__(self, patch_size, pixel_noise_th, kernel_size, pipe, debug=True, model_path=None):
         self.patch_size = patch_size
         self.total_patch_size = (patch_size * 2 + 1) ** 2

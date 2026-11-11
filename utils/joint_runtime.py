@@ -1,7 +1,6 @@
 """联合流程的可恢复状态和日志；训练顺序仍显式放在 train.py。"""
 
 import json
-import math
 import random
 from pathlib import Path
 
@@ -73,26 +72,53 @@ def restore_pending_gradients(gaussians, saved):
 class JointRuntime:
     """只保存状态与记录结果，不隐藏 render/backward/optimizer/topology 顺序。"""
 
-    def __init__(self, config, teacher, topology, output, start_iteration=0):
+    def __init__(self, config, teacher, topology, output, start_iteration=0, *,
+                 detailed_virtual_log=True, log_interval=100, final_iteration=None):
         self.config, self.teacher, self.topology = config, teacher, topology
         self.output = Path(output)
         self.identity = {"config_sha256": config_identity(config), "teacher": teacher.identity}
         self.start_iteration = start_iteration
         self.segment_virtual_samples = 0
+        self.detailed_virtual_log = detailed_virtual_log
+        self.log_interval, self.final_iteration = log_interval, final_iteration
+        self._weighted_names = ()
+        self._weighted_values = None
+        self._weighted_state_dirty = False
         self.stats = {"virtual_samples": 0, "weighted_loss_sums": {}, "last_iteration": start_iteration}
         self.stream = (self.output / "virtual_loss.jsonl").open("w", buffering=1)
 
+    def should_record(self, iteration):
+        return self.detailed_virtual_log or iteration % self.log_interval == 0 or iteration == self.final_iteration
+
+    def _sync_weighted_sums(self):
+        if self._weighted_state_dirty:
+            self.stats["weighted_loss_sums"] = dict(zip(self._weighted_names, self._weighted_values.cpu().tolist()))
+            self._weighted_state_dirty = False
+
     def record(self, iteration, index, camera, losses, stage, ramp):
-        raw = {key: float(value.detach().item()) for key, value in losses.raw.items()}
-        weighted = {key: float(value.detach().item()) for key, value in losses.weighted.items()}
-        total = float(losses.total.detach().item())
-        if not all(math.isfinite(value) for value in [total, *raw.values(), *weighted.values()]):
+        raw_names, weighted_names = tuple(losses.raw), tuple(losses.weighted)
+        values = torch.stack([value.detach().reshape(()) for value in
+                              (*losses.raw.values(), *losses.weighted.values(), losses.total)]).to(torch.float64)
+        if not bool(torch.isfinite(values).all()):
             raise FloatingPointError(f"Nonfinite virtual geometry loss at iteration {iteration}")
+        if self._weighted_values is None:
+            self._weighted_names = weighted_names
+            self._weighted_values = values.new_tensor([self.stats["weighted_loss_sums"].get(key, 0.) for key in weighted_names])
+        elif weighted_names != self._weighted_names:
+            raise ValueError("Virtual loss logging fields changed during the run")
+        self._weighted_values.add_(values[len(raw_names):len(raw_names)+len(weighted_names)])
+        self._weighted_state_dirty = True
         self.stats["virtual_samples"] += 1
         self.segment_virtual_samples += 1
         self.stats["last_iteration"] = iteration
-        for key, value in weighted.items():
-            self.stats["weighted_loss_sums"][key] = self.stats["weighted_loss_sums"].get(key, 0.) + value
+        if not self.should_record(iteration):
+            return
+        host = torch.cat((values, self._weighted_values)).cpu().tolist()
+        raw = dict(zip(raw_names, host[:len(raw_names)]))
+        weighted = dict(zip(weighted_names, host[len(raw_names):len(raw_names)+len(weighted_names)]))
+        total = host[len(values)-1]
+        self.stats["weighted_loss_sums"] = dict(zip(weighted_names, host[len(values):]))
+        self._weighted_state_dirty = False
         self.stream.write(json.dumps({
             "iteration": iteration, "view_index": int(index), "camera": camera_name(camera),
             "stage": stage, "ramp": ramp, "raw": raw, "weighted": weighted,
@@ -100,10 +126,13 @@ class JointRuntime:
         }, allow_nan=False) + "\n")
 
     def summary(self):
+        self._sync_weighted_sums()
         return {
             "identity": self.identity, "start_iteration": self.start_iteration,
             "virtual_camera_count": len(self.teacher),
             "segment_virtual_samples": self.segment_virtual_samples,
+            "virtual_log_mode": "detailed" if self.detailed_virtual_log else "interval",
+            "virtual_log_interval": 1 if self.detailed_virtual_log else self.log_interval,
             **self.stats,
             "mean_weighted_losses": {key: value / max(self.stats["virtual_samples"], 1)
                                      for key, value in self.stats["weighted_loss_sums"].items()},
@@ -114,6 +143,7 @@ class JointRuntime:
         write_json(self.output / "virtual_geometry_stats.json", self.summary())
 
     def capture(self, gaussians, real_stack):
+        self._sync_weighted_sums()
         return {
             "schema_version": 1, "identity": self.identity,
             "teacher": self.teacher.state_dict(), "topology": self.topology.state_dict(),
@@ -134,6 +164,9 @@ class JointRuntime:
         self.teacher.load_state_dict(saved["teacher"])
         self.topology.load_state_dict(saved["topology"])
         self.stats = saved["stats"]
+        self._weighted_values = None
+        self._weighted_names = ()
+        self._weighted_state_dirty = False
         for field in ("filter_3D", "xyz_gradient_accum_abs"):
             target = getattr(gaussians, field)
             value = saved[field]
