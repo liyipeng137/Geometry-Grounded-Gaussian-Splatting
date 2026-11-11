@@ -1,5 +1,8 @@
 # GenRecon 全局点云初始化实验
 
+本页保留固定245数据集和历史teacher的实验复现命令；新数据集使用
+[A准备、B训练入口](dataset_pipeline.md)。
+
 正式训练现可直接传 `--init_mesh`，由 `train.py` 自动完成采样与训练照片着色，
 无需先单独运行准备脚本：
 

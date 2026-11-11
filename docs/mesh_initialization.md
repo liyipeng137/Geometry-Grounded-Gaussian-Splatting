@@ -45,20 +45,22 @@ python train.py -s /workspace/dataset/245_for_train \
 python train.py -s /workspace/dataset/245_for_train \
   -m /workspace/outputs/gggs_mesh_NEW \
   --init_mesh /workspace/dataset/245_for_train/genrecon_mesh.ply \
+  --disable_virtual_geometry \
   --frame_gpu_budget 4 --iterations 20000 --training_seed 0
 ```
 
 ### Mesh 初值，加上已准备的虚拟 D/N
 
 ```bash
-OMP_NUM_THREADS=8 OPENBLAS_NUM_THREADS=1 bash scripts/run_245_virtual_geometry.sh \
-  /workspace/outputs/gggs_mesh_virtual_NEW \
+OMP_NUM_THREADS=8 OPENBLAS_NUM_THREADS=1 bash scripts/run_dataset.sh \
+  /workspace/dataset/245_for_train -m /workspace/outputs/gggs_mesh_virtual_NEW \
   --init_mesh /workspace/dataset/245_for_train/genrecon_mesh.ply
 ```
 
-该脚本显式传入 `--virtual_geometry_config configs/virtual_geometry_245.json`，
-使用已有的160视角 teacher。**初始化来源与虚拟监督独立选择：** 单独传
-`--init_mesh` 不会开启虚拟 D/N，也不会重新生成或覆盖 teacher。
+此例假设已完成A，数据集默认目录中有完整虚拟几何产物，B会自动读取它。
+**初始化来源与虚拟监督独立选择：** `--init_mesh`
+只控制初值，不重新生成或覆盖teacher；通用入口是否使用虚拟D/N取决于默认缓存发现、
+显式配置或 `--disable_virtual_geometry`，见[A/B入口说明](dataset_pipeline.md)。
 
 切换训练划分时，虚拟 teacher 也必须与实际训练相机集合一致；现有全245帧
 teacher 不能直接用于加了 `--eval` 或排除列表的训练。相关流程见
@@ -79,14 +81,15 @@ python train.py -s /workspace/dataset/245_for_train \
 ### 从 checkpoint 续训
 
 ```bash
-bash scripts/run_245_virtual_geometry.sh \
-  /workspace/outputs/gggs_mesh_virtual_resume_NEW \
+bash scripts/run_dataset.sh /workspace/dataset/245_for_train \
+  -m /workspace/outputs/gggs_mesh_virtual_resume_NEW \
   --start_checkpoint /workspace/outputs/gggs_mesh_virtual_NEW/chkpnt7000.pth
 ```
 
 续训沿用 checkpoint 记录的初值，不必再次提供 `--init_mesh`。程序从旧 run 的
 `input.ply` 或原初始化缓存中定位同一份点云并校验 SHA，不重新采样、着色或切回
 默认 TSDF。原 mesh 可以不再存在，但同内容的初始化点云缓存必须仍可读取。
+若该mesh同时是虚拟teacher的来源，联合训练仍须满足teacher自己的来源校验。
 
 显式提供 `--init_ply` 时，其内容 SHA 必须与 checkpoint 一致；显式提供
 `--init_mesh` 时，须对应 checkpoint 记录的 mesh 来源路径。续训始终使用已冻结的

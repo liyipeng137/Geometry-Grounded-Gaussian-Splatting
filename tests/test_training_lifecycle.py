@@ -226,6 +226,7 @@ def make_harness(start=0, stop=3, multiview=False, failure_at=None):
         "prepare_output": lambda *args: None,
         "restore_checkpoint": lambda *args: None,
         "record_initialization": lambda *args: None,
+        "resolve_virtual_geometry_config": lambda dataset, explicit_config=None, disabled=False: explicit_config,
         "GaussianModel": Model, "Scene": Scene, "FramePayloadCache": Cache,
         "PatchMatch": patchmatch_factory, "TrainingLogger": Logger, "tqdm": Progress,
         "randint": lambda lower, upper: 0, "sample": lambda candidates, count: candidates[:count],
@@ -254,7 +255,7 @@ def make_harness(start=0, stop=3, multiview=False, failure_at=None):
     )
     dataset = SimpleNamespace(
         sh_degree=3, sg_degree=0, frame_gpu_budget=1, white_background=False,
-        disable_filter3D=True, kernel_size=0.0, model_path="unused-output",
+        disable_filter3D=True, kernel_size=0.0, model_path="unused-output", source_path="unused-dataset",
     )
     return SimpleNamespace(
         run=lambda: namespace["training"](dataset, opt, SimpleNamespace(debug=False), args),

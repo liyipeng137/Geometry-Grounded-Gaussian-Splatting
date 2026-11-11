@@ -1,6 +1,7 @@
 # GGGS 真实相机基线训练
 
-本文描述未指定 `--virtual_geometry_config` 的真实基线路径。
+本文描述显式 `--disable_virtual_geometry`，或未指定配置且数据集默认虚拟缓存目录
+不存在时的纯真实基线路径。数据集自动发现规则见[按数据集运行](dataset_pipeline.md)。
 同一 `train.py` 中的 GenRecon 联合模式另见 [虚拟几何训练说明](virtual_geometry_training.md)。
 
 这次整理以 `dev/gggs-fast-scene` 的 `0c9a4ac` 为起点，只保留真实相机训练。
@@ -120,7 +121,7 @@ mesh，以共享边定义三角面连通分量，按面数降序只保留最大�
 
 ```bash
 cd /workspace/Geometry-Grounded-Gaussian-Splatting
-bash scripts/run_245_baseline.sh /workspace/outputs/gggs_245_base
+bash scripts/run_245_baseline.sh /workspace/outputs/gggs_245_base --disable_virtual_geometry
 ```
 
 脚本使用 `/usr/local/miniconda3/envs/py312/bin/python`、全部 245 个真实相机、

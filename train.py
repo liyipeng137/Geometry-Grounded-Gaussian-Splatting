@@ -16,7 +16,9 @@ utils/training_io.py。这里保留训练阶段的先后关系，不隐藏在 Tr
 --init_ply 复用已准备的点云。两者互斥，均不改变 filter/拓扑策略。指定 --virtual_geometry_config
 后额外加入已审核机位的固定D/N；没有虚拟RGB、appearance ID或PatchMatch邻居。
 真实监督保留，几何增密/补点在optimizer安全边界后统一提交。
-详见 docs/virtual_geometry_training.md；省略配置时保持原真实基线生命周期。
+未显式指定配置时，自动使用 dataset/virtual_geometry 中由离线 A 管道完成的产物；
+没有产物或显式 --disable_virtual_geometry 时走原真实基线。训练不会生成虚拟机位。
+详见 docs/dataset_pipeline.md 和 docs/virtual_geometry_training.md。
 """
 
 import math
@@ -33,6 +35,7 @@ from scene import GaussianModel, Scene
 from scene.cameras import FramePayloadCache
 from utils.general_utils import safe_state
 from utils.initialization import validate_initialization_options, resolve_checkpoint_initialization
+from utils.dataset_virtual_geometry import resolve_virtual_geometry_config
 from utils.loss_utils import PatchMatch
 from utils.training_io import (
     TrainingLogger,
@@ -237,6 +240,19 @@ def training(dataset, opt, pipe, args):
     validate_initialization_options(dataset)
     if getattr(dataset, "init_mesh", "") and not Path(dataset.source_path, "sparse").is_dir():
         raise ValueError("--init_mesh requires a COLMAP dataset")
+
+    # A is an explicit offline step. This only selects its completed config;
+    # no artifacts means the existing real-only pipeline, partial artifacts fail.
+    explicit_virtual_config = getattr(args, "virtual_geometry_config", None)
+    args.virtual_geometry_config = resolve_virtual_geometry_config(
+        dataset.source_path, explicit_virtual_config,
+        disabled=getattr(args, "disable_virtual_geometry", False),
+    )
+    if args.virtual_geometry_config:
+        origin = "explicit" if explicit_virtual_config else "dataset"
+        print(f"Virtual geometry ({origin}): {args.virtual_geometry_config}")
+    else:
+        print("Virtual geometry: disabled; using real-camera training")
 
     joint_config = teacher = joint = None
     if getattr(args, "virtual_geometry_config", None):
@@ -549,7 +565,11 @@ def main():
     parser.add_argument("--start_checkpoint", type=str, default=None)
     parser.add_argument(
         "--virtual_geometry_config", type=str, default=None,
-        help="正式虚拟D/N联合流程JSON；省略时保持真实基线，需先准备固定teacher缓存",
+        help="显式虚拟D/N配置，优先于dataset/virtual_geometry自动发现；需先准备固定teacher缓存",
+    )
+    parser.add_argument(
+        "--disable_virtual_geometry", action="store_true",
+        help="即使dataset含虚拟视角产物也只训练真实相机；不能与显式虚拟配置同时使用",
     )
     parser.add_argument("--training_seed", type=int, default=0)
     parser.add_argument(

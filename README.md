@@ -1,17 +1,18 @@
 # Geometry-Grounded Gaussian Splatting
 
 当前真实相机基线入口及逐阶段说明见 [训练管道说明](docs/training_baseline.md)。
-`train.py` 不使用旧伪视角/R2C 临时分支；UKD-4090 的 245 帧基线启动脚本为
-`scripts/run_245_baseline.sh`。normal prior 和 NCC 默认采用 `train_demo.py` 的动态权重；所有训练帧必须同时提供 normal/depth prior。
+`train.py` 不使用旧伪视角/R2C 临时分支；通用纯真实入口为
+`bash scripts/run_dataset.sh DATASET --disable_virtual_geometry`。normal prior 和 NCC 默认采用 `train_demo.py` 的动态权重；所有训练帧必须同时提供 normal/depth prior。
 
 外观模式 4 已接入用户 fork 的 PPISP；安装、配对保存及与模式 3 的对照口径见
 [PPISP 模式说明](docs/ppisp_mode4.md)。默认模式仍为 3。
 
-固定 GenRecon mesh 的虚拟 D/N 已作为正式联合模式接入同一个 `train.py`。
-运行 `scripts/run_245_virtual_geometry.sh NEW_OUTPUT`，或指定
-`--virtual_geometry_config configs/virtual_geometry_245.json`。数据缓存、联合loss、
-几何增密/补点、日程和续训契约见 [虚拟几何训练说明](docs/virtual_geometry_training.md)。
-省略该配置时保留真实基线；已审核机位不重新选择，也不需要生成贴图。
+固定 GenRecon mesh 的虚拟 D/N 已接入同一个 `train.py`。手动运行
+`python scripts/prepare_virtual_geometry.py --dataset DATASET` 准备机位、预览和D/N，
+再运行 `bash scripts/run_dataset.sh DATASET`：默认目录有完整缓存时自动联合训练，
+目录不存在时走纯真实基线。A/B分工、显式覆盖及输出控制见
+[按数据集运行](docs/dataset_pipeline.md)；联合loss和拓扑见
+[虚拟几何训练说明](docs/virtual_geometry_training.md)。旧245脚本保留用于历史复现。
 
 初始化默认使用 RGBD/TSDF。指定 `--init_mesh PATH` 可在训练内自动准备20万表面点及
 训练照片颜色；`--init_ply PATH` 可复用已有点云。缓存、续训和渲染行为见

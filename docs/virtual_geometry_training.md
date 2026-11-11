@@ -2,7 +2,10 @@
 
 本流程直接接入 `train.py`。每一步仍训练一张真实照片，按阶段额外加入一张虚拟
 depth/normal。真实 RGB、原 D/N、NCC/geo、自一致性及默认 appearance=3 保留。
-虚拟机位使用已审核的160个 pose，不增加生成纹理或虚拟 RGB。
+虚拟机位使用预先准备的固定pool，不增加生成纹理或虚拟 RGB。
+
+新数据集的默认使用方式见[A 准备、B 训练](dataset_pipeline.md)。本页以下245数据集
+命令固定复用历史160机位teacher，用于复现已经完成的实验。
 
 实现与短训证据见 [2026-11-10验证记录](virtual_geometry_validation_20261110.md)。
 
@@ -20,7 +23,8 @@ bash scripts/run_245_virtual_geometry.sh /workspace/outputs/gggs_245_virtual_joi
 ```
 
 输出目录必须是新的。等价入口是 `python train.py ... --virtual_geometry_config
-configs/virtual_geometry_245.json`。不传这项时仍运行既有真实baseline。初始化默认使用
+configs/virtual_geometry_245.json`。通用入口省略配置时会检查数据集默认缓存；可用
+`--disable_virtual_geometry` 明确选择纯真实训练。初始化默认使用
 train-only RGBD/TSDF；也可独立指定 `--init_mesh` 或 `--init_ply`，见
 [初始化入口](mesh_initialization.md)。切换初值不改变真实训练划分或重建虚拟teacher。
 联合模式依赖受控的3D filter，不接受`--disable_filter3D`，避免该标志被周期刷新静默覆盖。
