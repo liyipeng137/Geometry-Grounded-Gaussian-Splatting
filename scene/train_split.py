@@ -89,16 +89,18 @@ def _validate_calibration_proof(record):
 def validate_initialization_proof(record):
     _validate_calibration_proof(record)
     initialization = record.get("initialization", {})
-    if initialization.get("kind") != "train_only_rgbd" or initialization.get("algorithm") != RGBD_INITIALIZATION_ALGORITHM:
-        raise ValueError("Checkpoint initialization must use current-split float32 RGBD v3")
+    allowed = {"train_only_rgbd": RGBD_INITIALIZATION_ALGORITHM,
+               "external_ply": "external_colored_ply_v1"}
+    if initialization.get("kind") not in allowed or initialization.get("algorithm") != allowed[initialization["kind"]]:
+        raise ValueError("Checkpoint initialization must use current-split float32 RGBD v3 or explicit colored PLY")
     path = initialization.get("ply_path")
     if not isinstance(path, str) or not Path(path).is_absolute():
         raise ValueError("Checkpoint initialization must preserve its absolute PLY source")
     if not _is_sha256(initialization.get("ply_sha256")) or not _is_sha256(initialization.get("cache_fingerprint")):
-        raise ValueError("Checkpoint initialization lacks hashed RGBD/cache provenance")
+        raise ValueError("Checkpoint initialization lacks hashed point-cloud/cache provenance")
     count = initialization.get("point_count")
     if isinstance(count, bool) or not isinstance(count, int) or count < 1:
-        raise ValueError("Checkpoint RGBD initialization must contain a positive point count")
+        raise ValueError("Checkpoint initialization must contain a positive point count")
 
 
 def checkpoint_training_state(model_params, iteration):
@@ -134,8 +136,12 @@ def validate_checkpoint_split(checkpoint_path, model_path, previous_record=None)
             raise ValueError(f"Checkpoint dataset/calibration/split changed: {field}")
     if Path(previous["dataset_root"]).resolve() != Path(current["dataset_root"]).resolve():
         raise ValueError("Checkpoint resume requires the same normalized dataset root")
-    if previous["initialization"]["cache_fingerprint"] != current["initialization"]["cache_fingerprint"]:
-        raise ValueError("Checkpoint RGBD initialization operator or training inputs changed")
+    fields = ("kind", "algorithm", "cache_fingerprint")
+    if previous["initialization"]["kind"] == "external_ply":
+        fields += ("ply_sha256", "point_count")
+    for field in fields:
+        if previous["initialization"][field] != current["initialization"][field]:
+            raise ValueError("Checkpoint initialization operator or training inputs changed")
     current["scene_placeholder_initialization"] = current["initialization"]
     current["initialization"] = previous["initialization"]
     current["checkpoint_restoration"] = {
@@ -154,6 +160,6 @@ def validate_checkpoint_split(checkpoint_path, model_path, previous_record=None)
     finally:
         if temporary is not None:
             temporary.unlink(missing_ok=True)
-    return {"expanded": False, "initialization_preserved": True, "initialization_kind": "train_only_rgbd",
+    return {"expanded": False, "initialization_preserved": True, "initialization_kind": previous["initialization"]["kind"],
             "previous_train_count": len(previous["train_image_names"]), "current_train_count": len(current["train_image_names"]),
             "remaining_heldout_image_names": current["test_image_names"]}

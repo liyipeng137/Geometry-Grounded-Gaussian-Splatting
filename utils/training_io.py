@@ -59,10 +59,10 @@ def require_baseline_checkpoint(state, iteration):
         )
     if (
         state.get("camera_split", {}).get("initialization", {}).get("kind")
-        != "train_only_rgbd"
+        not in ("train_only_rgbd", "external_ply")
     ):
         raise ValueError(
-            "Baseline checkpoints require train-only RGBD initialization provenance"
+            "Baseline checkpoints require RGBD or explicit colored-PLY initialization provenance"
         )
     return state
 

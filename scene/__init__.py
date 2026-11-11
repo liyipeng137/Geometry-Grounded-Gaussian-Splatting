@@ -62,6 +62,7 @@ class Scene:
                 init_cache_dir=self.model_path,
                 # RGBD 初始化与训练监督共用深度来源，避免各自读取不同目录。
                 depth_prior_dir=getattr(args, "depth_prior_dir", "depth"),
+                init_ply=getattr(args, "init_ply", ""),
             )
         elif os.path.exists(os.path.join(args.source_path, "transforms.json")):
             print("Found transforms_train.json file, assuming Blender data set!")

@@ -83,11 +83,13 @@ class ModelParams(ParamGroup):
         self.depth_confidence_dir = "confidence"
         self.depth_confidence_format = "png"
         self.train_exclude_images = ""
+        self.init_ply = ""  # Optional XYZ/RGB initialization; training/filter policy is unchanged.
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args):
         g = super().extract(args)
         g.source_path = os.path.abspath(g.source_path)
+        g.init_ply = os.path.abspath(os.path.expanduser(g.init_ply)) if getattr(g, "init_ply", "") else ""
         g.max_image_width = getattr(g, "max_image_width", 0) or 0
         if g.max_image_width < 0:
             raise ValueError("max_image_width must be nonnegative")
