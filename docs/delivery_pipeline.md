@@ -1,9 +1,9 @@
-# GGGS 交付入口
+# 历史 GGGS 虚拟联合交付入口
 
 在仓库根目录、已激活的 GGGS 训练环境中运行：
 
 ```bash
-python pipeline.py --dataset /workspace/dataset/245_for_train
+python pipeline_virtual.py --dataset /workspace/dataset/245_for_train
 ```
 
 入口依次检查输入、准备或复用虚拟机位与固定 D/N teacher、准备初始化点云，再调用现有
@@ -14,7 +14,7 @@ mesh、相机和 priors 必须已经处于同一 COLMAP 坐标系与尺度。
 
 | 项目 | 默认值 |
 |---|---|
-| 初始化 | Gen mesh 全表面面积采样，200,000 点 |
+| 初始化 | TSDF 融合，默认采样上限 250,000 点 |
 | 虚拟机位 | 最多 160 个，候选上限 1,200 |
 | 轨迹平移比例 | `trajectory_offset_fraction: 0.16` |
 | 表面证据采样 | 120,000 点，与初始化点云独立采样 |
@@ -67,7 +67,7 @@ inputs:
 ```
 
 ```bash
-python pipeline.py --dataset /workspace/dataset/scene \
+python pipeline_virtual.py --dataset /workspace/dataset/scene \
   --config /workspace/configs/scene_inputs.yaml
 ```
 
@@ -80,7 +80,7 @@ teacher 的深度采用 camera-Z，法线采用朝向相机的相机空间实际
 颜色来自实际训练照片：按候选顺序做 mesh first-hit 遮挡检查，取第一个可见真实 RGB；
 所有候选都不可见的点使用中性 `128`。不使用 Gen 贴图，不新增法线/opacity/filter 初始化配方。
 
-切换 TSDF 并调整点数，例如保存为 `/workspace/configs/tsdf_init.yaml`：
+调整 TSDF 初始点数，例如保存为 `/workspace/configs/tsdf_init.yaml`：
 
 ```yaml
 initialization:
@@ -89,7 +89,7 @@ initialization:
 ```
 
 ```bash
-python pipeline.py --dataset /workspace/dataset/scene \
+python pipeline_virtual.py --dataset /workspace/dataset/scene \
   --config /workspace/configs/tsdf_init.yaml
 ```
 
@@ -128,7 +128,7 @@ DATASET/gggs/
 `--output` 只指定本次 run 的新目录；缓存仍在 `DATASET/gggs/cache`：
 
 ```bash
-python pipeline.py --dataset /workspace/dataset/scene \
+python pipeline_virtual.py --dataset /workspace/dataset/scene \
   --output /workspace/outputs/scene_delivery_01
 ```
 
@@ -190,7 +190,7 @@ outputs:
 例如任务中断时最新保留的是 `chkpnt10000.pth`：
 
 ```bash
-python pipeline.py --dataset /workspace/dataset/scene \
+python pipeline_virtual.py --dataset /workspace/dataset/scene \
   --config /workspace/configs/scene_with_checkpoints.yaml \
   --resume /workspace/outputs/scene_delivery_01/chkpnt10000.pth \
   --output /workspace/outputs/scene_delivery_01_resumed

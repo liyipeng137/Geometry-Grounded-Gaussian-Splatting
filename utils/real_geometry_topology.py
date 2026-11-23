@@ -141,10 +141,8 @@ class RealGeometryTopology:
         self.cams = scene.getTrainCameras()
         self.extent = scene.cameras_extent
         self.rng = np.random.default_rng(seed)
-        self.pairs = []
         self.remaining = []
-        self.previous = None
-        self.calendar = None
+        self.calendar = {}
         dev = model.get_xyz.device
         self.meta = {
             "birth": torch.zeros(len(model.get_xyz), dtype=torch.long, device=dev),
@@ -359,26 +357,6 @@ class RealGeometryTopology:
 
     @torch.no_grad()
     def step(self, iteration):
-        if self.calendar is not None:
-            return self._scheduled_step(iteration)
-        cfg = self.cfg
-        if iteration < cfg.first or (iteration - cfg.first) % cfg.interval:
-            return
-        if self.previous is None:
-            self.pairs = self.choose_pairs()
-        rank, split, prune, free, seeds = self._measure(iteration, self.pairs)
-        if self.previous is None:
-            self.previous = (split, prune, seeds)
-            return
-        old_split, old_prune, old_seeds = self.previous
-        self.previous = None
-        self._commit(
-            iteration,
-            (rank, split & old_split, [v for k, v in seeds.items() if k in old_seeds]),
-            (prune & old_prune, free, self.pairs),
-        )
-
-    def _scheduled_step(self, iteration):
         actions = self.calendar.get(iteration)
         if not actions:
             return
@@ -525,9 +503,8 @@ class RealGeometryTopology:
             ),
         }
         # Pending first-audit flags follow surviving rows; newborns have no previous evidence.
-        if self.calendar is not None:
-            for key in ("growth_first", "prune_first"):
-                extra_meta[key] = self.meta[key].new_zeros(len(combined["xyz"]))
+        for key in ("growth_first", "prune_first"):
+            extra_meta[key] = self.meta[key].new_zeros(len(combined["xyz"]))
         self.meta = apply_gaussian_transaction(
             model,
             torch.where(~drop)[0],

@@ -1,15 +1,19 @@
 # Geometry-Grounded Gaussian Splatting
 
-交付入口在一次运行中完成缓存准备、初始化与联合训练：
+当前场景 mesh 的默认入口使用真实照片、COLMAP 和对齐的深度。
 
 ```bash
-python pipeline.py --dataset /workspace/dataset/245_for_train
+python pipeline.py --dataset /workspace/dataset/scene
 ```
 
-默认使用 Gen mesh 20万点初始化、16%轨迹偏移、最多160个虚拟机位、模式3和20k训练；
-完整参数在 [config.yaml](config.yaml)。缓存与run放在 `DATASET/gggs/`，默认只保存最终原生
-模型及外观参数、配置和必要日志。TSDF切换、输入目录、输出及续训见
-[交付管道说明](docs/delivery_pipeline.md)。
+主入口自动生成或复用 `DATASET/depth_normal_prior/`，使用 TSDF 或已有初始 PLY，
+以固定的 `accelerated` 策略训练 20k，再用 `mesh_extract_mini.py` 输出最终平滑 mesh。
+运行环境、输入布局、产物及虚拟视角预留接口见 [真实视角几何管道](docs/gray_geometry_20k.md)。
+
+## 历史 RGB 与虚拟联合训练
+
+先前的交付入口保留为 `pipeline_virtual.py`，其 YAML 和续训命令见
+[虚拟联合交付说明](docs/delivery_pipeline.md)。
 
 当前真实相机基线入口及逐阶段说明见 [训练管道说明](docs/training_baseline.md)。
 `train.py` 不使用旧伪视角/R2C 临时分支；通用纯真实入口为

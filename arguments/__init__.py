@@ -52,7 +52,7 @@ class ParamGroup:
 
 
 class ModelParams(ParamGroup):
-    def __init__(self, parser, sentinel=False):
+    def __init__(self, parser, sentinel=False, *, fixed_normal_dir=None):
         self.sh_degree = 3
         self.sg_degree = 0
         self._source_path = ""
@@ -75,8 +75,9 @@ class ModelParams(ParamGroup):
         self.multi_view_max_dis = 1.5
         self.mask_dir = "masks"
         self.mask_format = "png"
-        self.normal_prior_dir = "normals"
-        self.normal_prior_format = "png"
+        if fixed_normal_dir is None:
+            self.normal_prior_dir = "normals"
+            self.normal_prior_format = "png"
         self.depth_prior_dir = "depth"
         self.depth_prior_format = "png"
         self.depth_prior_scale = 1000.0
@@ -88,6 +89,10 @@ class ModelParams(ParamGroup):
         self.init_num_points = 200000
         self.colmap_dir = "sparse/0"
         super().__init__(parser, "Loading Parameters", sentinel)
+        if fixed_normal_dir is not None:
+            # Stored in cfg_args for renderers, without adding source overrides to this CLI.
+            self.normal_prior_dir, self.normal_prior_format = fixed_normal_dir, "png"
+            parser.set_defaults(normal_prior_dir=fixed_normal_dir, normal_prior_format="png")
 
     def extract(self, args):
         g = super().extract(args)

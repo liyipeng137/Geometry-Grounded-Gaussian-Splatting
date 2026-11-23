@@ -20,6 +20,7 @@ import torch.nn.functional as F
 from PIL import Image
 
 from scene.cameras import Camera
+from utils.depth_prior_io import find_depth_file, read_native_depth
 from utils.general_utils import PILtoTorch
 from utils.graphics_utils import fov2focal
 from utils.system_utils import trim_process_memory
@@ -102,26 +103,11 @@ def _load_depth_prior(args, cam_info, resolution):
     if depth_root is None:
         return None
 
-    npy_path = os.path.join(depth_root, _prior_name(cam_info, "npy"))
-    if os.path.exists(npy_path):
-        depth_np = np.load(npy_path, allow_pickle=False).astype(np.float32, copy=False)
-        if depth_np.ndim != 2 or depth_np.shape != (cam_info.height, cam_info.width):
-            raise ValueError(f"Depth must match the original camera grid: {npy_path}")
-        depth_np = np.where(np.isfinite(depth_np) & (depth_np > 0), depth_np, 0).astype(np.float32)
-        return _resize_depth(depth_np, resolution)
-
-    depth_format = args.depth_prior_format.lower().lstrip(".")
-    if depth_format == "npy":
+    path = find_depth_file(depth_root, _prior_name(cam_info, "npy"), getattr(args, "depth_prior_format", "npy"))
+    if path is None:
         return None
-    depth_path = os.path.join(depth_root, _prior_name(cam_info, depth_format))
-    if not os.path.exists(depth_path):
-        return None
-
-    with Image.open(depth_path) as depth_img:
-        depth_np = np.asarray(depth_img).astype(np.float32)
-    if depth_np.ndim == 3:
-        depth_np = depth_np[..., 0]
-    return _resize_depth(depth_np / float(args.depth_prior_scale), resolution)
+    depth = read_native_depth(path, (cam_info.height, cam_info.width), getattr(args, "depth_prior_scale", 1000.))
+    return _resize_depth(depth, resolution)
 
 
 def _load_depth_confidence(args, cam_info, resolution):

@@ -1,4 +1,4 @@
-# Delivery defaults. Paths in inputs are relative to --dataset.
+# Historical joint delivery defaults for pipeline_virtual.py. Input paths are relative to --dataset.
 # Joint topology/reset schedule is controlled only by geometry, not legacy training aliases.
 version: 1
 seed: 0

@@ -1,5 +1,7 @@
 # Real-view geometry-only Gaussian experiment
 
+The commands below describe the historical 7k experiment at commit `d766bf7`. The current real-view pipeline is documented in [gray_geometry_20k.md](gray_geometry_20k.md).
+
 This document records the frozen-colour experiment at commit `d766bf7`.
 For the colour-free model, grayscale camera cache and 20k schedule on the
 current branch, see [grayscale geometry training](gray_geometry_20k.md).

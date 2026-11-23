@@ -19,6 +19,7 @@ from scene import Scene
 from scene.geometry_gaussians import GeometryGaussians
 from scene.cameras import FramePayloadCache
 from train import validate_training_priors
+from utils.depth_normal_prior import NORMAL_DIR, depth_normal_preparation
 from utils.general_utils import safe_state
 from utils.loss_utils import PatchMatch
 from utils.real_geometry_topology import RealGeometryTopology, TopologyConfig
@@ -27,7 +28,7 @@ from utils.training_losses import compute_training_losses, loss_schedule
 
 
 def refinement_policy(step, total_steps, base_ncc=0.1):
-    """Preserve the previous 7k window; allocate the last quarter to fixed-point refinement."""
+    """Return the NCC weight, learning-rate multiplier and pruning audit eligibility."""
     if total_steps <= 7000:
         topo = step <= total_steps - min(400, total_steps // 10)
         return base_ncc, 1.0, topo
@@ -42,12 +43,12 @@ def refinement_policy(step, total_steps, base_ncc=0.1):
 
 
 def cadence_windows(total_steps, cfg):
-    """Growth has its own paired audits; pruning keeps the exact reference clock."""
+    """Pair the growth and pruning audits for the accelerated real-view recipe."""
 
     def pairs(steps):
         return list(zip(steps[::2], steps[1::2]))
 
-    reference = [
+    prune_audits = [
         s
         for s in range(cfg.first, total_steps + 1, cfg.interval)
         if refinement_policy(s, total_steps)[2]
@@ -63,13 +64,13 @@ def cadence_windows(total_steps, cfg):
         (max(cfg.first, late), stop, cfg.interval),
     ):
         growth.extend(pairs(range(start, end + 1, interval)))
-    return growth, pairs(reference)
+    return growth, pairs(prune_audits)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     model_args, optim_args, pipe_args = (
-        ModelParams(parser),
+        ModelParams(parser, fixed_normal_dir=NORMAL_DIR),
         OptimizationParams(parser),
         PipelineParams(parser),
     )
@@ -77,6 +78,7 @@ def main():
         use_decoupled_appearance=0,
         sh_degree=0,
         iterations=20000,
+        init_num_points=250000,
         frame_gpu_budget=4,
         depth_prior_from_iter=1,
         regularization_from_iter=401,
@@ -89,9 +91,9 @@ def main():
     parser.add_argument("--audit_views", type=int, default=12)
     parser.add_argument(
         "--densification_schedule",
-        choices=("reference", "accelerated"),
-        default="reference",
-        help="Change only split/seed timing; pruning follows the reference paired audit schedule.",
+        choices=("accelerated",),
+        default="accelerated",
+        help=argparse.SUPPRESS,  # Accept the existing accelerated invocation.
     )
     parser.add_argument("--coverage_weight", type=float, default=0.05)
     args = parser.parse_args()
@@ -102,7 +104,7 @@ def main():
     )
     if (
         not args.model_path
-        or not args.init_ply
+        or args.init_mesh
         or not args.source_path
         or args.iterations < 1
         or args.use_decoupled_appearance != 0
@@ -116,7 +118,7 @@ def main():
         or min(args.audit_from, args.audit_interval, args.audit_views) < 1
     ):
         parser.error(
-            "Use a new -m, -s, --init_ply, positive iteration/audit settings, real filtered Gaussians, appearance 0, SG 0 and a frame cache >=2."
+            "Use a new -m, -s, TSDF or --init_ply, positive iteration/audit settings, real filtered Gaussians, appearance 0, SG 0 and a frame cache >=2."
         )
     dataset.gray_observations = True
     out = Path(dataset.model_path)
@@ -125,21 +127,7 @@ def main():
     cfg = TopologyConfig(
         interval=args.audit_interval, first=args.audit_from, views=args.audit_views
     )
-    accelerated = args.densification_schedule == "accelerated"
-    growth_windows, prune_windows = [], []
-    schedule_details = {}
-    topology_end = (
-        max(7000, round(0.75 * opt.iterations))
-        if opt.iterations > 7000
-        else opt.iterations - min(400, opt.iterations // 10)
-    )
-    if accelerated:
-        growth_windows, prune_windows = cadence_windows(opt.iterations, cfg)
-        schedule_details = {
-            "growth_audit_pairs": growth_windows,
-            "prune_audit_pairs": prune_windows,
-        }
-        topology_end = growth_windows[-1][1] if growth_windows else 0
+    growth_windows, prune_windows = cadence_windows(opt.iterations, cfg)
     write_json(
         out / "geometry_config.json",
         {
@@ -157,13 +145,19 @@ def main():
             "opacity_resets": [],
             "ncc_from": opt.regularization_from_iter,
             "ncc_weight": opt.lambda_multi_view_ncc,
-            "topology_until": topology_end,
-            **schedule_details,
+            "topology_until": growth_windows[-1][1] if growth_windows else 0,
+            "growth_audit_pairs": growth_windows,
+            "prune_audit_pairs": prune_windows,
         },
     )
     safe_state(False, seed=args.training_seed)
     model = GeometryGaussians()
-    scene = Scene(dataset, model, initialization_seed=args.training_seed)
+    with depth_normal_preparation(dataset) as prepare_priors:
+        scene = Scene(
+            dataset, model, initialization_seed=args.training_seed,
+            prepare_camera_priors=prepare_priors,
+        )
+    write_json(out / "depth_normal_prior.json", scene.prior_preparation)
     cameras = scene.getTrainCameras()
     validate_training_priors(cameras)
     model.training_setup(opt)
@@ -182,8 +176,7 @@ def main():
     topo = RealGeometryTopology(
         model, scene, pipe, bg, dataset.kernel_size, cache, args.training_seed, cfg
     )
-    if accelerated:
-        topo.configure_cadence(growth_windows, prune_windows)
+    topo.configure_cadence(growth_windows, prune_windows)
     pm = PatchMatch(
         opt.multi_view_patch_size,
         opt.multi_view_pixel_noise_th,
@@ -205,7 +198,7 @@ def main():
                 rng.shuffle(stack)
             cam = cache.ensure(stack.pop())
             visits[cam.image_name] += 1
-            ncc_weight, lr_multiplier, topology_active = refinement_policy(
+            ncc_weight, lr_multiplier, _ = refinement_policy(
                 it, opt.iterations, opt.lambda_multi_view_ncc
             )
             model.set_rates(it, lr_multiplier)
@@ -290,8 +283,7 @@ def main():
             model.optimizer.step()
             model.optimizer.zero_grad(set_to_none=True)
             del buf, terms, coverage, total
-            if accelerated or topology_active:
-                topo.step(it)
+            topo.step(it)
             if it % 400 == 0 and (not topo.events or topo.events[-1]["step"] != it):
                 model.compute_3D_filter(cameras=cameras)
             if it in checkpoints:

@@ -56,7 +56,7 @@ def test_cadence_draws_and_pending_prune_survive_a_growth_commit():
 
     t._commit = commit
     for i in range(1, 5):
-        t._scheduled_step(i)
+        t.step(i)
     assert [c[0] for c in commits] == [2, 4]
     assert commits[0][2] is None and commits[1][2][0].tolist() == [True, True, False]
     assert commits[1][2][2] == t.panels[0]
