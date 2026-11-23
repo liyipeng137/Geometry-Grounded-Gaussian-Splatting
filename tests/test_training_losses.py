@@ -293,5 +293,19 @@ class TrainingLossTests(unittest.TestCase):
         self.assertAlmostEqual(result.total.item(), 1.3, places=6)
 
 
+def test_geometry_only_routes_depth_gradient_without_photometric_supervision():
+    depth = torch.full((1, 2, 2), 1.25, requires_grad=True)
+    img = torch.ones(3, 2, 2, requires_grad=True)
+    cam = camera(depth_prior=torch.ones_like(depth))
+    opt = options(depth_prior_from_iter=1, depth_prior_ramp_iters=0)
+    with patch.object(losses, "_photometric_rgb_loss", side_effect=AssertionError("RGB was used")):
+        result = losses.compute_training_losses(
+            {"render": img, "median_depth": depth}, cam, None, opt,
+            losses.loss_schedule(cam, opt, 1), supervise_rgb=False)
+    result.total.backward()
+    assert img.grad is None and result.rgb.item() == 0
+    torch.testing.assert_close(depth.grad, torch.full_like(depth, opt.lambda_depth_prior / depth.numel()))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -92,7 +92,7 @@ def apply_gaussian_transaction(model, keep, additions, addition_filter, metadata
             extra = additions[name].to(device=old.device, dtype=old.dtype)
             if extra.shape != (added, *old.shape[1:]) or not torch.isfinite(extra).all():
                 raise ValueError(f"Invalid new Gaussian parameter: {name}")
-            new = torch.nn.Parameter(torch.cat((old[keep], extra), 0))
+            new = torch.nn.Parameter(torch.cat((old[keep], extra), 0), requires_grad=old.requires_grad)
             previous = optimizer.state.get(old)
             state = None
             if previous is not None:

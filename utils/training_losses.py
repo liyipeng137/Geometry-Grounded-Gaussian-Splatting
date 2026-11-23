@@ -198,6 +198,8 @@ def compute_training_losses(
     patchmatch=None,
     nearest_camera=None,
     iteration=0,
+    *,
+    supervise_rgb=True,
 ):
     """计算一个真实视角的损失；不执行 backward、更新参数或改变几何拓扑。
 
@@ -207,10 +209,12 @@ def compute_training_losses(
     image = render_pkg["render"]
     zero = image.new_zeros(())
     # 保留输入 dtype（可能为 uint8）；fused photometric loss 负责其解释。
-    target_image = camera.original_image.to(device=image.device)
-    rgb, l1 = _photometric_rgb_loss(
-        image, target_image, gaussians, camera.uid, opt.lambda_dssim
-    )
+    rgb = l1 = zero
+    if supervise_rgb:
+        target_image = camera.original_image.to(device=image.device)
+        rgb, l1 = _photometric_rgb_loss(
+            image, target_image, gaussians, camera.uid, opt.lambda_dssim
+        )
     terms = LossTerms(zero, rgb, l1, zero, zero, zero, zero, zero, zero, zero)
     if getattr(gaussians, "ppisp", None) is not None:
         # 官方正则包含其自身权重，防止场景颜色与 ISP 参数任意相互补偿。

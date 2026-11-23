@@ -192,6 +192,16 @@ def test_atomic_survivor_mapping_preserves_adam_and_camera_appearance(api, model
     assert old not in model.optimizer.state
 
 
+def test_topology_replacement_keeps_color_parameters_frozen(api, model):
+    torch = api.torch
+    model._features_dc.requires_grad_(False)
+    model._features_rest.requires_grad_(False)
+    api.apply_gaussian_transaction(model, torch.tensor([0, 2]), payload(api, model, 1),
+                                   torch.tensor([[.03]]), {}, {}, 3)
+    assert model._xyz.requires_grad
+    assert not model._features_dc.requires_grad and not model._features_rest.requires_grad
+
+
 def test_empty_transaction_is_identity_even_with_pending_gradients(api, model):
     torch, old = api.torch, model._xyz
     model._features_rest.grad = torch.ones_like(model._features_rest)
