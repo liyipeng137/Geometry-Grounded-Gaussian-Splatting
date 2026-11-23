@@ -81,9 +81,9 @@ def validate_options(opt, args):
             raise ValueError(f"{name} must be finite and nonnegative")
     if not 0 <= opt.lambda_dssim <= 1:
         raise ValueError("lambda_dssim must lie in [0, 1]")
-    if opt.real_depth_loss_mode not in ("absolute", "relative_charbonnier"):
+    if opt.real_depth_loss_mode not in ("absolute", "relative_charbonnier", "affinegs"):
         raise ValueError(
-            "real_depth_loss_mode must be absolute or relative_charbonnier"
+            "real_depth_loss_mode must be absolute, relative_charbonnier or affinegs"
         )
     for name in ("real_depth_relative_epsilon", "real_depth_relative_floor"):
         value = getattr(opt, name)

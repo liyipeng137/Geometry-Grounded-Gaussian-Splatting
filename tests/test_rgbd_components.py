@@ -16,7 +16,7 @@ ROOT = Path(__file__).resolve().parents[1]
 def load_functions(**overrides):
     """隔离相机/CUDA 导入，连通分量操作仍使用真实 Open3D。"""
     path = ROOT / "utils/pd_utils.py"
-    names = {"_keep_largest_three_components", "generate_ply_from_rgbd"}
+    names = {"_keep_largest_components", "generate_ply_from_rgbd"}
     nodes = [
         node for node in ast.parse(path.read_text()).body
         if isinstance(node, ast.FunctionDef) and node.name in names
@@ -53,45 +53,45 @@ def component_ids(mesh):
     return set(np.rint(np.asarray(mesh.vertex_colors)[:, 0] * 5).astype(int))
 
 
-def test_keeps_three_largest_by_triangle_count_not_area():
+def test_keeps_two_largest_by_triangle_count_not_area():
     mesh = disconnected_fans([2, 7, 4, 1, 5], orphan=True)
     # 最少面的组件反而具有最大的面积，防止实现误按面积排序。
     vertices = np.asarray(mesh.vertices)
     vertices[:4] *= 100
-    result = load_functions()["_keep_largest_three_components"](mesh)
+    result = load_functions()["_keep_largest_components"](mesh)
     assert result is mesh
-    assert component_ids(mesh) == {1, 2, 4}
-    assert sorted(mesh.cluster_connected_triangles()[1], reverse=True) == [7, 5, 4]
-    assert len(mesh.vertices) == 22
+    assert component_ids(mesh) == {1, 4}
+    assert sorted(mesh.cluster_connected_triangles()[1], reverse=True) == [7, 5]
+    assert len(mesh.vertices) == 16
     assert len(mesh.vertex_colors) == len(mesh.vertices)
     # remove_unreferenced_vertices 必须同时压缩坐标和颜色，不能遗留已删除碎片的点。
-    np.testing.assert_array_equal(np.unique(np.asarray(mesh.triangles)), np.arange(22))
+    np.testing.assert_array_equal(np.unique(np.asarray(mesh.triangles)), np.arange(16))
     assert np.asarray(mesh.vertices).max() < 100
 
 
-@pytest.mark.parametrize("counts", [(3,), (3, 2), (3, 2, 1)])
-def test_at_most_three_components_keep_all_and_preserve_vertex_colors(counts):
+@pytest.mark.parametrize("counts", [(3,), (3, 2)])
+def test_at_most_two_components_keep_all_and_preserve_vertex_colors(counts):
     mesh = disconnected_fans(counts, orphan=True)
     expected_vertices = np.asarray(mesh.vertices)[:-1].copy()
     expected_colors = np.asarray(mesh.vertex_colors)[:-1].copy()
-    load_functions()["_keep_largest_three_components"](mesh)
+    load_functions()["_keep_largest_components"](mesh)
     assert len(mesh.triangles) == sum(counts)
     np.testing.assert_array_equal(np.asarray(mesh.vertices), expected_vertices)
     np.testing.assert_array_equal(np.asarray(mesh.vertex_colors), expected_colors)
 
 
-def test_equal_sizes_keep_first_three_components_stably():
+def test_equal_sizes_keep_first_two_components_stably():
     for _ in range(2):
         mesh = disconnected_fans([2, 2, 2, 2])
-        load_functions()["_keep_largest_three_components"](mesh)
-        assert component_ids(mesh) == {0, 1, 2}
-        assert len(mesh.triangles) == 6
+        load_functions()["_keep_largest_components"](mesh)
+        assert component_ids(mesh) == {0, 1}
+        assert len(mesh.triangles) == 4
 
 
 def test_empty_surface_does_not_fall_back_to_unfiltered_points():
     mesh = disconnected_fans([], orphan=True)
     with pytest.raises(RuntimeError):
-        load_functions()["_keep_largest_three_components"](mesh)
+        load_functions()["_keep_largest_components"](mesh)
 
 
 @pytest.mark.parametrize("budget", [5, 100])
@@ -100,7 +100,7 @@ def test_fuses_all_frames_then_filters_and_samples_retained_vertices(tmp_path, b
     mesh = disconnected_fans([2, 7, 4, 1, 5], orphan=True)
     original_vertices = np.asarray(mesh.vertices).copy()
     original_colors = np.asarray(mesh.vertex_colors).copy()
-    retained = np.isin(np.rint(original_colors[:, 0] * 5).astype(int), [1, 2, 4])
+    retained = np.isin(np.rint(original_colors[:, 0] * 5).astype(int), [1, 4])
     expected_vertices, expected_colors = original_vertices[retained], original_colors[retained]
 
     class Volume:

@@ -67,14 +67,14 @@ def _load_tsdf_depth(source_path, image_name, depth_prior_dir="depth"):
     return np.where(np.isfinite(depth) & (depth > 0), depth, 0).astype(np.float32)
 
 
-def _keep_largest_three_components(mesh):
-    """按共享边连通的三角面数量保留前三个分量，原地清理其余面和孤立顶点。"""
+def _keep_largest_components(mesh, keep_count=1):
+    """按共享边连通的三角面数量保留最大分量，原地清理其余面和孤立顶点。"""
     if not mesh.has_triangles():
         raise RuntimeError("RGBD initialization produced no TSDF surface triangles")
     labels, counts, _ = mesh.cluster_connected_triangles()
     counts = np.asarray(counts)
     # 同面数时保留原组件顺序，避免初始化因排序不稳定而变化。
-    keep = np.argsort(-counts, kind="stable")[:3]
+    keep = np.argsort(-counts, kind="stable")[:keep_count]
     before_vertices = len(mesh.vertices)
     mesh.remove_triangles_by_mask(~np.isin(np.asarray(labels), keep))
     mesh.remove_unreferenced_vertices()
@@ -104,7 +104,7 @@ def generate_ply_from_rgbd(
     """从真实 RGB-D 融合初始化点云，使用与训练监督相同的深度目录。
 
     ``depth_prior_dir`` 支持数据集内相对目录或绝对目录；默认 ``depth``
-    保持原有入口。全部融合后先保留最大三个 mesh 连通分量，再抽取初始化点。
+    保持原有入口。全部融合后先保留最大两个 mesh 连通分量，再抽取初始化点。
     """
     print("Generating dense init ply from RGBD ...")
     if len(train_cam_infos) == 0:
@@ -176,7 +176,7 @@ def generate_ply_from_rgbd(
         volume.integrate(rgbd, camera_intrinsics, np.linalg.inv(c2w))
 
     # 连通性必须依据最终融合结果；不再累积各中间 TSDF 快照中的浮点。
-    mesh = _keep_largest_three_components(volume.extract_triangle_mesh())
+    mesh = _keep_largest_components(volume.extract_triangle_mesh())
     pick_num = min(num_points, len(mesh.vertices))
     idx = np.random.choice(len(mesh.vertices), size=pick_num, replace=False)
     points = np.asarray(mesh.vertices)[idx]

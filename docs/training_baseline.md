@@ -38,12 +38,19 @@ FastGS 的梯度累积。默认前 15k 主参数每步更新，15k～20k 每 32 
 | 项目 | 默认权重 | 启用与含义 |
 |---|---:|---|
 | RGB | 1 | `(1−lambda_dssim)×L1 + lambda_dssim×(1−SSIM)`，`lambda_dssim=.2` |
-| Depth prior | .4 | 从 3000 步开启，默认绝对 camera-Z L1；支持原有 relative Charbonnier |
+| Depth prior | .4 | 从 3000 步开启，`--real_depth_loss_mode` 支持 `absolute`（默认）、`relative_charbonnier` 和 `affinegs` |
 | Depth–normal 自一致性 | .05 | 从 7000 步开启；无效像素置零后按全图平均 |
 | 外部 normal prior | **.1 → .15 → .2 → .1** | 默认从第 1 步开启，采用 `train_demo.py` 的有向 cosine 和下述日程 |
 | 多视角 NCC | **.2 → .1 → .05** | 从 7001 步按 demo 日程启用，15k 后保持 .05 |
 | 多视角几何 | .02 | 从 7000 步开启 |
 | Mask | 0 | 现有背景约束；不把 depth-valid mask 解释为物体轮廓 |
+
+`affinegs` 把每帧有效 camera-Z 的倒数按第 1、99 百分位归一化，供作相对视差。
+它从相对视差和当前有效 D50 估计局部尺度与偏移，在归一化视差引导下做带掩码的保边滤波，
+再用视差梯度的幅值、方向及重新对齐到当前 D50 的深度 L1 监督真实相机。
+默认总权重 0.4 对应梯度项 0.1、L1 项 0.4。梯度使用完整有效的中心差分邻域，
+该项的采样网格长边最多 960 像素。已有的外部法线和深度导出法线监督独立计算。
+纯真实对照可在原命令中复用 `--init_ply` 和 `--disable_virtual_geometry`，指定新输出目录并加 `--real_depth_loss_mode affinegs`。
 
 normal prior 现完整采用用户提供的生产 `GGGS/train_demo.py` 逻辑，默认 20k 日程为：
 

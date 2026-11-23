@@ -21,6 +21,7 @@ from scene.train_split import (
     read_checkpoint_split,
     validate_checkpoint_split,
 )
+from utils.affinegs_depth import GRADIENT_RATIO, GUIDE_EPSILON, GUIDE_RADIUS_FRACTION, MAX_LOSS_EDGE
 from utils.photometric import get_photometric_backend
 from utils.virtual_geometry_config import JOINT_RECIPE
 
@@ -129,6 +130,23 @@ def prepare_output(dataset, opt, pipe, args, joint_config=None, joint_identity=N
                           if joint_config else "official PPISP optimizer/scheduler, every non-final iteration"),
             "camera_groups": "COLMAP camera IDs; frames are training image identities",
         }
+    if opt.real_depth_loss_mode == "affinegs":
+        depth_config = {
+            "mode": "affinegs",
+            "input": "positive camera-Z -> per-view 1/99 percentile normalized inverse depth",
+            "terms": "render-aligned L1 + gradient magnitude and direction",
+            "gradient_to_l1_weight_ratio": GRADIENT_RATIO,
+            "max_loss_long_edge": MAX_LOSS_EDGE,
+            "guided_filter_radius_fraction": GUIDE_RADIUS_FRACTION,
+            "guided_filter_epsilon_normalized_guide": GUIDE_EPSILON,
+        }
+    else:
+        depth_config = {
+            "mode": opt.real_depth_loss_mode,
+            "relative_epsilon": opt.real_depth_relative_epsilon,
+            "denominator_floor_scene_units": opt.real_depth_relative_floor,
+            "loss_units": "scene" if opt.real_depth_loss_mode == "absolute" else "dimensionless_relative",
+        }
     write_json(
         output / "training_config.json",
         {
@@ -146,14 +164,7 @@ def prepare_output(dataset, opt, pipe, args, joint_config=None, joint_identity=N
                 "lambda_multi_view_ncc_base": opt.lambda_multi_view_ncc,
                 "lambda_multi_view_geo": opt.lambda_multi_view_geo,
             },
-            "effective_real_depth_loss": {
-                "mode": opt.real_depth_loss_mode,
-                "relative_epsilon": opt.real_depth_relative_epsilon,
-                "denominator_floor_scene_units": opt.real_depth_relative_floor,
-                "loss_units": "scene"
-                if opt.real_depth_loss_mode == "absolute"
-                else "dimensionless_relative",
-            },
+            "effective_real_depth_loss": depth_config,
             "normal_prior_schedule": {
                 "source": "train_demo.py normal prior",
                 "from_iter": opt.normal_prior_from_iter,

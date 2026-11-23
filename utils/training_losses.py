@@ -20,6 +20,8 @@ from dataclasses import dataclass
 import torch
 import torch.nn.functional as F
 
+from utils.affinegs_depth import affinegs_depth_loss
+
 
 @dataclass(frozen=True)
 class LossSchedule:
@@ -241,7 +243,9 @@ def compute_training_losses(
     if schedule.depth_prior_enabled:
         prior = camera.depth_prior
         mask = prior > 0.01  # 原管道的有效深度阈值；不是渲染结果产生的 mask。
-        if opt.real_depth_loss_mode == "relative_charbonnier":
+        if opt.real_depth_loss_mode == "affinegs":
+            terms.depth_prior = affinegs_depth_loss(depth, prior)
+        elif opt.real_depth_loss_mode == "relative_charbonnier":
             terms.depth_prior = relative_charbonnier_depth_loss(
                 depth,
                 prior,

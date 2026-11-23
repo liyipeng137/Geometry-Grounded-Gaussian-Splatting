@@ -9,8 +9,8 @@ inputs:
   colmap: sparse/0
   mesh: genrecon_mesh.ply
 initialization:
-  method: gen_mesh
-  num_points: 200000
+  method: tsdf # tsdf or gen_mesh
+  num_points: 250000
 virtual_views:
   max_count: 160
   trajectory_offset_fraction: 0.16

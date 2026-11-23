@@ -93,7 +93,7 @@ python pipeline.py --dataset /workspace/dataset/scene \
   --config /workspace/configs/tsdf_init.yaml
 ```
 
-`gen_mesh` 生成指定数量的表面点；TSDF 沿用 RGBD 融合及最大三个连通分量过滤，点数是抽样上限，
+`gen_mesh` 生成指定数量的表面点；TSDF 沿用 RGBD 融合及最大两个连通分量过滤，点数是抽样上限，
 最终数量以 `summary.json` 的 `initialization.actual_points` 为准。`num_points` 必须为正且不能超过
 `geometry.max_gaussians`。切换初值后仍需提供 Gen mesh，虚拟机位与 D/N teacher 仍以它为源。
 
