@@ -41,6 +41,31 @@ def refinement_policy(step, total_steps, base_ncc=0.1):
     return base_ncc * (1.5 - 0.9 * progress), 1.0 - 0.75 * progress, False
 
 
+def cadence_windows(total_steps, cfg):
+    """Growth has its own paired audits; pruning keeps the exact reference clock."""
+
+    def pairs(steps):
+        return list(zip(steps[::2], steps[1::2]))
+
+    reference = [
+        s
+        for s in range(cfg.first, total_steps + 1, cfg.interval)
+        if refinement_policy(s, total_steps)[2]
+    ]
+    middle = round(0.15 * total_steps)
+    late = round(0.75 * total_steps)
+    stop = round(0.90 * total_steps)
+    fast = max(1, cfg.interval // 2)
+    growth = []
+    for start, end, interval in (
+        (cfg.first, middle, cfg.interval),
+        (max(cfg.first, middle + fast), late - 1, fast),
+        (max(cfg.first, late), stop, cfg.interval),
+    ):
+        growth.extend(pairs(range(start, end + 1, interval)))
+    return growth, pairs(reference)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     model_args, optim_args, pipe_args = (
@@ -62,6 +87,12 @@ def main():
     parser.add_argument("--audit_from", type=int, default=800)
     parser.add_argument("--audit_interval", type=int, default=200)
     parser.add_argument("--audit_views", type=int, default=12)
+    parser.add_argument(
+        "--densification_schedule",
+        choices=("reference", "accelerated"),
+        default="reference",
+        help="Change only split/seed timing; pruning follows the reference paired audit schedule.",
+    )
     parser.add_argument("--coverage_weight", type=float, default=0.05)
     args = parser.parse_args()
     dataset, opt, pipe = (
@@ -94,6 +125,21 @@ def main():
     cfg = TopologyConfig(
         interval=args.audit_interval, first=args.audit_from, views=args.audit_views
     )
+    accelerated = args.densification_schedule == "accelerated"
+    growth_windows, prune_windows = [], []
+    schedule_details = {}
+    topology_end = (
+        max(7000, round(0.75 * opt.iterations))
+        if opt.iterations > 7000
+        else opt.iterations - min(400, opt.iterations // 10)
+    )
+    if accelerated:
+        growth_windows, prune_windows = cadence_windows(opt.iterations, cfg)
+        schedule_details = {
+            "growth_audit_pairs": growth_windows,
+            "prune_audit_pairs": prune_windows,
+        }
+        topology_end = growth_windows[-1][1] if growth_windows else 0
     write_json(
         out / "geometry_config.json",
         {
@@ -111,9 +157,8 @@ def main():
             "opacity_resets": [],
             "ncc_from": opt.regularization_from_iter,
             "ncc_weight": opt.lambda_multi_view_ncc,
-            "topology_until": max(7000, round(0.75 * opt.iterations))
-            if opt.iterations > 7000
-            else opt.iterations - min(400, opt.iterations // 10),
+            "topology_until": topology_end,
+            **schedule_details,
         },
     )
     safe_state(False, seed=args.training_seed)
@@ -137,6 +182,8 @@ def main():
     topo = RealGeometryTopology(
         model, scene, pipe, bg, dataset.kernel_size, cache, args.training_seed, cfg
     )
+    if accelerated:
+        topo.configure_cadence(growth_windows, prune_windows)
     pm = PatchMatch(
         opt.multi_view_patch_size,
         opt.multi_view_pixel_noise_th,
@@ -243,7 +290,7 @@ def main():
             model.optimizer.step()
             model.optimizer.zero_grad(set_to_none=True)
             del buf, terms, coverage, total
-            if topology_active:
+            if accelerated or topology_active:
                 topo.step(it)
             if it % 400 == 0 and (not topo.events or topo.events[-1]["step"] != it):
                 model.compute_3D_filter(cameras=cameras)

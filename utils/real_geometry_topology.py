@@ -144,6 +144,7 @@ class RealGeometryTopology:
         self.pairs = []
         self.remaining = []
         self.previous = None
+        self.calendar = None
         dev = model.get_xyz.device
         self.meta = {
             "birth": torch.zeros(len(model.get_xyz), dtype=torch.long, device=dev),
@@ -340,13 +341,78 @@ class RealGeometryTopology:
             model._opacity[candidates] = opacity
         return candidates
 
+    def configure_cadence(self, growth_windows, prune_windows):
+        """Assign both clocks the original deterministic camera-pair draw sequence."""
+        self.calendar = {}
+        self.panels = [
+            self.choose_pairs()
+            for _ in range(max(len(growth_windows), len(prune_windows)))
+        ]
+        for name, windows in (("growth", growth_windows), ("prune", prune_windows)):
+            self.meta[name + "_first"] = torch.zeros_like(
+                self.meta["birth"], dtype=torch.bool
+            )
+            for panel, (first, confirm) in enumerate(windows):
+                for step, second in ((first, False), (confirm, True)):
+                    self.calendar.setdefault(step, {})[name] = (panel, second)
+        self.pending_seeds = set()
+
     @torch.no_grad()
     def step(self, iteration):
-        cfg, model = self.cfg, self.model
+        if self.calendar is not None:
+            return self._scheduled_step(iteration)
+        cfg = self.cfg
         if iteration < cfg.first or (iteration - cfg.first) % cfg.interval:
             return
         if self.previous is None:
             self.pairs = self.choose_pairs()
+        rank, split, prune, free, seeds = self._measure(iteration, self.pairs)
+        if self.previous is None:
+            self.previous = (split, prune, seeds)
+            return
+        old_split, old_prune, old_seeds = self.previous
+        self.previous = None
+        self._commit(
+            iteration,
+            (rank, split & old_split, [v for k, v in seeds.items() if k in old_seeds]),
+            (prune & old_prune, free, self.pairs),
+        )
+
+    def _scheduled_step(self, iteration):
+        actions = self.calendar.get(iteration)
+        if not actions:
+            return
+        # Shared observations at coincident times/panels are rendered only once.
+        observations = {
+            idx: self._measure(iteration, self.panels[idx])
+            for idx in sorted({idx for idx, _ in actions.values()})
+        }
+        growth = pruning = None
+        for name, (idx, confirm) in actions.items():
+            rank, split, prune, free, seeds = observations[idx]
+            self.counts[name + "_audits"] += 1
+            flags = split if name == "growth" else prune
+            key = name + "_first"
+            if not confirm:
+                self.meta[key] = flags
+                if name == "growth":
+                    self.pending_seeds = set(seeds)
+                continue
+            confirmed = flags & self.meta[key]
+            if name == "growth":
+                growth = (
+                    rank,
+                    confirmed,
+                    [v for k, v in seeds.items() if k in self.pending_seeds],
+                )
+                self.pending_seeds = set()
+            else:
+                pruning = (confirmed, free, self.panels[idx])
+        if growth is not None or pruning is not None:
+            self._commit(iteration, growth, pruning)
+
+    def _measure(self, iteration, pairs):
+        cfg, model = self.cfg, self.model
         n = len(model.get_xyz)
         dev = model.get_xyz.device
         error = torch.zeros(n, device=dev)
@@ -355,7 +421,7 @@ class RealGeometryTopology:
         separate_free = torch.zeros_like(free)
         first_ray = torch.zeros_like(model.get_xyz)
         seeds = {}
-        for i, j in self.pairs:
+        for i, j in pairs:
             cam = self.cache.ensure(self.cams[i])
             peer = self.cache.ensure(self.cams[j], keep=(cam,))
             buf = self.render(cam)
@@ -394,28 +460,36 @@ class RealGeometryTopology:
             seed_proposals=len(seeds),
             free_space_multiview=int(separate_free.sum()),
         )
-        if self.previous is None:
-            self.previous = (split, prune, seeds)
-            return
-        prev_split, prev_prune, prev_seeds = self.previous
-        self.previous = None
-        ids = torch.where(prune & prev_prune)[0]
-        ids = ids[
-            (
-                separate_free[ids].float() * 2
-                + 1
-                - model.get_opacity_with_3D_filter[ids, 0]
-            ).argsort(descending=True)[: cfg.max_prune]
-        ]
-        removed = self.safe_removals(ids, sorted({i for i, _ in self.pairs}))
+        return rank, split, prune, separate_free, seeds
+
+    def _commit(self, iteration, growth, pruning):
+        cfg, model = self.cfg, self.model
+        n = len(model.get_xyz)
+        dev = model.get_xyz.device
+        empty = torch.empty(0, device=dev, dtype=torch.long)
+        ids = removed = empty
+        raw_prune_count = 0
+        if pruning is not None:
+            prune, free, pairs = pruning
+            ids = torch.where(prune)[0]
+            raw_prune_count = len(ids)
+            ids = ids[
+                (
+                    free[ids].float() * 2 + 1 - model.get_opacity_with_3D_filter[ids, 0]
+                ).argsort(descending=True)[: cfg.max_prune]
+            ]
+            removed = self.safe_removals(ids, sorted({i for i, _ in pairs}))
         drop = torch.zeros(n, dtype=torch.bool, device=dev)
         drop[removed] = True
         budget = max(0, min(12000, n // 20, cfg.max_points - n + len(removed)))
-        eligible = torch.where(split & prev_split & ~drop)[0]
-        parents = eligible[
-            rank[eligible].argsort(descending=True)[: min(cfg.max_splits, budget)]
-        ]
-        new_seeds = [value for key, value in seeds.items() if key in prev_seeds]
+        eligible = parents = empty
+        new_seeds = []
+        if growth is not None:
+            rank, split, new_seeds = growth
+            eligible = torch.where(split & ~drop)[0]
+            parents = eligible[
+                rank[eligible].argsort(descending=True)[: min(cfg.max_splits, budget)]
+            ]
         additions, filt = self.seed_rows(
             new_seeds, min(budget - len(parents), cfg.max_seeds)
         )
@@ -450,6 +524,10 @@ class RealGeometryTopology:
                 (len(combined["xyz"]),), iteration, device=dev, dtype=torch.long
             ),
         }
+        # Pending first-audit flags follow surviving rows; newborns have no previous evidence.
+        if self.calendar is not None:
+            for key in ("growth_first", "prune_first"):
+                extra_meta[key] = self.meta[key].new_zeros(len(combined["xyz"]))
         self.meta = apply_gaussian_transaction(
             model,
             torch.where(~drop)[0],
@@ -464,6 +542,12 @@ class RealGeometryTopology:
         self.events.append(
             {
                 "step": iteration,
+                "growth_decision": growth is not None,
+                "prune_decision": pruning is not None,
+                "split_candidates_before_limit": len(eligible),
+                "split_deferred_by_limit": len(eligible) - len(parents),
+                "persistent_seed_candidates": len(new_seeds),
+                "prune_candidates_before_limit": raw_prune_count,
                 "parents_split": len(parents),
                 "seeds": seed_count,
                 "prune_candidates": len(ids),
@@ -473,6 +557,8 @@ class RealGeometryTopology:
         )
         self.counts.update(
             transactions=1,
+            growth_decisions=int(growth is not None),
+            prune_decisions=int(pruning is not None),
             parents_split=len(parents),
             seeds=seed_count,
             pruned=len(removed),

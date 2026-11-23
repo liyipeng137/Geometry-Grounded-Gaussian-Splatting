@@ -37,6 +37,19 @@ the extractor uses fixed mesh filenames.
 
 ## 20,000 updates
 
+The default `--densification_schedule reference` uses the original paired
+audit windows below. For the cadence-only comparison, start from the same
+initialization and arguments in a new directory and pass
+`--densification_schedule accelerated`. At 20k steps its split/seed windows
+are 800/1,000 through 2,800/3,000 (every 400 steps), 3,100/3,200 through
+14,700/14,800 (every 200 steps), and 15,000/15,200 through 17,800/18,000
+(every 400 steps). The first number is the audit and the second is its
+confirmation. This permits 73 growth decisions. The 35 prune windows still
+use the reference times and camera-pair draw sequence. Pending observations
+follow surviving rows across changes; children need their own confirmations.
+Each transaction records persistent split candidates before the limit, the
+number deferred by the limit, and seed candidates before spatial deduplication.
+
 | Updates | Matching and topology |
 |---|---|
 | 1–400 | TSDF initialization, absolute camera-Z L1, normal prior and alpha coverage. |
