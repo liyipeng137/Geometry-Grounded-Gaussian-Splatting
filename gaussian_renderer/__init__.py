@@ -42,6 +42,7 @@ def render(
     """
 
     # Set up rasterization configuration
+    geometry_only = getattr(pc, "geometry_only", False)
     tanfovx = math.tan(viewpoint_camera.FoVx * 0.5)
     tanfovy = math.tan(viewpoint_camera.FoVy * 0.5)
     screenspace_points = torch.zeros_like(pc.get_xyz, dtype=pc.get_xyz.dtype, requires_grad=True, device="cuda") + 0
@@ -65,8 +66,8 @@ def render(
         scale_modifier=scaling_modifier,
         viewmatrix=viewpoint_camera.world_view_transform,
         projmatrix=viewpoint_camera.full_proj_transform,
-        sh_degree=pc.active_sh_degree,
-        sg_degree=pc.active_sg_degree,
+        sh_degree=getattr(pc, "active_sh_degree", 0),
+        sg_degree=getattr(pc, "active_sg_degree", 0),
         campos=viewpoint_camera.camera_center,
         prefiltered=False,
         require_depth = require_depth,
@@ -90,28 +91,31 @@ def render(
     scales, opacity = pc.get_scaling_n_opacity_with_3D_filter
     rotations = pc.get_rotation
 
-    # If precomputed colors are provided, use them. Otherwise, if it is desired to precompute colors
-    # from SHs in Python, do it. If not, then SH -> RGB conversion will be done by rasterizer.
-    shs = pc.get_features
-    colors_precomp = None
-    
-    sg_axis = pc.get_sg_axis
-    sg_sharpness = pc.get_sg_sharpness
-    sg_color = pc.get_sg_color
+    if geometry_only:
+        raster_output = rasterizer.forward_geometry(means3D, means2D, opacity, scales, rotations)
+    else:
+        # If precomputed colors are provided, use them. Otherwise, if it is desired to precompute colors
+        # from SHs in Python, do it. If not, then SH -> RGB conversion will be done by rasterizer.
+        shs = pc.get_features
+        colors_precomp = None
 
-    raster_output = rasterizer(
-        means3D = means3D,
-        means2D = means2D,
-        shs = shs,
-        sg_axis = sg_axis,
-        sg_sharpness = sg_sharpness,
-        sg_color = sg_color,
-        colors_precomp = colors_precomp,
-        opacities = opacity,
-        scales = scales,
-        rotations = rotations,
-        cov3D_precomp = cov3D_precomp,
-    )
+        sg_axis = pc.get_sg_axis
+        sg_sharpness = pc.get_sg_sharpness
+        sg_color = pc.get_sg_color
+
+        raster_output = rasterizer(
+            means3D = means3D,
+            means2D = means2D,
+            shs = shs,
+            sg_axis = sg_axis,
+            sg_sharpness = sg_sharpness,
+            sg_color = sg_color,
+            colors_precomp = colors_precomp,
+            opacities = opacity,
+            scales = scales,
+            rotations = rotations,
+            cov3D_precomp = cov3D_precomp,
+        )
     if record_transmittance:
         (
             rendered_image,
@@ -128,8 +132,6 @@ def render(
         transmittance_avg = None
         num_covered_pixels = None
 
-
-
     if require_depth and hasattr(viewpoint_camera, "camera_z_depth"):
         rendered_median_depth = viewpoint_camera.camera_z_depth(rendered_median_depth)
 
@@ -145,7 +147,7 @@ def render(
 
     # Those Gaussians that were frustum culled or had a radius of 0 were not visible.
     # They will be excluded from value updates used in the splitting criteria.
-    return {"render": rendered_image,
+    return {**({} if geometry_only else {"render": rendered_image}),
             "mask": rendered_alpha,
             "median_depth": rendered_median_depth,
             "viewspace_points": means2D,
@@ -235,8 +237,8 @@ def integrate(points3D, viewpoint_camera, pc : GaussianModel, pipe, kernel_size 
         scale_modifier=scaling_modifier,
         viewmatrix=viewpoint_camera.world_view_transform,
         projmatrix=viewpoint_camera.full_proj_transform,
-        sh_degree=pc.active_sh_degree,
-        sg_degree=pc.active_sg_degree,
+        sh_degree=getattr(pc, "active_sh_degree", 0),
+        sg_degree=getattr(pc, "active_sg_degree", 0),
         campos=viewpoint_camera.camera_center,
         prefiltered=False,
         debug=pipe.debug,
@@ -298,8 +300,8 @@ def evaluate_sdf(points3D, viewpoint_camera, pc : GaussianModel, pipe, kernel_si
         scale_modifier=scaling_modifier,
         viewmatrix=viewpoint_camera.world_view_transform,
         projmatrix=viewpoint_camera.full_proj_transform,
-        sh_degree=pc.active_sh_degree,
-        sg_degree=pc.active_sg_degree,
+        sh_degree=getattr(pc, "active_sh_degree", 0),
+        sg_degree=getattr(pc, "active_sg_degree", 0),
         campos=viewpoint_camera.camera_center,
         prefiltered=False,
         debug=pipe.debug,
@@ -377,8 +379,8 @@ def sample_depth(points3D, viewpoint_camera, pc : GaussianModel, pipe : torch.Te
         scale_modifier=scaling_modifier,
         viewmatrix=viewpoint_camera.world_view_transform,
         projmatrix=viewpoint_camera.full_proj_transform,
-        sh_degree=pc.active_sh_degree,
-        sg_degree=pc.active_sg_degree,
+        sh_degree=getattr(pc, "active_sh_degree", 0),
+        sg_degree=getattr(pc, "active_sg_degree", 0),
         campos=viewpoint_camera.camera_center,
         prefiltered=False,
         debug=pipe.debug,

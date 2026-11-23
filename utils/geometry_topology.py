@@ -61,6 +61,7 @@ def apply_gaussian_transaction(model, keep, additions, addition_filter, metadata
     Only consumed-gradient boundaries are accepted. Surviving Adam moments and
     group step counters remain intact; new rows receive zero moments.
     """
+    fields = getattr(model, "point_parameters", PARAMETERS)
     count = len(model.get_xyz)
     device = model.get_xyz.device
     keep = torch.as_tensor(keep, dtype=torch.long, device=device)
@@ -73,7 +74,7 @@ def apply_gaussian_transaction(model, keep, additions, addition_filter, metadata
         raise ValueError("A survivor cannot appear twice")
     if added == 0 and torch.equal(keep, torch.arange(count, device=device)):
         return metadata
-    if set(additions) != set(PARAMETERS) or set(metadata) != set(addition_metadata):
+    if set(additions) != set(fields) or set(metadata) != set(addition_metadata):
         raise ValueError("Incomplete topology parameter or metadata payload")
     for key, values in metadata.items():
         if len(values) != count or len(addition_metadata[key]) != added:
@@ -84,7 +85,7 @@ def apply_gaussian_transaction(model, keep, additions, addition_filter, metadata
     for optimizer in model._iter_optimizers():
         for group in optimizer.param_groups:
             name = group["name"]
-            if name not in PARAMETERS:
+            if name not in fields:
                 continue
             old = group["params"][0]
             if old.grad is not None:
@@ -104,7 +105,7 @@ def apply_gaussian_transaction(model, keep, additions, addition_filter, metadata
                         state[key] = value.clone() if torch.is_tensor(value) else copy.deepcopy(value)
             replacements[name] = new
             optimizer_updates.append((optimizer, group, old, new, state))
-    if set(replacements) != set(PARAMETERS):
+    if set(replacements) != set(fields):
         raise ValueError("Gaussian optimizers do not own all required point tensors")
     mapped = {key: torch.cat((value[keep], addition_metadata[key].to(value)), 0)
               for key, value in metadata.items()}
@@ -117,9 +118,11 @@ def apply_gaussian_transaction(model, keep, additions, addition_filter, metadata
         if state is not None:
             optimizer.state[new] = state
     for name, parameter in replacements.items():
-        setattr(model, PARAMETERS[name], parameter)
+        setattr(model, fields[name], parameter)
     model.filter_3D = filtering
     for name in ("xyz_gradient_accum", "xyz_gradient_accum_abs", "denom", "max_radii2D"):
+        if not hasattr(model, name):
+            continue
         value = getattr(model, name)
         setattr(model, name, torch.cat((value[keep], value.new_zeros((added, *value.shape[1:]))), 0))
     return mapped
@@ -242,22 +245,24 @@ def choose_seed_witnesses(xyz, view_epochs, camera_centers, epoch, minimum_angle
     return [int(ids[first]), int(ids[second])]
 
 
-def make_seed_payload(model, xyz, normals, spacing, filtering, rgb):
+def make_seed_payload(model, xyz, normals, spacing, filtering, rgb=None):
     xyz = torch.as_tensor(xyz, dtype=model.get_xyz.dtype, device=model.get_xyz.device)
     spacing = torch.as_tensor(spacing, dtype=xyz.dtype, device=xyz.device)
     normals = torch.as_tensor(normals, dtype=xyz.dtype, device=xyz.device)
-    rgb = torch.as_tensor(rgb, dtype=xyz.dtype, device=xyz.device)
+    fields = getattr(model, "point_parameters", PARAMETERS)
     scales = spacing[:, None] * xyz.new_tensor([.7, .7, .2])
     coefficient = filter_coefficient(scales, filtering)
     probability = .25 / coefficient.clamp_min(1e-12)
     valid = ((probability < .95) & torch.isfinite(probability) & (spacing > 0)
              & torch.isfinite(xyz).all(1) & torch.isfinite(normals).all(1) & (normals.norm(dim=1) > .5))
     payload = {name: getattr(model, field).new_zeros((len(xyz), *getattr(model, field).shape[1:]))
-               for name, field in PARAMETERS.items()}
+               for name, field in fields.items()}
     payload.update(xyz=xyz, scaling=scales.log(), rotation=normal_quaternions(normals),
                    opacity=torch.logit(probability.clamp(1e-6, 1-1e-6))[:, None])
-    payload["f_dc"][:, 0, :] = (rgb.clamp(0, 1) - .5) / .28209479177387814
-    if payload["sg_axis"].numel():
+    if "f_dc" in fields:
+        rgb = torch.as_tensor(rgb, dtype=xyz.dtype, device=xyz.device)
+        payload["f_dc"][:, 0, :] = (rgb.clamp(0, 1) - .5) / .28209479177387814
+    if "sg_axis" in fields and payload["sg_axis"].numel():
         payload["sg_axis"][..., 2] = 1
     return payload, valid
 

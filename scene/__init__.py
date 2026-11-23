@@ -145,14 +145,15 @@ class Scene:
                             file.write(json_str)
                             file.write("\n")
 
-        self.gaussians.create_app_model(
-            len(scene_info.train_cameras), args.use_decoupled_appearance,
-            train_cameras=self.train_cameras[resolution_scales[0]],
-        )
+        if not getattr(self.gaussians, "geometry_only", False):
+            self.gaussians.create_app_model(
+                len(scene_info.train_cameras), args.use_decoupled_appearance,
+                train_cameras=self.train_cameras[resolution_scales[0]],
+            )
 
         if self.loaded_iter:
             self.gaussians.load_ply(os.path.join(self.model_path, "point_cloud", "iteration_" + str(self.loaded_iter), "point_cloud.ply"))
-            if self.gaussians.ppisp is not None:
+            if getattr(self.gaussians, "ppisp", None) is not None:
                 state_path = os.path.join(self.model_path, "point_cloud", "iteration_" + str(self.loaded_iter), "ppisp.pth")
                 self.gaussians.ppisp.load_export_state(torch.load(state_path, weights_only=False))
         else:
@@ -167,6 +168,10 @@ class Scene:
     def save(self, iteration, save_viewer=True):
         point_cloud_path = os.path.join(self.model_path, "point_cloud/iteration_{}".format(iteration))
         self.gaussians.save_ply(os.path.join(point_cloud_path, "point_cloud.ply"))
+        if getattr(self.gaussians, "geometry_only", False):
+            if save_viewer:
+                self.gaussians.export_neutral_viewer(os.path.join(point_cloud_path, "neutral_3dgsviewer.ply"))
+            return
         if self.gaussians.app_model == GaussianModel.App_model.PGSR:
             if not save_viewer:
                 # Delivery keeps the small learned appearance state without a second full PLY.

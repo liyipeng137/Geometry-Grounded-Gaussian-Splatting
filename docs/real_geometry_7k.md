@@ -1,5 +1,9 @@
 # Real-view geometry-only Gaussian experiment
 
+This document records the frozen-colour experiment at commit `d766bf7`.
+For the colour-free model, grayscale camera cache and 20k schedule on the
+current branch, see [grayscale geometry training](gray_geometry_20k.md).
+
 `train_real_geometry.py` optimizes Gaussian centres, scales, rotations and opacity.
 Real RGB contributes through calibrated grey-patch NCC between two photographs.
 The native viewer colour is fixed DC from the TSDF point cloud. A split inherits

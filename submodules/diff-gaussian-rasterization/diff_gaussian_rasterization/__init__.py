@@ -300,6 +300,9 @@ class _RasterizeGaussians(torch.autograd.Function):
             grad_cov3Ds_precomp,
             None,
         )
+        if raster_settings.bg.numel() == 0:
+            return (grad_means3D, grad_means2D, None, None, None, None, None,
+                    grad_opacities, grad_scales, grad_rotations, None, None)
         return grads
 
 
@@ -329,6 +332,15 @@ class GaussianRasterizer(nn.Module):
     def __init__(self, raster_settings):
         super().__init__()
         self.raster_settings = raster_settings
+
+    def forward_geometry(self, means3D, means2D, opacities, scales, rotations):
+        """Run zero-colour-channel forward/backward kernels without appearance tensors."""
+        if not getattr(_C, "geometry_only_channels", False):
+            raise RuntimeError("Rebuild the rasterizer with geometry-only channel support")
+        empty = means3D.new_empty(0)
+        settings = self.raster_settings._replace(bg=empty, sh_degree=0, sg_degree=0)
+        return rasterize_gaussians(
+            means3D, means2D, empty, empty, empty, empty, empty, opacities, scales, rotations, empty, settings)
 
     @torch.no_grad()
     def geometry_score(self, means3D, opacities, scales, rotations, target_range,

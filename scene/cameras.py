@@ -20,6 +20,7 @@ from utils.graphics_utils import getProjectionMatrix, getWorld2View2
 
 _PAYLOAD_FIELDS = (
     "original_image",
+    "gray_observation",
     "gt_mask",
     "normal_prior",
     "normal_prior_mask",
@@ -88,7 +89,7 @@ class Camera(nn.Module):
                  depth_confidence=None,
                  trans=np.array([0.0, 0.0, 0.0]), scale=1.0, data_device = "cuda",
                  lazy_payload=False,
-                 K=None,
+                 K=None, cache_gray=False,
                  ):
         super(Camera, self).__init__()
 
@@ -153,7 +154,13 @@ class Camera(nn.Module):
         self.has_depth_prior = depth_prior is not None
         self.has_depth_confidence = depth_confidence is not None
 
-        self._store_payload("original_image", image)
+        self.cache_gray = cache_gray
+        gray = None
+        if cache_gray:
+            channels = image.float().mul_(1.0 / 255.0)
+            gray = channels if len(channels) == 1 else (0.299*channels[0] + 0.587*channels[1] + 0.114*channels[2])[None]
+        self._store_payload("gray_observation", gray)
+        self._store_payload("original_image", None if cache_gray else image)
         self._store_payload("gt_mask", mask_f)
         self._store_payload("normal_prior", normal_prior)
         self._store_payload("normal_prior_mask", normal_prior_mask)
@@ -205,7 +212,7 @@ class Camera(nn.Module):
         if not self.lazy_payload:
             return
         for name in fields:
-            cpu_tensor = getattr(self, name + "_cpu")
+            cpu_tensor = getattr(self, name + "_cpu", None)
             if cpu_tensor is not None and getattr(self, name) is None:
                 setattr(self, name, cpu_tensor.to(self.data_device, non_blocking=True))
 
@@ -223,6 +230,8 @@ class Camera(nn.Module):
 
     @property
     def gray_image(self):
+        if getattr(self,"cache_gray",False):
+            return self.gray_observation
         image = self.original_image_float()
         return (0.299 * image[0] + 0.587 * image[1] + 0.114 * image[2])[None]
 

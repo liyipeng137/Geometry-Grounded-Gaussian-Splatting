@@ -14,7 +14,8 @@ from tqdm import tqdm
 from PIL import Image
 
 from arguments import ModelParams, PipelineParams, get_combined_args
-from gaussian_renderer import GaussianModel, integrate
+from gaussian_renderer import integrate
+from scene.geometry_gaussians import GeometryGaussians
 from scene.colmap_loader import (
     qvec2rotmat,
     read_extrinsics_binary,
@@ -226,7 +227,7 @@ def load_mesh_cameras_from_colmap(dataset: ModelParams, load_gt_mask=True, llffh
     return cameras
 
 
-def load_gaussians_from_iteration(dataset: ModelParams, gaussians: GaussianModel, iteration: int):
+def load_gaussians_from_iteration(dataset: ModelParams, gaussians: GeometryGaussians, iteration: int):
     if iteration == -1:
         point_cloud_root = os.path.join(dataset.model_path, "point_cloud")
         loaded_iter = searchForMaxIteration(point_cloud_root)
@@ -684,7 +685,7 @@ def extract_mesh(
     smooth_iterations: int = 0, smooth_lambda: float = 0.5, smooth_mu: float = -0.53,
 ):
     with torch.no_grad():
-        gaussians = GaussianModel(dataset.sh_degree, dataset.sg_degree)
+        gaussians = GeometryGaussians()
         load_gaussians_from_iteration(dataset, gaussians, iteration)
         kernel_size = dataset.kernel_size
         cams = load_mesh_cameras_from_colmap(dataset, load_gt_mask=load_gt_mask)

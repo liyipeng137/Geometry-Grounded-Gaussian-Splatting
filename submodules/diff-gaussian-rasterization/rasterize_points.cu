@@ -82,7 +82,10 @@ RasterizeGaussiansCUDA(
     auto int_opts   = means3D.options().dtype(torch::kInt32);
     auto float_opts = means3D.options().dtype(torch::kFloat32);
 
-    torch::Tensor out_color  = torch::full({NUM_CHANNELS, H, W}, 0.0, float_opts);
+    const bool geometry_only = background.numel() == 0;
+    TORCH_CHECK(!geometry_only || (colors.numel() == 0 && sh.numel() == 0 && sg_color.numel() == 0),
+                "geometry-only rasterization accepts no appearance");
+    torch::Tensor out_color  = torch::zeros({geometry_only ? 0 : NUM_CHANNELS, H, W}, float_opts);
     torch::Tensor out_mdepth = torch::full({1, H, W}, 0.0, float_opts);
     torch::Tensor out_alpha  = torch::full({1, H, W}, 0.0, float_opts);
     torch::Tensor out_normal = torch::full({3, H, W}, 0.0, float_opts);
@@ -131,7 +134,7 @@ RasterizeGaussiansCUDA(
             imgFunc,
             tileFunc,
             P, sh_degree, SHM, sg_degree, SGM,
-            background.contiguous().data_ptr<float>(),
+            geometry_only ? nullptr : background.contiguous().data_ptr<float>(),
             W, H,
             means3D.contiguous().data_ptr<float>(),
             colors.contiguous().data_ptr<float>(),
@@ -152,7 +155,7 @@ RasterizeGaussiansCUDA(
             kernel_size,
             metric_map.contiguous().data_ptr<int>(),
             prefiltered,
-            out_color.contiguous().data_ptr<float>(),
+            geometry_only ? nullptr : out_color.contiguous().data_ptr<float>(),
             out_mdepth.contiguous().data_ptr<float>(),
             out_alpha.contiguous().data_ptr<float>(),
             out_normal.contiguous().data_ptr<float>(),
@@ -216,7 +219,7 @@ GeometryScoreCUDA(
     auto empty = torch::empty({0}, options);
     auto metric = torch::empty({0}, options.dtype(torch::kInt32));
     auto rendering = RasterizeGaussiansCUDA(
-        torch::zeros({3}, options), means3D, torch::zeros({P, 3}, options),
+        empty, means3D, empty,
         opacity, scales, rotations, empty, empty, empty, empty, empty,
         0, 0, scale_modifier, viewmatrix, projmatrix, tan_fovx, tan_fovy,
         kernel_size, metric, image_height, image_width, campos,
@@ -225,7 +228,7 @@ GeometryScoreCUDA(
     char* geometry = reinterpret_cast<char*>(std::get<6>(rendering).data_ptr());
     char* binning = reinterpret_cast<char*>(std::get<7>(rendering).data_ptr());
     char* tiles = reinterpret_cast<char*>(std::get<9>(rendering).data_ptr());
-    auto geometry_state = CudaRasterizer::GeometryState::fromChunk(geometry, P);
+    auto geometry_state = CudaRasterizer::GeometryState::fromChunk(geometry, P, false);
     auto binning_state = CudaRasterizer::BinningState::fromChunk(binning, rendered);
     dim3 grid((image_width + BLOCK_X - 1) / BLOCK_X, (image_height + BLOCK_Y - 1) / BLOCK_Y, 1);
     dim3 block(BLOCK_X, BLOCK_Y, 1);
@@ -282,8 +285,9 @@ RasterizeGaussiansBackwardCUDA(
     const bool protect_invalid_depth,
     const bool debug) {
     const int P = means3D.size(0);
-    const int H = dL_dout_color.size(1);
-    const int W = dL_dout_color.size(2);
+    const bool geometry_only = background.numel() == 0;
+    const int H = mdepth.size(1);
+    const int W = mdepth.size(2);
     // 只改变 joint 调用：无 D50 根时不存在可用的隐函数深度导数。
     // 默认 baseline 不额外处理，保持原来的数值路径。
     torch::Tensor depth_gradient = dL_dout_mdepth;
@@ -302,7 +306,7 @@ RasterizeGaussiansBackwardCUDA(
 
     torch::Tensor dL_dmeans3D      = torch::zeros({P, 3}, means3D.options());
     torch::Tensor dL_dmeans2D      = torch::zeros({P, 3}, means3D.options());
-    torch::Tensor dL_dcolors       = torch::zeros({P, NUM_CHANNELS}, means3D.options());
+    torch::Tensor dL_dcolors       = torch::zeros({P, geometry_only ? 0 : NUM_CHANNELS}, means3D.options());
     torch::Tensor dL_dopacity      = torch::zeros({P, 1}, means3D.options());
     torch::Tensor dL_dcov3D        = torch::zeros({P, 6}, means3D.options());
     torch::Tensor dL_dsh           = torch::zeros({P, SHM, 3}, means3D.options());
@@ -321,7 +325,7 @@ RasterizeGaussiansBackwardCUDA(
         CudaRasterizer::Rasterizer::backward(
             geomFunc,
             P, sh_degree, SHM, sg_degree, SGM, R,
-            background.contiguous().data_ptr<float>(),
+            geometry_only ? nullptr : background.contiguous().data_ptr<float>(),
             W, H,
             means3D.contiguous().data_ptr<float>(),
             colors.contiguous().data_ptr<float>(),
@@ -348,7 +352,7 @@ RasterizeGaussiansBackwardCUDA(
             reinterpret_cast<char*>(binningBuffer.contiguous().data_ptr()),
             reinterpret_cast<char*>(imageBuffer.contiguous().data_ptr()),
             reinterpret_cast<char*>(tileBuffer.contiguous().data_ptr()),
-            dL_dout_color.contiguous().data_ptr<float>(),
+            geometry_only ? nullptr : dL_dout_color.contiguous().data_ptr<float>(),
             depth_gradient.contiguous().data_ptr<float>(),
             dL_dout_alpha.contiguous().data_ptr<float>(),
             dL_dout_normal.contiguous().data_ptr<float>(),

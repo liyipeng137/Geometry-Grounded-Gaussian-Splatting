@@ -58,7 +58,7 @@ def arrays(buf):
         return val.permute(1, 2, 0).contiguous().cpu().numpy()
 
     return dict(
-        rgb=hw("render"),
+        **({"rgb": hw("render")} if "render" in buf else {}),
         z=hw("median_depth"),
         n=hw("normal"),
         alpha=hw("mask"),
@@ -72,7 +72,7 @@ def image(data):
     )
 
 
-def panels(a, limits):
+def geometry_panels(a, limits):
     valid = a["hit"]
     n = a["n"] / np.linalg.norm(a["n"], axis=-1, keepdims=True).clip(1e-8)
     light = np.array([-0.4, -0.6, -1.0], np.float32)
@@ -85,12 +85,15 @@ def panels(a, limits):
     )[..., ::-1].copy()
     colors[~valid] = 0
     return [
-        image(a["rgb"]),
         image(gray).convert("RGB"),
         image(norm),
         Image.fromarray(colors),
         image(a["alpha"]).convert("RGB"),
     ]
+
+
+def panels(a, limits):
+    return [image(a["rgb"]), *geometry_panels(a, limits)]
 
 
 def strip(images, labels, width=210):
@@ -185,12 +188,11 @@ def interpolate_views(dest, frames, names, model, pipe, bg, kernel, limits):
                 depth_search_expansions=2,
             )
             small = {k: v[1::3, 1::3] for k, v in arrays(output).items()}
-            rgb, clay, _, depth, _ = panels(small, limits)
-            card = strip(
-                [rgb, clay, depth],
-                ["Frozen-color RGB", "Normal shading", "Camera-Z depth"],
-                width=360,
-            )
+            clay, normal, depth, alpha = geometry_panels(small, limits)
+            if "rgb" in small:
+                card = strip([image(small["rgb"]),clay,depth],["Frozen-color RGB","Normal shading","Camera-Z depth"],width=360)
+            else:
+                card = strip([clay,normal,depth,alpha],["Normal shading","Camera normal","Camera-Z","Alpha"],width=300)
             if writer is None:
                 writer = video_writer(dest / "interpolated.mp4", card.size, 24)
             writer.stdin.write(card.tobytes())

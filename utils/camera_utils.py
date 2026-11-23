@@ -207,7 +207,7 @@ def loadCam(args, id, cam_info, resolution_scale):
                       depth_prior=depth_prior,
                       depth_confidence=None,
                       data_device=args.data_device,
-                      lazy_payload=_frame_gpu_budget(args) != -1, K=scaled_K)
+                      lazy_payload=_frame_gpu_budget(args) != -1, K=scaled_K, cache_gray=getattr(args, "gray_observations", False))
         camera.source_image_name = cam_info.colmap_image_name or os.path.basename(cam_info.image_path)
         return camera
     finally:

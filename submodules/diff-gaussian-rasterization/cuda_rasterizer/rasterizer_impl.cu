@@ -183,16 +183,18 @@ void CudaRasterizer::Rasterizer::markVisible(
         present);
 }
 
-CudaRasterizer::GeometryState CudaRasterizer::GeometryState::fromChunk(char*& chunk, size_t P) {
+CudaRasterizer::GeometryState CudaRasterizer::GeometryState::fromChunk(char*& chunk, size_t P, bool with_color) {
     GeometryState geom;
     obtain(chunk, geom.depths, P, 128);
     obtain(chunk, geom.ray_planes, P, 128);
     obtain(chunk, geom.normals, P, 128);
-    obtain(chunk, geom.clamped, P * 3, 128);
+    geom.clamped = nullptr;
+    if (with_color) obtain(chunk, geom.clamped, P * 3, 128);
     obtain(chunk, geom.internal_radii, P, 128);
     obtain(chunk, geom.means2D, P, 128);
     obtain(chunk, geom.conic_opacity, P, 128);
-    obtain(chunk, geom.rgb, P * 3, 128);
+    geom.rgb = nullptr;
+    if (with_color) obtain(chunk, geom.rgb, P * 3, 128);
     obtain(chunk, geom.tiles_touched, P, 128);
     cub::DeviceScan::InclusiveSum(nullptr, geom.scan_size, geom.tiles_touched, geom.tiles_touched, P);
     obtain(chunk, geom.scanning_space, geom.scan_size, 128);
@@ -316,9 +318,9 @@ int CudaRasterizer::Rasterizer::forward(
     dim3 block(BLOCK_X, BLOCK_Y, 1);
     const int tiles = tile_grid.x * tile_grid.y;
 
-    size_t chunk_size       = required<GeometryState>(P);
+    size_t chunk_size       = required<GeometryState>(P, background != nullptr);
     char* chunkptr          = geometryBuffer(chunk_size);
-    GeometryState geomState = GeometryState::fromChunk(chunkptr, P);
+    GeometryState geomState = GeometryState::fromChunk(chunkptr, P, background != nullptr);
 
     size_t tile_chunk_size     = required<TileState<false>>(tiles);
     char* tile_chunkptr        = tileBuffer(tile_chunk_size);
@@ -498,7 +500,7 @@ void CudaRasterizer::Rasterizer::backward(
     float* dL_dsg_color,
     bool require_depth,
     bool debug) {
-    GeometryState geomState   = GeometryState::fromChunk(geom_buffer, P);
+    GeometryState geomState   = GeometryState::fromChunk(geom_buffer, P, background != nullptr);
     BinningState binningState = BinningState::fromChunk(binning_buffer, R);
     ImageState imgState       = ImageState::fromChunk(img_buffer, width * height);
 
@@ -624,9 +626,9 @@ int CudaRasterizer::Rasterizer::evaluateTransmittance(
     const float focal_y = height / (2.0f * tan_fovy);
     const float focal_x = width / (2.0f * tan_fovx);
 
-    size_t chunk_size       = required<GeometryState>(P);
+    size_t chunk_size       = required<GeometryState>(P, false);
     char* chunkptr          = geometryBuffer(chunk_size);
-    GeometryState geomState = GeometryState::fromChunk(chunkptr, P);
+    GeometryState geomState = GeometryState::fromChunk(chunkptr, P, false);
 
     dim3 tile_grid((width + BLOCK_X - 1) / BLOCK_X, (height + BLOCK_Y - 1) / BLOCK_Y, 1);
     const int tiles = tile_grid.x * tile_grid.y;
@@ -639,7 +641,7 @@ int CudaRasterizer::Rasterizer::evaluateTransmittance(
     CHECK_CUDA(FORWARD::preprocess(
                    P, 0, 0, 0, 0,
                    means3D,
-                   geomState.rgb, // give a safe pointer to avoid color computation
+                   nullptr, // geometric query; no colour or SH input
                    opacities,
                    (glm::vec3*)scales,
                    (float4*)rotations,
@@ -849,9 +851,9 @@ int CudaRasterizer::Rasterizer::evaluateSDF(
     const float focal_y = height / (2.0f * tan_fovy);
     const float focal_x = width / (2.0f * tan_fovx);
 
-    size_t chunk_size       = required<GeometryState>(P);
+    size_t chunk_size       = required<GeometryState>(P, false);
     char* chunkptr          = geometryBuffer(chunk_size);
-    GeometryState geomState = GeometryState::fromChunk(chunkptr, P);
+    GeometryState geomState = GeometryState::fromChunk(chunkptr, P, false);
 
     dim3 tile_grid((width + BLOCK_X - 1) / BLOCK_X, (height + BLOCK_Y - 1) / BLOCK_Y, 1);
     const int tiles = tile_grid.x * tile_grid.y;
@@ -865,7 +867,7 @@ int CudaRasterizer::Rasterizer::evaluateSDF(
     CHECK_CUDA(FORWARD::preprocess(
                    P, 0, 0, 0, 0,
                    means3D,
-                   geomState.rgb, // give a safe pointer to avoid color computation
+                   nullptr, // geometric query; no colour or SH input
                    opacities,
                    (glm::vec3*)scales,
                    (float4*)rotations,
@@ -1072,9 +1074,9 @@ int3 CudaRasterizer::Rasterizer::sampleDepth(
     const float focal_y = height / (2.0f * tan_fovy);
     const float focal_x = width / (2.0f * tan_fovx);
 
-    size_t chunk_size       = required<GeometryState>(P);
+    size_t chunk_size       = required<GeometryState>(P, false);
     char* chunkptr          = geometryBuffer(chunk_size);
-    GeometryState geomState = GeometryState::fromChunk(chunkptr, P);
+    GeometryState geomState = GeometryState::fromChunk(chunkptr, P, false);
 
     dim3 tile_grid((width + BLOCK_X - 1) / BLOCK_X, (height + BLOCK_Y - 1) / BLOCK_Y, 1);
 
@@ -1087,7 +1089,7 @@ int3 CudaRasterizer::Rasterizer::sampleDepth(
     CHECK_CUDA(FORWARD::preprocess(
                    P, 0, 0, 0, 0,
                    means3D,
-                   geomState.rgb, // give a safe pointer to avoid color computation
+                   nullptr, // geometric query; no colour or SH input
                    opacities,
                    (glm::vec3*)scales,
                    (float4*)rotations,
@@ -1301,7 +1303,7 @@ void CudaRasterizer::Rasterizer::sampleDepthBackward(
     float* dL_drot,
     float* dL_dpoint,
     bool debug) {
-    GeometryState geomState                   = GeometryState::fromChunk(geom_buffer, P);
+    GeometryState geomState                   = GeometryState::fromChunk(geom_buffer, P, false);
     BinningState binningState                 = BinningState::fromChunk(binning_buffer, R);
     PointState pointState                     = PointState::fromChunk(point_buffer, PN);
     BinningState point_binningState           = BinningState::fromChunk(point_binning_buffer, RN);

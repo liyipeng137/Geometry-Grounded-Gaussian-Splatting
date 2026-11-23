@@ -762,7 +762,7 @@ __global__ void __launch_bounds__(BLOCK_X* BLOCK_Y)
     __shared__ int collected_id[BLOCK_SIZE];
     __shared__ float2 collected_xy[BLOCK_SIZE];
     __shared__ float4 collected_conic_opacity[BLOCK_SIZE];
-    __shared__ float collected_colors[C * BLOCK_SIZE];
+    __shared__ float collected_colors[C ? C * BLOCK_SIZE : 1];
     [[maybe_unused]] __shared__ float4 collected_ray_planes[BLOCK_SIZE];
     [[maybe_unused]] __shared__ float3 collected_normals[BLOCK_SIZE];
 
@@ -778,8 +778,8 @@ __global__ void __launch_bounds__(BLOCK_X* BLOCK_Y)
     // Gaussian is known from each pixel from the forward.
     const int last_contributor = inside ? n_contrib[pix_id] : 0;
 
-    float accum_rec[C] = {0};
-    float dL_dpixel[C];
+    float accum_rec[C ? C : 1] = {0};
+    float dL_dpixel[C ? C : 1];
     float dL_dfinalT;
     [[maybe_unused]] float accum_t_rec = 0;
     [[maybe_unused]] float dL_dpixel_t;
@@ -884,7 +884,7 @@ __global__ void __launch_bounds__(BLOCK_X* BLOCK_Y)
     uint32_t contributor = toDo;
 
     float last_alpha                      = 0;
-    float last_color[C]                   = {0};
+    float last_color[C ? C : 1]                   = {0};
     [[maybe_unused]] float last_t         = 0;
     [[maybe_unused]] float last_normal[3] = {0};
 
@@ -935,7 +935,7 @@ __global__ void __launch_bounds__(BLOCK_X* BLOCK_Y)
             if (!warp.any(valid))
                 continue;
 
-            float dL_dcolors_local[C]                    = {0};
+            float dL_dcolors_local[C ? C : 1]                    = {0};
             [[maybe_unused]] float3 dL_dnormals_local    = {0};
             [[maybe_unused]] float2 dL_dray_planes_local = {0};
             [[maybe_unused]] float dL_dtc_local          = 0.f;
@@ -1191,8 +1191,8 @@ void BACKWARD::render(
     float4* dL_dray_planes,
     float3* dL_dnormals,
     bool require_depth) {
-#define RENDER_CUDA_CALL(template_depth)                                    \
-    renderCUDA<NUM_CHANNELS, template_depth><<<grid, block>>>(              \
+#define RENDER_CUDA_CALL(channels, template_depth)                                    \
+    renderCUDA<channels, template_depth><<<grid, block>>>(              \
         ranges, point_list, W, H, bg_color, means2D, conic_opacity, colors, \
         depths, ray_planes, normals, alphas, normalmap, mdepth,             \
         normal_length, n_contrib, max_contributors, dL_dpixels,             \
@@ -1200,10 +1200,14 @@ void BACKWARD::render(
         focal_x, focal_y, dL_dmean2D, dL_dconic2D, dL_dcolors,              \
         dL_dray_planes, dL_dnormals)
 
-    if (require_depth)
-        RENDER_CUDA_CALL(true);
-    else
-        RENDER_CUDA_CALL(false);
+    if (dL_dpixels == nullptr) {
+        if (require_depth) RENDER_CUDA_CALL(0, true);
+        else RENDER_CUDA_CALL(0, false);
+    } else if (require_depth) {
+        RENDER_CUDA_CALL(NUM_CHANNELS, true);
+    } else {
+        RENDER_CUDA_CALL(NUM_CHANNELS, false);
+    }
 
 #undef RENDER_CUDA_CALL
 }

@@ -206,11 +206,11 @@ def compute_training_losses(
     保留旧管道的两种不同分母：normal consistency 的无效像素置零后按
     全图平均；外部 prior 按其有效像素平均。不能在重构中无意统一二者。
     """
-    image = render_pkg["render"]
-    zero = image.new_zeros(())
+    zero = (render_pkg["render"] if supervise_rgb else render_pkg["median_depth"]).new_zeros(())
     # 保留输入 dtype（可能为 uint8）；fused photometric loss 负责其解释。
     rgb = l1 = zero
     if supervise_rgb:
+        image = render_pkg["render"]
         target_image = camera.original_image.to(device=image.device)
         rgb, l1 = _photometric_rgb_loss(
             image, target_image, gaussians, camera.uid, opt.lambda_dssim

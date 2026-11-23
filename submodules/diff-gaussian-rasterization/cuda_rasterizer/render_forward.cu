@@ -371,7 +371,7 @@ __global__ void preprocessCUDA(
 
     // If colors have been precomputed, use them, otherwise convert
     // spherical harmonics coefficients to RGB color.
-    if (colors_precomp == nullptr) {
+    if (colors_precomp == nullptr && shs != nullptr) {
         glm::vec3 result = computeColorFromSHSG(idx, SHD, SHM, SGD, SGM, (glm::vec3*)orig_points, *cam_pos, shs, sg_axis, sg_sharpness, sg_color, clamped);
         rgb[idx * C + 0] = result.x;
         rgb[idx * C + 1] = result.y;
@@ -443,7 +443,7 @@ __global__ void __launch_bounds__(BLOCK_X* BLOCK_Y)
     // Allocate storage for batches of collectively fetched data.
     __shared__ int collected_id[BLOCK_SIZE];
     __shared__ float2 collected_xy[BLOCK_SIZE];
-    __shared__ float collected_feature[BLOCK_SIZE * CHANNELS];
+    __shared__ float collected_feature[CHANNELS ? BLOCK_SIZE * CHANNELS : 1];
     __shared__ float4 collected_conic_opacity[BLOCK_SIZE];
     [[maybe_unused]] __shared__ float4 collected_ray_planes[BLOCK_SIZE];
     [[maybe_unused]] __shared__ float3 collected_normals[BLOCK_SIZE];
@@ -452,7 +452,7 @@ __global__ void __launch_bounds__(BLOCK_X* BLOCK_Y)
     float T                            = 1.0f;
     uint32_t contributor               = 0;
     uint32_t last_contributor          = 0;
-    float C[CHANNELS]                  = {0};
+    float C[CHANNELS ? CHANNELS : 1]                  = {0};
     [[maybe_unused]] float mDepth      = 0;
     [[maybe_unused]] float Normal[3]   = {0};
     [[maybe_unused]] float last_depth  = 0;
@@ -829,8 +829,8 @@ void FORWARD::render(
     float* normal_length,
     bool require_depth,
     int depth_search_expansions) {
-#define RENDER_CUDA_CALL(template_depth)                                                \
-    renderCUDA<NUM_CHANNELS, template_depth, SPLIT, SPLIT_ITERATIONS><<<grid, block>>>( \
+#define RENDER_CUDA_CALL(channels, template_depth)                                                \
+    renderCUDA<channels, template_depth, SPLIT, SPLIT_ITERATIONS><<<grid, block>>>( \
         ranges, point_list, W, H, means2D, conic_opacity, colors,                       \
         ray_planes, normals, focal_x, focal_y,                                          \
         n_contrib, max_contributor, metric_map, get_flag, metricCount,                  \
@@ -838,10 +838,14 @@ void FORWARD::render(
         bg_color, out_color, out_alpha,                                                 \
         out_normal, out_mdepth, normal_length, depth_search_expansions)
 
-    if (require_depth)
-        RENDER_CUDA_CALL(true);
-    else
-        RENDER_CUDA_CALL(false);
+    if (out_color == nullptr) {
+        if (require_depth) RENDER_CUDA_CALL(0, true);
+        else RENDER_CUDA_CALL(0, false);
+    } else if (require_depth) {
+        RENDER_CUDA_CALL(NUM_CHANNELS, true);
+    } else {
+        RENDER_CUDA_CALL(NUM_CHANNELS, false);
+    }
 
 #undef RENDER_CUDA_CALL
 }

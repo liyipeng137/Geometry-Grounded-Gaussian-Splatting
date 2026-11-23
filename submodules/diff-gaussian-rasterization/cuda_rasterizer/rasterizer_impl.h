@@ -38,7 +38,7 @@ struct GeometryState {
     uint32_t* point_offsets;
     uint32_t* tiles_touched;
 
-    static GeometryState fromChunk(char*& chunk, size_t P);
+    static GeometryState fromChunk(char*& chunk, size_t P, bool with_color = true);
 };
 
 struct GeometryBwdState {
@@ -109,10 +109,10 @@ struct BinningState {
     static BinningState fromChunk(char*& chunk, size_t P);
 };
 
-template <typename T>
-size_t required(size_t P) {
+template <typename T, typename... Args>
+size_t required(size_t P, Args... args) {
     char* size = nullptr;
-    T::fromChunk(size, P);
+    T::fromChunk(size, P, args...);
     return ((size_t)size) + 128;
 }
 }; // namespace CudaRasterizer

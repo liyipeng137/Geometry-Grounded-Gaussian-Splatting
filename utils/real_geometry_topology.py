@@ -10,7 +10,6 @@ import torch
 import torch.nn.functional as F
 
 from utils.geometry_topology import (
-    PARAMETERS,
     apply_gaussian_transaction,
     make_seed_payload,
     real_filter_for_points,
@@ -148,7 +147,6 @@ class RealGeometryTopology:
         dev = model.get_xyz.device
         self.meta = {
             "birth": torch.zeros(len(model.get_xyz), dtype=torch.long, device=dev),
-            "frozen_dc": model._features_dc.detach().clone(),
         }
         self.counts = Counter()
         self.events = []
@@ -277,20 +275,22 @@ class RealGeometryTopology:
                 .cpu()
                 .numpy()
             )
-            rgb = cam.original_image_float()[:, v[fy, fx], u[fy, fx]].T.cpu().numpy()
             seeds = {
-                (cam.image_name, k): (pos, norm, h, col)
-                for k, pos, norm, h, col in zip(key, xyz, normal, spacing, rgb)
+                (cam.image_name, k): (pos, norm, h)
+                for k, pos, norm, h in zip(key, xyz, normal, spacing)
             }
         return score, in_front, seeds
 
     def seed_rows(self, seeds, cap):
-        empty = {k: getattr(self.model, a)[:0].detach() for k, a in PARAMETERS.items()}
+        empty = {
+            k: getattr(self.model, a)[:0].detach()
+            for k, a in self.model.point_parameters.items()
+        }
         if not seeds or cap <= 0:
             return empty, self.model.filter_3D[:0]
-        xyz, norm, h, rgb = (np.asarray(x) for x in zip(*seeds))
+        xyz, norm, h = (np.asarray(x) for x in zip(*seeds))
         ids = spacing_deduplicate(xyz, h, 4 * cap)
-        xyz, norm, h, rgb = (x[ids] for x in (xyz, norm, h, rgb))
+        xyz, norm, h = (x[ids] for x in (xyz, norm, h))
         model = self.model
         tree = cKDTree(model.get_xyz.detach().cpu().numpy())
         _, neighbours = tree.query(xyz, k=min(4, len(model.get_xyz)), workers=1)
@@ -305,7 +305,7 @@ class RealGeometryTopology:
         ).square().sum(-1) < 1.5**2
         keep = ~(nearby & (model.get_opacity_with_3D_filter[ix, 0] > 0.08)).any(1)
         filt, seen = real_filter_for_points(pos, self.cams)
-        payload, ok = make_seed_payload(model, pos, norm, h, filt, rgb)
+        payload, ok = make_seed_payload(model, pos, norm, h, filt)
         take = torch.where(keep & seen & ok)[0][:cap]
         return {k: v[take] for k, v in payload.items()}, filt[take]
 
@@ -422,7 +422,10 @@ class RealGeometryTopology:
         seed_count = len(filt)
         drop[parents] = True
         owners = parents.repeat(2)
-        children = {k: getattr(model, a)[owners].clone() for k, a in PARAMETERS.items()}
+        children = {
+            k: getattr(model, a)[owners].clone()
+            for k, a in self.model.point_parameters.items()
+        }
         if len(parents):
             axes = rotations(model._rotation[parents])
             scales = model.get_scaling[parents]
@@ -438,12 +441,14 @@ class RealGeometryTopology:
                 dim.repeat(2)[:, None],
                 torch.full_like(owners[:, None], math.log(0.65), dtype=scales.dtype),
             )
-        combined = {k: torch.cat((children[k], additions[k])) for k in PARAMETERS}
+        combined = {
+            k: torch.cat((children[k], additions[k]))
+            for k in self.model.point_parameters
+        }
         extra_meta = {
             "birth": torch.full(
                 (len(combined["xyz"]),), iteration, device=dev, dtype=torch.long
             ),
-            "frozen_dc": combined["f_dc"].clone(),
         }
         self.meta = apply_gaussian_transaction(
             model,
