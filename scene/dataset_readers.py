@@ -222,7 +222,7 @@ def _write_record(path, value):
 
 def readColmapSceneInfo(path, images, eval, llffhold=8, use_rgbd_init_ply=True,
                        train_exclude_images="", init_cache_dir=None, depth_prior_dir="depth", init_ply="",
-                       init_mesh="", init_seed=0, initialization_record=None, load_initialization=True, init_num_points=200000, colmap_dir="sparse/0"):
+                       init_mesh="", init_seed=0, initialization_record=None, load_initialization=True, init_num_points=250000, colmap_dir="sparse/0"):
     """默认 RGBD；mesh/PLY 只替换初始 XYZ/RGB，续训复用冻结的点云。
 
     ``depth_prior_dir`` 与训练监督使用同一配置，支持相对数据集或绝对目录。
