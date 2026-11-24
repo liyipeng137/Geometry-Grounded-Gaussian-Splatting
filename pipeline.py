@@ -10,6 +10,8 @@ import subprocess
 import sys
 import uuid
 
+from arguments import REAL_GEOMETRY_DEPTH_LOSS_MODES
+
 ROOT = Path(__file__).resolve().parent
 
 
@@ -19,6 +21,7 @@ def run(
     *,
     init_ply=None,
     iterations=20000,
+    real_depth_loss_mode="absolute",
     virtual_geometry_config=None,
 ):
     if virtual_geometry_config is not None:
@@ -29,6 +32,8 @@ def run(
         )
     if iterations < 1:
         raise ValueError("--iterations must be positive")
+    if real_depth_loss_mode not in REAL_GEOMETRY_DEPTH_LOSS_MODES:
+        raise ValueError(f"Unknown real-view depth loss: {real_depth_loss_mode!r}")
     dataset = Path(dataset).expanduser().resolve(strict=True)
     if output is None:
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -57,6 +62,8 @@ def run(
         str(output),
         "--iterations",
         str(iterations),
+        "--real_depth_loss_mode",
+        real_depth_loss_mode,
     ]
     if init_ply is not None:
         train.extend(
@@ -89,6 +96,7 @@ def run(
         "status": "complete",
         "dataset": str(dataset),
         "iterations": iterations,
+        "real_depth_loss_mode": real_depth_loss_mode,
         "densification_schedule": "accelerated",
         "virtual_training_cameras": 0,
         "normal_prior": json.loads((output / "depth_normal_prior.json").read_text()),
@@ -117,6 +125,13 @@ def main():
         help="Existing aligned XYZ/RGB PLY. Otherwise fuse training RGB-D with TSDF.",
     )
     parser.add_argument("--iterations", type=int, default=20000)
+    parser.add_argument(
+        "--real-depth-loss-mode",
+        "--real_depth_loss_mode",
+        choices=REAL_GEOMETRY_DEPTH_LOSS_MODES,
+        default="absolute",
+        help="Depth supervision for real training views (default: absolute camera-Z L1).",
+    )
     parser.add_argument(
         "--virtual-geometry-config",
         "--virtual_geometry_config",

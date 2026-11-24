@@ -57,7 +57,17 @@ PYTHONPATH="$PWD/build/geometry_rasterizer/lib:${PYTHONPATH:-}" \
 | 3,100～14,800 | 100 步 | 59 |
 | 15,000～18,000 | 200 步 | 8 |
 
-两次持续检查通过后执行长轴 split 或双真实视角 seed，共 73 次增长决策。剪枝沿用原来的 35 次确认，最后一次在 15,000 步。18,001～20,000 步固定点集。真实深度 L1、外部法线项的权重日程、灰度 NCC、位置学习率及 opacity 策略沿用已验证的配方；法线项的目标来自输入深度。实际日程和增删记录可查看 `geometry_config.json`、`geometry_stats.json`。
+两次持续检查通过后执行长轴 split 或双真实视角 seed，共 73 次增长决策。剪枝沿用原来的 35 次确认，最后一次在 15,000 步。18,001～20,000 步固定点集。法线项的目标来自输入深度。实际日程和增删记录可查看 `geometry_config.json`、`geometry_stats.json`。
+
+## 真实视角深度损失
+
+默认 `--real-depth-loss-mode absolute` 在有效 prior 像素上监督渲染 camera-Z 的绝对 L1。对已经按帧做过正尺度对齐的单目深度，可以显式启用已有的 AffineGS 风格相对监督。
+
+```bash
+python pipeline.py --dataset /workspace/dataset/scene --real-depth-loss-mode affinegs
+```
+
+`affinegs` 将单帧 prior 转为逆深度，用当前渲染范围及引导滤波估计局部尺度和偏移。它在渲染和 prior 都有效的区域计算重新对齐后的深度 L1，并匹配逆深度梯度的幅值和方向。拟合出的目标停止梯度，损失计算最长边最多 960 像素。默认深度总权重为 0.4，梯度项对应的权重为 0.1。TSDF、法线生成、覆盖损失和拓扑审计继续读取原始对齐深度。运行采用的模式记录在 `geometry_config.json` 的 `args.real_depth_loss_mode` 和 `pipeline_summary.json` 中。
 
 ## 虚拟视角接入位置
 

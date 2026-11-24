@@ -9,12 +9,14 @@ import pytest
 import torch
 
 import pipeline
-from arguments import ModelParams
+from arguments import ModelParams, OptimizationParams
+from utils.affinegs_depth import affinegs_depth_loss
 from utils.depth_normal_prior import (
     NORMAL_DIR,
     depth_normal_preparation,
     normals_from_depth,
 )
+from utils.training_losses import compute_training_losses, loss_schedule
 
 
 def test_calibrated_normal_orientation_scale_and_discontinuity():
@@ -115,7 +117,13 @@ def test_trainer_fixed_normals_do_not_change_other_model_parsers():
     )
 
 
-def test_real_pipeline_stage_order_and_reserved_virtual_input(tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    "options,mode",
+    [({}, "absolute"), ({"real_depth_loss_mode": "affinegs"}, "affinegs")],
+)
+def test_real_pipeline_stage_order_and_reserved_virtual_input(
+    tmp_path, monkeypatch, options, mode
+):
     dataset = tmp_path / "data"
     dataset.mkdir()
     output = tmp_path / "out"
@@ -129,6 +137,7 @@ def test_real_pipeline_stage_order_and_reserved_virtual_input(tmp_path, monkeypa
         if len(calls) == 1:
             assert command[command.index("--init_ply") + 1] == str(initial)
             assert command[command.index("-s") + 1] == str(dataset)
+            assert command[command.index("--real_depth_loss_mode") + 1] == mode
             model = output / "point_cloud/iteration_20000/point_cloud.ply"
             model.parent.mkdir(parents=True)
             model.write_bytes(b"model")
@@ -141,13 +150,49 @@ def test_real_pipeline_stage_order_and_reserved_virtual_input(tmp_path, monkeypa
     with pytest.raises(NotImplementedError, match="Virtual supervision"):
         pipeline.run(dataset, output, virtual_geometry_config=tmp_path / "teacher.json")
     assert not calls and not output.exists()
-    mesh = pipeline.run(dataset, output, init_ply=initial)
+    mesh = pipeline.run(dataset, output, init_ply=initial, **options)
     assert [Path(c[2]).name for c in calls] == [
         "train_real_geometry.py",
         "mesh_extract_mini.py",
     ]
-    assert json.loads((output / "pipeline_summary.json").read_text())["mesh"] == str(
-        mesh
-    )
+    summary = json.loads((output / "pipeline_summary.json").read_text())
+    assert summary["mesh"] == str(mesh) and summary["real_depth_loss_mode"] == mode
     with pytest.raises(FileExistsError):
         pipeline.run(dataset, output)
+
+
+def test_color_free_training_uses_the_selected_weighted_depth_loss():
+    parser = argparse.ArgumentParser()
+    group = OptimizationParams(parser)
+    y, x = torch.meshgrid(
+        torch.linspace(0, 1, 17), torch.linspace(0, 1, 23), indexing="ij"
+    )
+    prior = (1.5 + x + 0.2 * y)[None]
+    z = (prior * 1.7 + 0.15 * torch.sin(x * 9)[None]).requires_grad_()
+    camera = SimpleNamespace(normal_prior=None, depth_prior=prior, gt_mask=None)
+    for mode in ("absolute", "affinegs"):
+        opt = group.extract(
+            parser.parse_args(
+                ["--real_depth_loss_mode", mode, "--depth_prior_from_iter", "1"]
+            )
+        )
+        schedule = loss_schedule(camera, opt, 1)
+        terms = compute_training_losses(
+            {"median_depth": z},
+            camera,
+            SimpleNamespace(),
+            opt,
+            schedule,
+            supervise_rgb=False,
+        )
+        expected = (
+            affinegs_depth_loss(z, prior)
+            if mode == "affinegs"
+            else (z - prior).abs().mean()
+        )
+        expected = expected * schedule.depth_prior_weight
+        torch.testing.assert_close(terms.total, expected)
+        (grad,) = torch.autograd.grad(terms.total, z)
+        (wanted,) = torch.autograd.grad(expected, z)
+        torch.testing.assert_close(grad, wanted)
+        assert grad.abs().sum() > 0

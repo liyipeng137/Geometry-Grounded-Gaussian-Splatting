@@ -13,7 +13,12 @@ from pathlib import Path
 import torch
 from tqdm import tqdm
 
-from arguments import ModelParams, OptimizationParams, PipelineParams
+from arguments import (
+    REAL_GEOMETRY_DEPTH_LOSS_MODES,
+    ModelParams,
+    OptimizationParams,
+    PipelineParams,
+)
 from gaussian_renderer import render
 from scene import Scene
 from scene.geometry_gaussians import GeometryGaussians
@@ -102,6 +107,8 @@ def main():
         optim_args.extract(args),
         pipe_args.extract(args),
     )
+    if opt.real_depth_loss_mode not in REAL_GEOMETRY_DEPTH_LOSS_MODES:
+        parser.error(f"--real_depth_loss_mode must be one of {REAL_GEOMETRY_DEPTH_LOSS_MODES}")
     if (
         not args.model_path
         or args.init_mesh
@@ -112,7 +119,6 @@ def main():
         or args.sg_degree != 0
         or args.disable_filter3D
         or args.frame_gpu_budget < 2
-        or args.real_depth_loss_mode != "absolute"
         or not math.isfinite(args.coverage_weight)
         or args.coverage_weight < 0
         or min(args.audit_from, args.audit_interval, args.audit_views) < 1

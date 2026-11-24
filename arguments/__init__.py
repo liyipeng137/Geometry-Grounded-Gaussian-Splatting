@@ -14,6 +14,9 @@ import sys
 import os
 
 
+REAL_GEOMETRY_DEPTH_LOSS_MODES = ("absolute", "affinegs")
+
+
 class GroupParams:
     pass
 
