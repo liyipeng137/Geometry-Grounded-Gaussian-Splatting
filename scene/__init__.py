@@ -30,8 +30,7 @@ class Scene:
     gaussians: GaussianModel
 
     def __init__(self, args: ModelParams, gaussians: GaussianModel, load_iteration=None, shuffle=True, resolution_scales=[1.0],
-                 *, initialization_seed=0, initialization_record=None, resolved_init_ply=None,
-                 prepare_camera_priors=None):
+                 *, initialization_seed=0, initialization_record=None, resolved_init_ply=None):
         """b
         :param path: Path to colmap scene main folder.
         """
@@ -65,6 +64,8 @@ class Scene:
                 init_cache_dir=self.model_path,
                 # RGBD 初始化与训练监督共用深度来源，避免各自读取不同目录。
                 depth_prior_dir=getattr(args, "depth_prior_dir", "depth"),
+                depth_prior_format=getattr(args, "depth_prior_format", "npy"),
+                depth_prior_scale=getattr(args, "depth_prior_scale", 1000.0),
                 init_ply=resolved_init_ply if resolved_init_ply is not None else getattr(args, "init_ply", ""),
                 init_mesh=getattr(args, "init_mesh", ""),
                 init_seed=initialization_seed,
@@ -72,6 +73,8 @@ class Scene:
                 load_initialization=self.loaded_iter is None,
                 init_num_points=getattr(args, "init_num_points", 200000),
                 colmap_dir=getattr(args, "colmap_dir", "sparse/0"),
+                merge_sparse_init=getattr(args, "merge_sparse_init", False),
+                geometry_only=getattr(self.gaussians, "geometry_only", False),
             )
         elif os.path.exists(os.path.join(args.source_path, "transforms.json")):
             print("Found transforms_train.json file, assuming Blender data set!")
@@ -96,9 +99,6 @@ class Scene:
         # if shuffle:
         #     random.shuffle(scene_info.train_cameras)  # Multi-res consistent random shuffling
         #     random.shuffle(scene_info.test_cameras)  # Multi-res consistent random shuffling
-
-        if prepare_camera_priors is not None:
-            self.prior_preparation = prepare_camera_priors(scene_info.train_cameras + scene_info.test_cameras)
 
         self.cameras_extent = max(scene_info.nerf_normalization["radius"], 1e-6)
 

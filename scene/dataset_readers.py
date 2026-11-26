@@ -220,13 +220,42 @@ def _write_record(path, value):
             temporary.unlink(missing_ok=True)
 
 
+def _prepare_real_geometry_input(run, model, train, cam_intrinsics, path, depth_root,
+                                 init_num_points, init_ply, merge_sparse_init):
+    """Return the run's initial XYZ/RGB: the given PLY, or TSDF points plus in-range sparse points."""
+    if init_ply:
+        ply = Path(init_ply).expanduser().resolve(strict=True)
+        info = {"kind": "external_ply", "source_path": str(ply)}
+    else:
+        from utils.sparse_initialization import merge_tsdf_sparse_ply, sparse_points_path
+
+        sparse = sparse_points_path(model) if merge_sparse_init else None
+        ply = run.resolve() / "input.ply"
+        tsdf = ply.with_name("tsdf_init.ply") if sparse is not None else ply
+        generate_ply_from_rgbd(train, num_points=init_num_points, ply_path=str(tsdf), cam_intrinsics=cam_intrinsics,
+                               source_path=path, pixel_center_convention="colmap_half_integer",
+                               depth_prior_dir=str(depth_root))
+        info = {"kind": "train_only_rgbd"}
+        if sparse is not None:
+            centers = [-camera.R @ camera.T for camera in train]
+            stats = merge_tsdf_sparse_ply(tsdf, sparse, centers, ply)
+            info = {"kind": "tsdf_sparse",
+                    "sparse_merge": {**stats, "tsdf_ply": str(tsdf), "sparse_model": str(sparse.resolve())}}
+            print(f"TSDF + sparse initialization: {stats['tsdf_points']} TSDF + {stats['sparse_kept']} sparse "
+                  f"= {stats['merged_points']} points ({stats['sparse_clipped']} sparse clipped)")
+    pcd = fetchOpen3DPly(str(ply))
+    return pcd, {**info, "ply_path": str(ply), "point_count": len(pcd.points)}
+
+
 def readColmapSceneInfo(path, images, eval, llffhold=8, use_rgbd_init_ply=True,
                        train_exclude_images="", init_cache_dir=None, depth_prior_dir="depth", init_ply="",
-                       init_mesh="", init_seed=0, initialization_record=None, load_initialization=True, init_num_points=250000, colmap_dir="sparse/0"):
+                       init_mesh="", init_seed=0, initialization_record=None, load_initialization=True, init_num_points=250000, colmap_dir="sparse/0",
+                       merge_sparse_init=False, geometry_only=False, depth_prior_format="npy", depth_prior_scale=1000.0):
     """默认 RGBD；mesh/PLY 只替换初始 XYZ/RGB，续训复用冻结的点云。
 
     ``depth_prior_dir`` 与训练监督使用同一配置，支持相对数据集或绝对目录。
-    初始化、数据指纹和融合后的重新校验均读取这个目录；不回退到稀疏点云。
+    ``geometry_only``（pipeline.py 主流程）只补齐法线并写本次初值，不做数据指纹和证明；
+    其余入口沿用外观训练 checkpoint 的数据指纹。
     外部点云不改变相机、priors、Gaussian 参数初始化或后续 filter/拓扑策略。
     """
     if load_initialization and initialization_record is None and init_ply and init_mesh:
@@ -257,6 +286,22 @@ def readColmapSceneInfo(path, images, eval, llffhold=8, use_rgbd_init_ply=True,
         # render/load_iteration 只需要相机；不访问初始 mesh/PLY/depth 或改写旧证明。
         return SceneInfo(point_cloud=None, train_cameras=train, test_cameras=test,
                          nerf_normalization=getNerfppNorm(train), ply_path=None)
+    if geometry_only:
+        from utils.depth_normal_prior import prepare_depth_normal_priors
+
+        cache = Path(init_cache_dir)
+        cache.mkdir(parents=True, exist_ok=True)
+        normals = prepare_depth_normal_priors(path, depth_root, infos, depth_prior_format, depth_prior_scale)
+        pcd, initial = _prepare_real_geometry_input(cache, model, train, cam_intrinsics, path, depth_root,
+                                                   init_num_points, init_ply, merge_sparse_init)
+        record = {"dataset_root": str(Path(path).resolve()),
+                  "train_image_names": [c.colmap_image_name for c in train],
+                  "test_image_names": [c.colmap_image_name for c in test],
+                  "initialization": initial, "normal_prior": normals}
+        (cache / "camera_split.json").write_text(json.dumps(record, indent=2) + "\n")
+        return SceneInfo(point_cloud=pcd, train_cameras=train, test_cameras=test,
+                         nerf_normalization=getNerfppNorm(train), ply_path=initial["ply_path"])
+
     calibrations = {}
     assets = {}
     for camera in infos:
@@ -334,7 +379,7 @@ def readColmapSceneInfo(path, images, eval, llffhold=8, use_rgbd_init_ply=True,
                     "train_assets": train_assets,
                     "calibrations": {name: calibrations[name] for name in train_assets},
                     "parameters": {"num_points": init_num_points, "voxel_length": 0.02, "sdf_trunc": 0.06, "depth_min": 0.05, "depth_max": 50.0,
-                                   "largest_mesh_components": 3, "component_rank": "triangle_count",
+                                   "largest_mesh_components": 1, "component_rank": "triangle_count",
                                    "point_sampling": "final_filtered_mesh_vertices"}}
         init_fingerprint = calibration_fingerprint(identity)
         ply_path = cache / f"rgbd_init_train_{init_fingerprint[:16]}.ply"

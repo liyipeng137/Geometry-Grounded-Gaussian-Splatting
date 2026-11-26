@@ -58,7 +58,7 @@ def test_keeps_two_largest_by_triangle_count_not_area():
     # 最少面的组件反而具有最大的面积，防止实现误按面积排序。
     vertices = np.asarray(mesh.vertices)
     vertices[:4] *= 100
-    result = load_functions()["_keep_largest_components"](mesh)
+    result = load_functions()["_keep_largest_components"](mesh, keep_count=2)
     assert result is mesh
     assert component_ids(mesh) == {1, 4}
     assert sorted(mesh.cluster_connected_triangles()[1], reverse=True) == [7, 5]
@@ -74,7 +74,7 @@ def test_at_most_two_components_keep_all_and_preserve_vertex_colors(counts):
     mesh = disconnected_fans(counts, orphan=True)
     expected_vertices = np.asarray(mesh.vertices)[:-1].copy()
     expected_colors = np.asarray(mesh.vertex_colors)[:-1].copy()
-    load_functions()["_keep_largest_components"](mesh)
+    load_functions()["_keep_largest_components"](mesh, keep_count=2)
     assert len(mesh.triangles) == sum(counts)
     np.testing.assert_array_equal(np.asarray(mesh.vertices), expected_vertices)
     np.testing.assert_array_equal(np.asarray(mesh.vertex_colors), expected_colors)
@@ -83,7 +83,7 @@ def test_at_most_two_components_keep_all_and_preserve_vertex_colors(counts):
 def test_equal_sizes_keep_first_two_components_stably():
     for _ in range(2):
         mesh = disconnected_fans([2, 2, 2, 2])
-        load_functions()["_keep_largest_components"](mesh)
+        load_functions()["_keep_largest_components"](mesh, keep_count=2)
         assert component_ids(mesh) == {0, 1}
         assert len(mesh.triangles) == 4
 
@@ -100,7 +100,7 @@ def test_fuses_all_frames_then_filters_and_samples_retained_vertices(tmp_path, b
     mesh = disconnected_fans([2, 7, 4, 1, 5], orphan=True)
     original_vertices = np.asarray(mesh.vertices).copy()
     original_colors = np.asarray(mesh.vertex_colors).copy()
-    retained = np.isin(np.rint(original_colors[:, 0] * 5).astype(int), [1, 4])
+    retained = np.rint(original_colors[:, 0] * 5).astype(int) == 1
     expected_vertices, expected_colors = original_vertices[retained], original_colors[retained]
 
     class Volume:

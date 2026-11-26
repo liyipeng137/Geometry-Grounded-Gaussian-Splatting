@@ -73,14 +73,15 @@ def external_reader(tmp_path):
         getNerfppNorm=lambda selected: {"radius": 2.5, "real_camera_count": len(selected)},
         SceneInfo=namedtuple("SceneInfo", "point_cloud train_cameras test_cameras nerf_normalization ply_path"),
     )
-    load_functions("scene/dataset_readers.py", {"_sha256_file", "_write_record", "readColmapSceneInfo"}, namespace)
+    load_functions("scene/dataset_readers.py", {"_sha256_file", "_write_record", "_prepare_real_geometry_input", "readColmapSceneInfo"}, namespace)
     load_functions("utils/training_io.py", {"require_baseline_checkpoint", "require_joint_checkpoint"}, namespace)
 
-    def read(output_name="first_run", init_ply=None, excluded=""):
+    def read(output_name="first_run", init_ply=None, excluded="", **options):
         output = tmp_path / output_name
         result = namespace["readColmapSceneInfo"](
             str(dataset), "images", False, init_cache_dir=str(output),
             init_ply=str(source if init_ply is None else init_ply), train_exclude_images=excluded,
+            **options,
         )
         return result, json.loads((output / "camera_split.json").read_text()), output
 
@@ -102,6 +103,23 @@ def test_external_init_skips_tsdf_and_preserves_real_cameras(external_reader):
     assert proof["initialization"]["ply_sha256"] == hashlib.sha256(f.source.read_bytes()).hexdigest()
     assert proof["dataset_content_fingerprint"] and proof["calibration_fingerprint"]
     f.namespace["validate_initialization_proof"](proof)
+
+
+def test_geometry_external_input_skips_fusion_sparse_and_proofs(external_reader):
+    f = external_reader
+    for cam in f.cameras:
+        png = f.dataset / "depth_normal_prior" / Path(cam.colmap_image_name).with_suffix(".png")
+        png.parent.mkdir(exist_ok=True, parents=True)
+        png.touch()
+    def no_hash(*args, **kwargs):
+        pytest.fail("Fresh geometry initialization unexpectedly hashed an input")
+    f.namespace.update(_sha256_file=no_hash, calibration_fingerprint=no_hash)
+    result, record, _ = f.read(geometry_only=True, merge_sparse_init=True)
+    assert result.point_cloud is f.cloud and result.ply_path == str(f.source.resolve())
+    assert record["initialization"]["source_path"] == str(f.source.resolve())
+    assert record["initialization"]["kind"] == "external_ply"
+    assert "ply_sha256" not in record["initialization"]
+    assert record["normal_prior"]["reused"] == len(f.cameras)
 
 
 @pytest.mark.parametrize("invalid", ["empty", "xyz_rank", "xyz_width", "xyz_nan", "xyz_inf",

@@ -18,13 +18,14 @@ from arguments import (
     ModelParams,
     OptimizationParams,
     PipelineParams,
+    add_real_geometry_sparse_init_argument,
 )
 from gaussian_renderer import render
 from scene import Scene
 from scene.geometry_gaussians import GeometryGaussians
 from scene.cameras import FramePayloadCache
 from train import validate_training_priors
-from utils.depth_normal_prior import NORMAL_DIR, depth_normal_preparation
+from utils.depth_normal_prior import NORMAL_DIR
 from utils.general_utils import safe_state
 from utils.loss_utils import PatchMatch
 from utils.real_geometry_topology import RealGeometryTopology, TopologyConfig
@@ -91,6 +92,7 @@ def main():
         depth_prior_ramp_iters=0,
     )
     parser.add_argument("--training_seed", type=int, default=0)
+    add_real_geometry_sparse_init_argument(parser)
     parser.add_argument("--audit_from", type=int, default=800)
     parser.add_argument("--audit_interval", type=int, default=200)
     parser.add_argument("--audit_views", type=int, default=12)
@@ -124,9 +126,10 @@ def main():
         or min(args.audit_from, args.audit_interval, args.audit_views) < 1
     ):
         parser.error(
-            "Use a new -m, -s, TSDF or --init_ply, positive iteration/audit settings, real filtered Gaussians, appearance 0, SG 0 and a frame cache >=2."
+            "Use a new -m, -s, a generated initialization or --init_ply, positive iteration/audit settings, real filtered Gaussians, appearance 0, SG 0 and a frame cache >=2."
         )
     dataset.gray_observations = True
+    dataset.merge_sparse_init = args.merge_sparse_init
     out = Path(dataset.model_path)
     out.mkdir(parents=True, exist_ok=False)
     (out / "cfg_args").write_text(str(argparse.Namespace(**vars(dataset))))
@@ -158,12 +161,7 @@ def main():
     )
     safe_state(False, seed=args.training_seed)
     model = GeometryGaussians()
-    with depth_normal_preparation(dataset) as prepare_priors:
-        scene = Scene(
-            dataset, model, initialization_seed=args.training_seed,
-            prepare_camera_priors=prepare_priors,
-        )
-    write_json(out / "depth_normal_prior.json", scene.prior_preparation)
+    scene = Scene(dataset, model, initialization_seed=args.training_seed)
     cameras = scene.getTrainCameras()
     validate_training_priors(cameras)
     model.training_setup(opt)
@@ -192,7 +190,7 @@ def main():
     )
     rng, stack = random.Random(args.training_seed), []
     ncc_steps = torch.zeros((), device="cuda", dtype=torch.long)
-    probes, visits = [], Counter()
+    visits = Counter()
     checkpoints = sorted(
         {i for i in (7000, 15000, opt.iterations) if i <= opt.iterations}
     )
@@ -240,28 +238,6 @@ def main():
             if not torch.isfinite(total).all():
                 raise FloatingPointError(f"Nonfinite objective at {it}")
             ncc_steps += (terms.ncc.detach().abs().sum() > 0).long()
-            if (
-                sched.reg_enabled
-                and terms.ncc.requires_grad
-                and (it == opt.regularization_from_iter or it % 500 == 0)
-            ):
-                dg, ng = torch.autograd.grad(
-                    sched.multi_view_ncc_weight * terms.ncc.sum(),
-                    (buf["median_depth"], buf["normal"]),
-                    retain_graph=True,
-                    allow_unused=True,
-                )
-                probes.append(
-                    {
-                        "step": it,
-                        "depth_grad_l1": float(dg.abs().sum())
-                        if dg is not None
-                        else 0.0,
-                        "normal_grad_l1": float(ng.abs().sum())
-                        if ng is not None
-                        else 0.0,
-                    }
-                )
             total.backward()
             if it == 1 or it % 200 == 0 or it == opt.iterations:
                 gradients = {
@@ -325,7 +301,6 @@ def main():
             "appearance_fields": [],
             "checkpoints": checkpoints,
             "ncc_nonzero_steps": int(ncc_steps),
-            "ncc_gradient_probes": probes,
             "observed_cameras": len(visits),
             "min_visits": min(visits.values()),
             "max_visits": max(visits.values()),

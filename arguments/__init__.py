@@ -17,6 +17,18 @@ import os
 REAL_GEOMETRY_DEPTH_LOSS_MODES = ("absolute", "affinegs")
 
 
+def add_real_geometry_sparse_init_argument(parser: ArgumentParser):
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument(
+        "--merge-sparse-init", "--merge_sparse_init", action="store_true", default=True,
+        help="Append in-range COLMAP sparse points to the TSDF initialization (default).",
+    )
+    group.add_argument(
+        "--no-merge-sparse-init", "--no_merge_sparse_init", dest="merge_sparse_init",
+        action="store_false", help="Use only TSDF points for the generated initialization.",
+    )
+
+
 class GroupParams:
     pass
 

@@ -10,7 +10,7 @@ import subprocess
 import sys
 import uuid
 
-from arguments import REAL_GEOMETRY_DEPTH_LOSS_MODES
+from arguments import REAL_GEOMETRY_DEPTH_LOSS_MODES, add_real_geometry_sparse_init_argument
 
 ROOT = Path(__file__).resolve().parent
 
@@ -20,6 +20,7 @@ def run(
     output=None,
     *,
     init_ply=None,
+    merge_sparse_init=True,
     iterations=20000,
     real_depth_loss_mode="absolute",
     virtual_geometry_config=None,
@@ -30,10 +31,6 @@ def run(
         raise NotImplementedError(
             "Virtual supervision is reserved for a later validation of this geometry pipeline."
         )
-    if iterations < 1:
-        raise ValueError("--iterations must be positive")
-    if real_depth_loss_mode not in REAL_GEOMETRY_DEPTH_LOSS_MODES:
-        raise ValueError(f"Unknown real-view depth loss: {real_depth_loss_mode!r}")
     dataset = Path(dataset).expanduser().resolve(strict=True)
     if output is None:
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -64,6 +61,7 @@ def run(
         str(iterations),
         "--real_depth_loss_mode",
         real_depth_loss_mode,
+        "--merge-sparse-init" if merge_sparse_init else "--no-merge-sparse-init",
     ]
     if init_ply is not None:
         train.extend(
@@ -89,23 +87,21 @@ def run(
     )
     model = output / "point_cloud" / f"iteration_{iterations}" / "point_cloud.ply"
     mesh = output / "recon_bounded_post_smooth.ply"
-    for path in (model, mesh):
-        if not path.is_file() or path.stat().st_size == 0:
-            raise RuntimeError(f"Missing reconstruction output: {path}")
+    split = json.loads((output / "camera_split.json").read_text())
     receipt = {
         "status": "complete",
         "dataset": str(dataset),
         "iterations": iterations,
         "real_depth_loss_mode": real_depth_loss_mode,
+        "merge_sparse_init": merge_sparse_init,
         "densification_schedule": "accelerated",
         "virtual_training_cameras": 0,
-        "normal_prior": json.loads((output / "depth_normal_prior.json").read_text()),
+        "normal_prior": split["normal_prior"],
+        "initialization": split["initialization"],
         "model": str(model),
         "mesh": str(mesh),
     }
-    temporary = output / "pipeline_summary.json.tmp"
-    temporary.write_text(json.dumps(receipt, indent=2) + "\n")
-    temporary.replace(output / "pipeline_summary.json")
+    (output / "pipeline_summary.json").write_text(json.dumps(receipt, indent=2) + "\n")
     print(f"Final mesh: {mesh}", flush=True)
     return mesh
 
@@ -122,8 +118,9 @@ def main():
         "--init-ply",
         "--init_ply",
         type=Path,
-        help="Existing aligned XYZ/RGB PLY. Otherwise fuse training RGB-D with TSDF.",
+        help="Use this aligned XYZ/RGB PLY in place of the generated initialization.",
     )
+    add_real_geometry_sparse_init_argument(parser)
     parser.add_argument("--iterations", type=int, default=20000)
     parser.add_argument(
         "--real-depth-loss-mode",

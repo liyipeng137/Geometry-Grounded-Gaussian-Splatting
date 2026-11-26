@@ -521,8 +521,6 @@ def marching_tetrahedra_with_binary_search_bounded(
     #     cells = cells[valid_cells_mask]
     #     print(f"Cells after boundary filtering: {cells.shape[0]}")
     
-    torch.save(cells, os.path.join(model_path, "cells_bounded.pt"))
-
     sdf, valid = evaluage_alpha_cull(
         points_filtered, views, gaussians, pipeline, kernel_size,
         alpha_threshold=alpha_threshold,

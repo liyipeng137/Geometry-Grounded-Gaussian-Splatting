@@ -21,11 +21,22 @@ bash scripts/build_geometry_rasterizer.sh build/geometry_rasterizer
 ```text
 DATASET/
 ├── images/
-├── sparse/0/             # 已去畸变的 COLMAP PINHOLE 或 SIMPLE_PINHOLE，相机及位姿
-└── depth/                # 与 image.name 对应的原分辨率 .npy，float camera-Z
+├── sparse/0/             # 已去畸变的 COLMAP PINHOLE 或 SIMPLE_PINHOLE，相机、位姿及 points3D
+├── depth/                # 与 image.name 对应的原分辨率 .npy，float camera-Z
+└── depth_normal_prior/   # 可选；缺失的帧在训练前由深度生成相机空间法线 .png，保留相对子目录
 ```
 
-首次运行用训练 RGB 和深度做 TSDF 初始化，默认最多采样 250,000 个点。已有同坐标系的带色 XYZ/RGB 初始点云可以直接复用。为一次运行指定输出时使用新目录。
+默认初始化由 TSDF 采样点和 COLMAP 稀疏点组成。先融合训练 RGB-D，保留三角面数最多的 TSDF 连通块，从其顶点中采样最多 250,000 个点。对每个 TSDF 采样点，计算它到最近训练相机中心的欧氏距离，取所有距离中的最大值作为裁切半径。所有到最近训练相机的距离小于等于该半径的稀疏点都会按原始 XYZ/RGB 追加，包括与 TSDF 重合的点。250,000 是 TSDF 部分的上限，合并后的初始点数可以更多。
+
+`pipeline.py` 和直接调用的 `train_real_geometry.py` 都默认启用 `--merge-sparse-init`。自动合并读取 COLMAP 的 `points3D.bin` 或 `points3D.txt`。如果文件中的点数为零，初值就是全部 TSDF 采样点。若只有相机和位姿文件，或需要复现仅用 TSDF 的基线，指定 `--no-merge-sparse-init`。
+
+```bash
+python pipeline.py --dataset /workspace/dataset/scene --no-merge-sparse-init
+python train_real_geometry.py -s /workspace/dataset/scene \
+  -m /workspace/results/scene_tsdf_only --no-merge-sparse-init
+```
+
+已有同坐标系的带色 XYZ/RGB 初始点云可以直接复用。显式 `--init-ply`（训练器使用 `--init_ply`）优先于自动初始化，文件中的点就是本次的完整初值。为一次运行指定输出时使用新目录。
 
 ```bash
 python pipeline.py --dataset /workspace/dataset/scene \
@@ -33,7 +44,7 @@ python pipeline.py --dataset /workspace/dataset/scene \
   --output /workspace/results/scene_01
 ```
 
-默认输出为 `DATASET/gggs/runs/real_geometry_<UTC时间>_<ID>/`。其中 `recon_bounded_post_smooth.ply` 是最终 mesh，`point_cloud/iteration_20000/point_cloud.ply` 是最终原生高斯，`pipeline_summary.json` 记录实际产物路径。保留 0、7k、15k、20k 的原生高斯和最终的中性 viewer PLY。`--iterations` 可显式指定验证用步数。
+默认输出为 `DATASET/gggs/runs/real_geometry_<UTC时间>_<ID>/`。其中 `input.ply` 是送入高斯模型的初始点云，`recon_bounded_post_smooth.ply` 是最终 mesh，`point_cloud/iteration_20000/point_cloud.ply` 是最终原生高斯。`geometry_config.json` 记录请求的初始化开关，`camera_split.json` 的 `initialization` 记录实际使用的初值。`pipeline_summary.json` 汇总初始化记录与产物路径。保留 0、7k、15k、20k 的原生高斯和最终的中性 viewer PLY。`--iterations` 可显式指定验证用步数。
 
 需要查看 20k 运行的高斯渲染时，可在仓库根目录使用同一份 rasterizer。
 
@@ -45,9 +56,11 @@ PYTHONPATH="$PWD/build/geometry_rasterizer/lib:${PYTHONPATH:-}" \
 
 ## 法线与致密策略
 
-所有注册帧的法线保存在 `DATASET/depth_normal_prior/<相对帧名>.png`。生成使用原图内参和 COLMAP 半像素约定。将每帧有效深度反投影，在一像素邻域内计算水平与垂直差分。邻点深度跳变超过两者较近深度的 5% 时排除该邻点，单侧可用时采用单侧差分。取垂直与水平切向量的叉积，归一化并朝向相机。边框、无效深度以及缺少有效切向量的位置写为中性灰并由 GGGS 的法线掩码排除。编码、训练监督和拓扑审计共享这份 PNG。
+每个注册帧的法线位于 `DATASET/depth_normal_prior/<相对帧名>.png`。例如 `images/cam1/view.jpg` 对应 `depth_normal_prior/cam1/view.png`。初始化前为缺失 PNG 的帧生成法线，已存在的 PNG 原样复用，不做内容校验。深度或内参变化后需删除对应 PNG 让其重新生成。
 
-目录内的 `manifest.json` 按帧记录源深度内容、内参、图像尺寸、算法版本和输出 SHA-256。后续运行复用匹配的帧，重建输入已变、缺失或损坏的帧。本次生成和复用数保存在 run 的 `depth_normal_prior.json`。清单及生成图片位于数据集，首次运行和修复需要该目录可写。
+生成使用原图内参和 COLMAP 半像素约定。将每帧有效深度反投影，在一像素邻域内计算水平与垂直差分。邻点深度跳变超过两者较近深度的 5% 时排除该邻点，单侧可用时采用单侧差分。取垂直与水平切向量的叉积，归一化并朝向相机，按 `round((1 - normal) * 127.5)` 编码为 RGB PNG。边框、无效深度以及缺少有效切向量的位置写为中性灰并由 GGGS 的法线掩码排除。训练监督和拓扑审计读取同一份 PNG。本次生成与复用的帧数记录在 run 的 `camera_split.json` 的 `normal_prior` 中。
+
+每次真实几何训练都在新输出目录中直接生成 `input.ply`。合并时另存本次的 `tsdf_init.ply`，记录保留与裁掉的稀疏点数。
 
 致密策略固定为 `accelerated`。默认 20k 训练中的增长日程如下。
 

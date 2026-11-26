@@ -104,7 +104,7 @@ def generate_ply_from_rgbd(
     """从真实 RGB-D 融合初始化点云，使用与训练监督相同的深度目录。
 
     ``depth_prior_dir`` 支持数据集内相对目录或绝对目录；默认 ``depth``
-    保持原有入口。全部融合后先保留最大两个 mesh 连通分量，再抽取初始化点。
+    保持原有入口。全部融合后先保留三角面数最多的 mesh 连通分量，再抽取初始化点。
     """
     print("Generating dense init ply from RGBD ...")
     if len(train_cam_infos) == 0:

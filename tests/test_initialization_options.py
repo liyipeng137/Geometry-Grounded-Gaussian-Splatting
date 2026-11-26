@@ -3,6 +3,7 @@
 import hashlib
 import importlib.util
 from pathlib import Path
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -36,6 +37,26 @@ def test_mesh_and_prepared_ply_cannot_both_be_selected():
         module.validate_initialization_options(args)
     with pytest.raises(ValueError, match="mutually exclusive"):
         module.validate_initialization_options(options(mesh="source.ply", ply="points.ply"))
+
+
+@pytest.mark.parametrize(
+    ("argv", "enabled"),
+    [
+        ([], True),
+        (["--merge-sparse-init"], True),
+        (["--merge_sparse_init"], True),
+        (["--no-merge-sparse-init"], False),
+        (["--no_merge_sparse_init"], False),
+    ],
+)
+def test_real_geometry_sparse_merge_cli(monkeypatch, argv, enabled):
+    import pipeline
+
+    received = {}
+    monkeypatch.setattr(pipeline, "run", received.update)
+    monkeypatch.setattr(sys, "argv", ["pipeline.py", "--dataset", "capture", *argv])
+    pipeline.main()
+    assert received["merge_sparse_init"] is enabled
 
 
 def test_resume_uses_saved_snapshot_without_source_mesh(saved):

@@ -6,8 +6,9 @@
 python pipeline.py --dataset /workspace/dataset/scene
 ```
 
-主入口自动生成或复用 `DATASET/depth_normal_prior/`，使用 TSDF 或已有初始 PLY，
-以固定的 `accelerated` 策略训练 20k，再用 `mesh_extract_mini.py` 输出最终平滑 mesh。
+主入口为 `DATASET/depth_normal_prior/` 中缺失的帧从深度生成 PNG 法线，已有的直接复用。默认用 TSDF 采样点与裁远后的 COLMAP 稀疏点初始化高斯。
+用 `--no-merge-sparse-init` 可切换为仅 TSDF，也可用 `--init-ply` 指定完整初值。
+训练采用固定的 `accelerated` 策略，共 20k 步，之后用 `mesh_extract_mini.py` 输出最终平滑 mesh。
 运行环境、输入布局、产物及虚拟视角预留接口见 [真实视角几何管道](docs/gray_geometry_20k.md)。
 
 ## 历史 RGB 与虚拟联合训练

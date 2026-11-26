@@ -12,6 +12,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import struct
 import tempfile
 from types import SimpleNamespace
 
@@ -153,20 +154,21 @@ def reader_fixture(tmp_path, depth_helpers):
     )
     load_functions(
         "scene/dataset_readers.py",
-        {"_sha256_file", "_write_record", "readColmapSceneInfo"},
+        {"_sha256_file", "_write_record", "_prepare_real_geometry_input", "readColmapSceneInfo"},
         namespace,
     )
     output = tmp_path / "output"
 
-    def read(depth_dir="depth"):
+    def read(depth_dir="depth", *, output_dir=output, **options):
         result = namespace["readColmapSceneInfo"](
             str(dataset),
             "images",
             False,
-            init_cache_dir=str(output),
+            init_cache_dir=str(output_dir),
             depth_prior_dir=depth_dir,
+            **options,
         )
-        return result, json.loads((output / "camera_split.json").read_text())
+        return result, json.loads((output_dir / "camera_split.json").read_text())
 
     return dataset, rgb, fusion_calls, namespace, read
 
@@ -186,16 +188,16 @@ def test_reader_hashes_configured_depth_and_ignores_shadow_default(reader_fixtur
         "calibration_fingerprint"
     ](expected)
     assert calls[0]["depth_prior_dir"] == str(custom.parent.parent)
-    assert calls[0]["num_points"] == 200000
+    assert calls[0]["num_points"] == 250000
     assert calls[0]["pixel_center_convention"] == "colmap_half_integer"
     metadata = json.loads(Path(result.ply_path).with_suffix(".ply.json").read_text())
     assert metadata["identity"]["parameters"] == {
-        "num_points": 200000,
+        "num_points": 250000,
         "voxel_length": 0.02,
         "sdf_trunc": 0.06,
         "depth_min": 0.05,
         "depth_max": 50.0,
-        "largest_mesh_components": 3,
+        "largest_mesh_components": 1,
         "component_rank": "triangle_count",
         "point_sampling": "final_filtered_mesh_vertices",
     }
@@ -232,3 +234,114 @@ def test_equal_contents_in_different_depth_roots_do_not_share_cache(reader_fixtu
     )
     assert default_result.ply_path != custom_result.ply_path
     assert len(calls) == 2
+
+
+def write_sparse_points(path, points):
+    if path.suffix == ".bin":
+        with path.open("wb") as stream:
+            stream.write(struct.pack("<Q", len(points)))
+            for point_id, record in enumerate(points, 1):
+                stream.write(struct.pack("<QdddBBBdQ", point_id, *record, 0.0, 0))
+    else:
+        path.write_text(
+            "".join(
+                f"{point_id} {' '.join(map(str, record))} 0\n"
+                for point_id, record in enumerate(points, 1)
+            )
+        )
+
+
+@pytest.mark.parametrize("extension", ["txt", "bin"])
+def test_real_geometry_writes_run_owned_initialization_without_hashes(
+    reader_fixture, extension
+):
+    from plyfile import PlyData, PlyElement
+
+    dataset, _, calls, ns, read = reader_fixture
+    write_depth(dataset / "depth", 1.0)
+    (camera,) = ns["readColmapCameras"]()
+    # C = -R @ T in this reader. The training center is (2, 3, 0).
+    camera.R = np.array([[0., -1., 0.], [1., 0., 0.], [0., 0., 1.]])
+    camera.T = np.array([-3., 2., 0.])
+    heldout = SimpleNamespace(**vars(camera))
+    heldout.colmap_image_name = heldout.image_name = "other.png"
+    heldout.image_path = str(dataset / "images/other.png")
+    Path(heldout.image_path).write_bytes(b"other")
+    heldout.R, heldout.T = np.eye(3), np.array([-50., 0., 0.])
+    excluded = dataset / "exclude.json"
+    excluded.write_text(json.dumps([heldout.colmap_image_name]))
+    ns["readColmapCameras"] = lambda *args: [camera, heldout]
+
+    xyz = ("x", "y", "z")
+    rgb = ("red", "green", "blue")
+    dtype = [(field, "f8") for field in xyz] + [(field, "u1") for field in rgb]
+    base = np.array([(2, 3, 1, 1, 2, 3), (3, 3, 0, 4, 5, 6)], dtype=dtype)
+
+    def fusion(cameras, ply_path, **options):
+        assert cameras == [camera]
+        calls.append(ply_path)
+        PlyData([PlyElement.describe(base.copy(), "vertex")]).write(ply_path)
+
+    def load_ply(path):
+        vertices = PlyData.read(path)["vertex"].data
+        return SimpleNamespace(
+            points=np.column_stack([vertices[k] for k in xyz]),
+            colors=np.column_stack([vertices[k] for k in rgb]) / 255,
+        )
+
+    ns.update(generate_ply_from_rgbd=fusion, fetchOpen3DPly=load_ply)
+    model = dataset / "sparse/0"
+    model.mkdir(parents=True)
+    points_file = model / f"points3D.{extension}"
+    (model / f"cameras.{extension}").touch()
+    (model / f"images.{extension}").touch()
+    points = [
+        (2, 3, 1, 80, 81, 82),  # Keep the duplicate TSDF position and its own RGB.
+        (2.25, 3, 0, 90, 91, 92),
+        (1, 3, 0, 10, 11, 12),  # Inclusive boundary, one unit from the training camera.
+        (2, 4.5, 0, 20, 21, 22),
+        (50, 0, 0, 30, 31, 32),  # A held-out center cannot expand the cutoff.
+    ]
+    def forbidden_hash(*args, **kwargs):
+        pytest.fail("Fresh geometry initialization should not hash inputs")
+
+    ns.update(_sha256_file=forbidden_hash, calibration_fingerprint=forbidden_hash)
+    options = dict(train_exclude_images=str(excluded), geometry_only=True)
+    write_sparse_points(points_file, points)
+    normals = dataset / "depth_normal_prior"
+    (normals / "nested").mkdir(parents=True)
+    (normals / "nested/frame.png").touch()
+    with pytest.raises(FileNotFoundError, match="Missing aligned depth for other.png"):
+        read(**options, merge_sparse_init=True)
+    assert not calls
+    (normals / "other.png").touch()
+    merged, split = read(**options, merge_sparse_init=True)
+    expected = np.concatenate((base, np.array(points[:3], dtype=dtype)))
+    assert Path(merged.ply_path).name == "input.ply"
+    assert (split["normal_prior"]["generated"], split["normal_prior"]["reused"]) == (0, 2)
+    assert "ply_sha256" not in split["initialization"]
+    init = split["initialization"]
+    assert init["kind"] == "tsdf_sparse" and init["point_count"] == 5
+    proof = init["sparse_merge"]
+    assert (proof["tsdf_points"], proof["sparse_points"]) == (2, 5)
+    assert (proof["sparse_kept"], proof["sparse_clipped"]) == (3, 2)
+    assert proof["max_nearest_camera_distance"] == pytest.approx(1.)
+    assert split["train_image_names"] == [camera.colmap_image_name]
+    assert split["test_image_names"] == [heldout.colmap_image_name]
+    np.testing.assert_array_equal(PlyData.read(merged.ply_path)["vertex"].data, expected)
+    np.testing.assert_array_equal(
+        merged.point_cloud.colors * 255, np.column_stack([expected[k] for k in rgb])
+    )
+    np.testing.assert_array_equal(PlyData.read(proof["tsdf_ply"])["vertex"].data, base)
+
+    write_sparse_points(points_file, [])
+    empty, _ = read(**options, merge_sparse_init=True, output_dir=dataset.parent / "empty")
+    np.testing.assert_array_equal(PlyData.read(empty.ply_path)["vertex"].data, base)
+    points_file.unlink()
+    with pytest.raises(FileNotFoundError, match="points3D"):
+        read(**options, merge_sparse_init=True, output_dir=dataset.parent / "missing")
+    assert len(calls) == 2
+    disabled, record = read(**options, merge_sparse_init=False, output_dir=dataset.parent / "tsdf_only")
+    assert record["initialization"]["kind"] == "train_only_rgbd"
+    np.testing.assert_array_equal(PlyData.read(disabled.ply_path)["vertex"].data, base)
+    assert len(calls) == 3
